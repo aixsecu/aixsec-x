@@ -180,6 +180,7 @@ Chế độ `--non-interactive`/`--oneshot` chỉ đọc env (không hỏi) — 
 | `WEBX_TEMPERATURE` | `0.1` | Nhiệt độ sampling |
 | `WEBX_PROMPT_STYLE` | `auto` | `auto`=heuristic theo tên model (≤9B→compact, ≥14B→full); `compact`=prompt ngắn cho model nhỏ; `full`=prompt đầy đủ |
 | `WEBX_OUTPUT_CAP` | `5000` | Giới hạn ký tự output tool đưa vào context |
+| `WEBX_NUM_PREDICT` | `0` | **v1.4.2** giới hạn cứng số token model sinh mỗi lượt. `0`=không giới hạn (mặc định). Đặt `512-2048` nếu model viết essay dài làm chậm từng round — rủi ro: final JSON có thể bị cắt cụt nếu đặt quá thấp |
 
 Để env chạy vĩnh viễn, thêm vào `~/.zshrc` (shell mặc định của Kali là zsh;
 dùng `~/.bashrc` nếu bạn ở bash):
@@ -362,6 +363,23 @@ Model 7B/9B (vd: `huihui_ai/qwen3.5-abliterated:9b`) tuân theo **ít quy tắc*
   ledger/terminal kèm dấu `⚠ thiếu bằng chứng` + lý do để operator tự xác minh.
   (Đã kiểm chứng bằng live-run v1.4: 2 finding bịa `dynamic_404`/`openresty_config`
   bị cờ đúng, 3 finding thật qua được.)
+- **v1.4.2 — Luật độ sâu (active check mỗi round):** nguyên nhân gốc của các
+  phiên "không kĩ" là recon chiếm trọn 2 round đầu (249 giây viết luận văn của
+  model 9B) rồi lên kế hoạch quanh tool máy không có. Giờ: recon giới hạn
+  **tối đa 2 rounds**; **từ round 3, MỖI round PHẢI chạy ÍT NHẤT 1 ACTIVE
+  check** (ffuf_dir, sqlmap_check, sqli_manual_test, sqli_blind_extract,
+  nikto_scan, nuclei_scan-nếu-có); batch 2-5 tool một round; bình luận giữa
+  các tool call tối đa **2 câu ngắn** (cấm essay).
+- **v1.4.2 — Phát hiện tool không khả dụng lúc khởi động:**
+  `tools.available_tools()` dò `shutil.which` MỘT lần cho mọi tool cần binary
+  — `nuclei`/`arjun` thường thiếu trên Kali và đang âm thầm đốt rounds vào
+  outcome=error. Banner + system prompt giờ in `⚠ TOOLS KHÔNG KHẢ DỤNG
+  (binary thiếu): nuclei_scan(nuclei), …` kèm TÊN BINARY để model 9B không
+  còn lên kế hoạch quanh tool chết và bạn biết chính xác cần `apt install` gì.
+- **v1.4.2 — Sửa lỗi wrap live-display:** `_LiveDisplay._flush` dùng textwrap
+  với `break_long_words=True` làm tách `**ffuf_dir**` thành `**ff` + `uf_dir**`.
+  Giờ dùng `break_long_words=False, break_on_hyphens=False` — từ dài nhảy
+  trọn sang dòng tiếp theo.
 - `build_system_prompt(cfg)` — `WEBX_PROMPT_STYLE=auto` (mặc định): tên model chứa `14b/32b/70b/72b/122b` → `full`, còn lại → `compact`. Ghi đè thủ công: `export WEBX_PROMPT_STYLE=compact|full`.
 
 ```bash

@@ -19,6 +19,8 @@ from urllib.parse import unquote_plus
 sys.path.insert(0, __file__.rsplit("/", 1)[0])
 
 from agent import (WebXAgent, SYSTEM_PROMPT, resolve_scope_interactive)  # noqa: E402
+from prompts import (SYSTEM_PROMPT_COMPACT, SYSTEM_PROMPT_FULL,  # noqa: E402
+                     build_system_prompt)
 from ledger import (Ledger, Finding, parse_findings_json, validation_plan,
                    render_markdown, check_findings_evidence)  # noqa: E402
 from scope import ScopePolicy  # noqa: E402
@@ -879,6 +881,123 @@ class TestLiveDisplayBuffer(unittest.TestCase):
         lines = out.getvalue().splitlines()
         content_lines = [l for l in lines if "▸" in l or "↳" in l]
         self.assertLess(len(content_lines), 50)
+
+
+class TestLiveDisplayWrap(unittest.TestCase):
+    """v1.4.2: không tách chữ giữa dòng khi wrap (trước đây '**ffuf_dir**'
+    in thành '**ff' + 'uf_dir**' vì textwrap break_long_words mặc định)."""
+
+    def _display(self, wrap=40):
+        from agent import _LiveDisplay
+        d = _LiveDisplay(1, max_rounds=8)
+        d._wrap = wrap
+        return d
+
+    @staticmethod
+    def _strip_ansi(s: str) -> str:
+        return re.sub(r"\x1b\[[0-9;?]*m", "", s)
+
+    def test_long_word_jumps_whole_to_next_line(self):
+        d = self._display(wrap=30)
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            d.on_token("chạy **ffuf_dir** để fuzz")
+            d.done()
+        raw = self._strip_ansi(out.getvalue())
+        self.assertIn("**ffuf_dir**", raw)
+        # KHÔNG dòng nào kết thúc bằng mảnh chữ bị cắt: "**ff"
+        for line in raw.splitlines():
+            t = line.replace("▸", "").replace("↳", "").strip()
+            self.assertFalse(t.endswith("**ff"), f"chữ bị tách giữa dòng: {line!r}")
+
+    def test_stream_boundary_no_midword_split(self):
+        """Tái hiện đúng kịch bản live-run v1.4.1: token '**ff' tới trước biên
+        wrap, 'uf_dir**' tới sau — không được in thành 2 dòng."""
+        d = self._display(wrap=50)
+        prefix = "Bây giờ tôi sẽ chạy "
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            d.on_token(prefix + "**ff")
+            d.on_token("uf_dir** để fuzz thư mục ẩn.")
+            d.done()
+        raw = self._strip_ansi(out.getvalue())
+        self.assertIn("**ffuf_dir**", raw)
+        for line in raw.splitlines():
+            t = line.replace("▸", "").replace("↳", "").strip()
+            self.assertFalse(t.endswith("**ff"), f"chữ bị tách giữa dòng: {line!r}")
+
+
+class TestToolAvailability(unittest.TestCase):
+    """v1.4.2: available_tools() — phát hiện sớm binary thiếu (nuclei/arjun
+    thường không có trên Kali) để model không lên kế hoạch quanh tool chết."""
+
+    @staticmethod
+    def _which(present):
+        return lambda b: f"/usr/bin/{b}" if b in present else None
+
+    def test_all_present(self):
+        with patch("tools.shutil.which", side_effect=self._which(
+                {"nuclei", "arjun", "sqlmap", "nikto", "ffuf",
+                 "subfinder", "whatweb", "wafw00f"})):
+            from tools import available_tools
+            avail, missing = available_tools()
+        self.assertIn("nuclei_scan", avail)
+        self.assertIn("param_discovery", avail)
+        self.assertIn("ffuf_dir", avail)
+        self.assertEqual(missing, {})
+
+    def test_missing_nuclei_arjun_reported(self):
+        with patch("tools.shutil.which", side_effect=self._which({"ffuf"})):
+            from tools import available_tools
+            avail, missing = available_tools()
+        self.assertIn("ffuf_dir", avail)
+        self.assertNotIn("nuclei_scan", avail)
+        self.assertIn("nuclei_scan", missing)
+        self.assertEqual(missing["nuclei_scan"], "nuclei")
+        self.assertEqual(missing["param_discovery"], "arjun")
+
+    def test_agent_prompt_warns_and_banner_flags(self):
+        with patch("tools.shutil.which", side_effect=self._which(set())):
+            a = WebXAgent(config=cfg())
+        self.assertIn("KHÔNG KHẢ DỤNG", a.system_prompt)
+        self.assertIn("nuclei_scan", a.system_prompt)
+        self.assertIn("arjun", a.system_prompt)
+        # tool thuần Python vẫn khả dụng dù mọi binary ngoài đều thiếu
+        self.assertIn("http_probe", a.available)
+
+    def test_need_error_has_replacement_hint(self):
+        from tools import _need
+        with patch("tools.shutil.which", return_value=None):
+            with self.assertRaises(FileNotFoundError) as cm:
+                _need("nuclei")
+        self.assertIn("ffuf_dir", str(cm.exception))
+
+
+class TestDepthPrompt(unittest.TestCase):
+    """v1.4.2: rule độ sâu — sau recon (max 2 rounds), mỗi round PHẢI chạy
+    active check; cấm essay dài giữa các tool call."""
+
+    def test_compact_forces_active_checks(self):
+        self.assertIn("ACTIVE check", SYSTEM_PROMPT_COMPACT)
+        self.assertIn("recon max 2 rounds", SYSTEM_PROMPT_COMPACT)
+        self.assertIn("no essays", SYSTEM_PROMPT_COMPACT)
+
+    def test_full_forces_active_checks(self):
+        self.assertIn("ÍT NHẤT 1 active check", SYSTEM_PROMPT_FULL)
+        self.assertIn("tối đa 2 câu ngắn", SYSTEM_PROMPT_FULL)
+        self.assertIn("KHÔNG lặp lại recon", SYSTEM_PROMPT_FULL)
+
+
+class TestConfigNumPredict(unittest.TestCase):
+    """v1.4.2: WEBX_NUM_PREDICT — cap output opt-in, mặc định 0 = unlimited."""
+
+    def test_default_unlimited(self):
+        with patch.dict(os.environ, {"WEBX_NUM_PREDICT": ""}, clear=False):
+            from config import load_config
+            self.assertEqual(load_config()["num_predict"], 0)
+
+    def test_env_override(self):
+        with patch.dict(os.environ, {"WEBX_NUM_PREDICT": "1024"}, clear=False):
+            from config import load_config
+            self.assertEqual(load_config()["num_predict"], 1024)
 
 
 class TestEvidenceGuard(unittest.TestCase):

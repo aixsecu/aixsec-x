@@ -54,7 +54,46 @@ def run_cmd(argv: list, timeout: int = 90, max_chars: int = 5000) -> str:
 
 def _need(tool: str):
     if shutil.which(tool) is None:
-        raise FileNotFoundError(f"{tool} chưa cài")
+        hint = _MISSING_HINT.get(tool, "")
+        raise FileNotFoundError(f"{tool} chưa cài trên máy này"
+                                + (f" — {hint}" if hint else ""))
+
+
+# Binary ngoài cần thiết cho từng tool — kiểm tra lúc khởi động để model KHÔNG
+# lên kế hoạch quanh tool chết (vd nuclei/arjun thường không có trên Kali),
+# tránh tốn round vào outcome=error rồi mới bị gate cứng (v1.4.2).
+TOOL_BINS: dict[str, str] = {
+    "nuclei_scan": "nuclei",
+    "param_discovery": "arjun",
+    "sqlmap_check": "sqlmap",
+    "nikto_scan": "nikto",
+    "ffuf_dir": "ffuf",
+    "subdomain_enum": "subfinder",
+    "detect_cms": "whatweb",
+    "waf_detect": "wafw00f",
+}
+
+# Hint thay thế khi binary thiếu (model 9B hiểu nhanh hơn với hướng dẫn cụ thể)
+_MISSING_HINT: dict[str, str] = {
+    "nuclei": "Thay thế bằng ffuf_dir, nikto_scan, sqlmap_check/sqli_manual_test.",
+    "arjun": "Thay thế bằng ffuf_dir hoặc kiểm tra tham số thủ công.",
+    "sqlmap": "Dùng sqli_manual_test / sqli_blind_extract (không cần sqlmap).",
+}
+
+
+def available_tools() -> tuple[set, dict]:
+    """(set tool khả dụng, dict {tool_name: binary thiếu}) — gọi 1 lần lúc khởi động.
+    Chỉ các tool cần binary NGOÀI mới được liệt kê; tool thuần Python
+    (http_probe, headers_recon, dns_lookup, sqli_manual_test, ...) luôn khả dụng."""
+    # tool thuần Python (không cần binary ngoài) LUÔN khả dụng
+    avail: set = {ts.name for ts in TOOL_REGISTRY if not TOOL_BINS.get(ts.name)}
+    missing: dict = {}
+    for name, binary in TOOL_BINS.items():
+        if shutil.which(binary):
+            avail.add(name)
+        else:
+            missing[name] = binary
+    return avail, missing
 
 
 def _url_host(url: str) -> str:

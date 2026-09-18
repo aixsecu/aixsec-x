@@ -92,8 +92,12 @@ def ollama_chat(messages: list, tools: list | None = None, config: dict | None =
         "messages": messages,
         "stream": stream,
         "think": cfg.get("think", False),
-        "options": {"temperature": cfg["temperature"], "num_ctx": cfg["num_ctx"]},
     }
+    opts = {"temperature": cfg["temperature"], "num_ctx": cfg["num_ctx"]}
+    np_cap = int(cfg.get("num_predict") or 0)
+    if np_cap > 0:  # v1.4.2: cap output opt-in qua WEBX_NUM_PREDICT (0 = unlimited)
+        opts["num_predict"] = np_cap
+    payload["options"] = opts
     if tools:
         payload["tools"] = tools
     if json_mode:

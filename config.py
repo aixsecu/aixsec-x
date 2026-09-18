@@ -17,6 +17,8 @@ def load_config() -> dict:
         "ollama_auth": os.environ.get("WEBX_OLLAMA_AUTH", ""),
         "model": os.environ.get("WEBX_MODEL", "qwen2.5:7b"),
         "num_ctx": int(os.environ.get("WEBX_NUM_CTX", "16384")),
+        # WEBX_NUM_PREDICT: cap số token sinh ra (opt-in; "0" = không giới hạn)
+        "num_predict": int(os.environ.get("WEBX_NUM_PREDICT", "0") or "0"),
 
         # ── Agent loop ──
         # 8 vòng mặc định: cân bằng độ sâu khai thác vs thời gian/chi phí LLM
@@ -27,6 +29,9 @@ def load_config() -> dict:
         #   (mặc định 300s — model 9B trên CPU có thể mất 1-3 phút/lượt)
         "llm_timeout": int(os.environ.get("WEBX_LLM_TIMEOUT", "300")),
         "output_cap": int(os.environ.get("WEBX_OUTPUT_CAP", "5000")),
+        #   WEBX_NUM_PREDICT: cap cứng số token model sinh mỗi lượt (v1.4.2).
+        #   0 = không giới hạn (mặc định). Đặt 512-2048 nếu model viết essay dài
+        #   làm chậm từng round — rủi ro: final JSON bị cắt cụt nếu đặt quá thấp.
         "auto_exec": os.environ.get("WEBX_AUTO_EXEC", "ask").lower(),
         #   ask | safe | all
         #   ask  → hỏi operator trước hành động noisy/destructive
