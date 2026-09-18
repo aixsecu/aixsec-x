@@ -28,10 +28,10 @@ from ledger import (Ledger, parse_findings_json, render_markdown, validation_pla
 from llm import InjectionGuard, ollama_chat
 from prompts import SYSTEM_PROMPT, build_system_prompt
 from scope import ScopePolicy
-from tools import TOOL_REGISTRY, TOOL_INDEX
+from tools import TOOL_REGISTRY, TOOL_INDEX, TOOL_BINS, available_tools
 
 # ── terminal colors (AIXSEC-X style) ──
-VERSION = "1.4.1"
+VERSION = "1.4.2"
 
 RED = "\033[91m"
 GREEN = "\033[92m"
@@ -98,7 +98,12 @@ class _LiveDisplay:
             return
         try:
             import textwrap
-            raw = textwrap.wrap(self._buf, self._wrap) or [self._buf]
+            # break_long_words=False: từ dài vượt wrap phải NHẢY trọn sang dòng
+            # sau, không tách chữ giữa dòng (v1.4.2 — trước đây in '**ff' /
+            # 'uf_dir**' khi stream token tới đúng biên wrap).
+            raw = textwrap.wrap(self._buf, self._wrap,
+                                break_long_words=False,
+                                break_on_hyphens=False) or [self._buf]
         except Exception:  # noqa: BLE001
             raw = [self._buf[:self._wrap]]
         on = int(self._lines) < int(self.MAX_LINES)
@@ -158,6 +163,17 @@ class WebXAgent:
         self.transcript: list[dict] = []
         self.tools = TOOL_REGISTRY
         self.extra_context = ""
+        # v1.4.2: phát hiện binary thiếu lúc khởi động (nuclei/arjun/... không
+        # có trên máy) → model được báo TRƯỚC để không lên kế hoạch quanh tool
+        # chết (trước đây tốn round vào outcome=error rồi mới bị gate cứng).
+        self.available, self.missing_tools = available_tools()
+        if self.missing_tools:
+            self.system_prompt += (
+                "\n\n⚠ TOOLS KHÔNG KHẢ DỤNG PHIÊN NÀY (binary thiếu trên máy): "
+                + ", ".join(f"{s}({TOOL_BINS[s]})" for s in sorted(self.missing_tools))
+                + ".\nKHÔNG gọi các tool này — outcome sẽ là error. Thay bằng tool "
+                  "khác trong registry (ffuf_dir, nikto_scan, sqlmap_check, "
+                  "sqli_manual_test, sqli_blind_extract, http_probe...).")
         # Bộ chống lặp lại tool-call (chỉ trong vòng lặp run):
         #  - _call_cache: kết quả theo khóa (name, args) — gọi lại y hệt thì trả
         #    outcome='duplicate' mà KHÔNG thực thi lại.
@@ -506,6 +522,9 @@ def main():
     print(f"{GREEN}[*]{RESET} Model       : {BOLD}{cfg['model']}{RESET}")
     print(f"{GREEN}[*]{RESET} Scope       : {agent.policy.describe()}")
     print(f"{GREEN}[*]{RESET} Auto-exec   : {cfg['auto_exec']}")
+    if agent.missing_tools:
+        print(f"{YELLOW}[⚠]{RESET} Unavailable tools (binary missing): "
+              f"{BOLD}{', '.join(f'{s}({TOOL_BINS[s]})' for s in sorted(agent.missing_tools))}{RESET}")
 
     if do_recon and cfg["targets"]:
         cyan = "\033[96m"
