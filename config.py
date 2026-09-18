@@ -21,6 +21,9 @@ def load_config() -> dict:
         # ── Agent loop ──
         "max_rounds": int(os.environ.get("WEBX_MAX_ROUNDS", "12")),
         "tool_timeout": int(os.environ.get("WEBX_TOOL_TIMEOUT", "90")),
+        #   WEBX_LLM_TIMEOUT: giây tối đa chờ model trả lời MỖI lượt gọi Ollama
+        #   (mặc định 300s — model 9B trên CPU có thể mất 1-3 phút/lượt)
+        "llm_timeout": int(os.environ.get("WEBX_LLM_TIMEOUT", "300")),
         "output_cap": int(os.environ.get("WEBX_OUTPUT_CAP", "5000")),
         "auto_exec": os.environ.get("WEBX_AUTO_EXEC", "ask").lower(),
         #   ask | safe | all
@@ -47,6 +50,10 @@ def load_config() -> dict:
         "temperature": float(os.environ.get("WEBX_TEMPERATURE", "0.1")),
         "think": os.environ.get("WEBX_THINK", "0") == "1",
         #   WEBX_THINK=1 → bật thinking mode (không khuyến nghị khi dùng function calling)
+        "stream": os.environ.get("WEBX_STREAM", "1") == "1",
+        #   WEBX_STREAM=1 → stream NDJSON từ Ollama về, agent hiển thị live
+        #   reasoning + nội dung đang sinh lên màn hình. Đặt 0 để tắt (chờ
+        #   nguyên response, không có hiển thị live).
         "prompt_style": os.environ.get("WEBX_PROMPT_STYLE", "auto").lower(),
         #   auto | compact | full
         #   auto    → heuristic theo model: ≤9B dùng compact, ≥14B dùng full

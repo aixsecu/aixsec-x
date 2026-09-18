@@ -1,6 +1,6 @@
 # AIXSEC-X — AI Web Exploitation Assistant (local LLM, Kali Linux)
 
-**AIXSEC-X** — AI Web Exploitation Assistant · thương hiệu **aixsecu.com**
+**AIXSEC-X** — AI Web Exploitation Assistant · thương hiệu **aixsecu.vn**
 Dùng **local LLM (Ollama)** — không cần cloud, không API key.
 Agent-grade: function calling, scope pinning, validation loop, finding ledger.
 
@@ -141,12 +141,32 @@ Chế độ `--non-interactive`/`--oneshot` chỉ đọc env (không hỏi) — 
 | `WEBX_AUTO_EXEC` | `ask` | `ask`=hỏi operator với tool noisy/active; `safe`=chỉ tự chạy tool an toàn; `all`=tự chạy hết (rủi ro) |
 | `WEBX_MAX_ROUNDS` | `12` | Số vòng tool-call tối đa mỗi lượt |
 | `WEBX_TOOL_TIMEOUT` | `90` | Timeout mỗi tool (giây) |
+| `WEBX_LLM_TIMEOUT` | `300` | Timeout tối đa chờ model trả lời mỗi lượt (giây); model 9B trên CPU có thể mất 1–3 phút |
+| `WEBX_STREAM` | `1` | `1`=stream NDJSON từ Ollama, agent hiển thị live reasoning + nội dung đang sinh + thời gian mỗi lượt; `0`=tắt (chờ nguyên response, không có hiển thị live) |
 | `WEBX_OLLAMA_URL` | `http://localhost:11434` | Endpoint Ollama (local / máy khác / tunnel) |
 | `WEBX_OLLAMA_AUTH` | *(trống)* | Header Authorization gửi tới Ollama: ghi đủ `Bearer xyz`/`Basic abc` hoặc chỉ token (tự thêm `Bearer `) — dùng cho tunnel/proxy có xác thực |
 | `WEBX_NUM_CTX` | `16384` | Context window (token) |
 | `WEBX_TEMPERATURE` | `0.1` | Nhiệt độ sampling |
 | `WEBX_PROMPT_STYLE` | `auto` | `auto`=heuristic theo tên model (≤9B→compact, ≥14B→full); `compact`=prompt ngắn cho model nhỏ; `full`=prompt đầy đủ |
 | `WEBX_OUTPUT_CAP` | `5000` | Giới hạn ký tự output tool đưa vào context |
+
+### Màn hình live (streaming)
+
+Khi model đang xử lý, AIXSEC-X hiển thị ngay trên màn hình để bạn không phải chờ mù:
+
+```
+[*] Vòng 1/12 — model đang xử lý...
+  ✦ think: Phân tích endpoint /login, thử SQLi ở param id...   (dim — reasoning)
+  ▸ Khai thác...                                                       (xanh — nội dung)
+  └ model xử lý xong trong 42.3s
+[→] http_probe({"url": "https://dinhtibooks.com.vn/"})
+[✔] http_probe → outcome=ok (1.2s)
+```
+
+- `✦ think:` = reasoning của model (nếu model có thinking, vd `huihui_ai/qwen3.5-abliterated:9b` + `WEBX_THINK=1`).
+- `▸` = nội dung model đang sinh ra.
+- Mỗi lệnh tool được in trước khi chạy `[→]` và kết quả kèm thời gian thực thi `[✔/✗]`.
+- Tắt bằng `WEBX_STREAM=0`; nếu thấy function-calling bị lỗi khi stream, thử tắt hoặc tắt `WEBX_THINK`.
 
 ### Lệnh interactive
 

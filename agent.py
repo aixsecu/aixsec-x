@@ -50,6 +50,43 @@ _AIXSEC_ART = r'''
 SEVERITY_RISK = {"destructive": 4, "active": 3, "noisy": 2, "safe": 1}
 
 
+class _LiveDisplay:
+    """Màn hình live khi model đang xử lý: reasoning (mờ) + nội dung (xanh)
+    + thời gian mỗi lượt — để người dùng thấy agent đang nghĩ/khai thác gì.
+
+    Mỗi lượt (round) dùng 1 đối tượng: khởi tạo in header, callback từ
+    ollama_chat streaming đẩy từng dòng, done() chốt elapsed time.
+    """
+
+    REASON_CAP = 250   # ký tự tối đa mỗi dòng reasoning
+    CONTENT_CAP = 600  # ký tự tối đa mỗi dòng nội dung
+
+    def __init__(self, rnd, max_rounds=None):
+        self.t0 = time.time()
+        label = f"Vòng {rnd}/{max_rounds}" if rnd else "Vòng kết thúc"
+        print(f"\n{CYAN}[*]{RESET} {BOLD}{label}{RESET} — "
+              f"{DIM}model đang xử lý...{RESET}", flush=True)
+
+    @staticmethod
+    def _line(chunk, cap: int) -> str:
+        s = "".join(chunk) if isinstance(chunk, (list, tuple)) else str(chunk)
+        return " ".join(s.split())[:cap]
+
+    def on_reasoning(self, chunk: str):
+        s = self._line(chunk, self.REASON_CAP)
+        if s:
+            print(f"{DIM}  ✦ think:{RESET} {DIM}{s}{RESET}", flush=True)
+
+    def on_token(self, token: str):
+        s = self._line(token, self.CONTENT_CAP)
+        if s:
+            print(f"{GREEN}  ▸{RESET} {GREEN}{s}{RESET}", flush=True)
+
+    def done(self):
+        dt = time.time() - self.t0
+        print(f"{DIM}  └ model xử lý xong trong {dt:.1f}s{RESET}", flush=True)
+
+
 class WebXAgent:
     def __init__(self, config: dict | None = None, chat=None):
         self.config = config or load_config()
@@ -118,9 +155,12 @@ class WebXAgent:
         max_rounds = self.config["max_rounds"]
         result = {"risk_level": "UNKNOWN", "overall_summary": "", "final_text": "", "calls": 0}
         for rnd in range(1, max_rounds + 1):
-            resp = self.chat(msgs, tools=[t.schema() for t in self.tools])
+            disp = _LiveDisplay(rnd, max_rounds)
+            resp = self.chat(msgs, tools=[t.schema() for t in self.tools],
+                             on_token=disp.on_token, on_reasoning=disp.on_reasoning)
             calls = resp.get("tool_calls") or []
             if not calls:
+                disp.done()
                 result["final_text"] = resp.get("content", "")
                 if not self._looks_like_json(result["final_text"]):
                     return result
@@ -134,7 +174,22 @@ class WebXAgent:
                     pass
                 return result
 
-            results = [self._dispatch(c["name"], c.get("arguments") or {}) for c in calls]
+            # chạy tool tuần tự: in lệnh → dispatch → kết quả kèm thời gian
+            results = []
+            for c in calls:
+                name = c.get("name", "?")
+                args = c.get("arguments") or {}
+                print(f"{YELLOW}[→]{RESET} {BOLD}{name}{RESET}("
+                      f"{json.dumps(args, ensure_ascii=False)[:200]})", flush=True)
+                t0 = time.time()
+                r = self._dispatch(name, args)
+                dt = time.time() - t0
+                tag = f"{GREEN}[✔]{RESET}" if r.get("outcome") == "ok" \
+                    else f"{RED}[✗]{RESET}"
+                print(f"{tag} {name} → outcome={r.get('outcome', '?')} ({dt:.1f}s)",
+                      flush=True)
+                results.append(r)
+            disp.done()
             self.transcript.append({"round": rnd, "type": "tools", "calls": results})
             result["calls"] += len(results)
 
@@ -151,7 +206,10 @@ class WebXAgent:
                         "\n[TOOL RESULTS END]\nTiếp tục. Khi đủ dữ liệu trả JSON cuối cùng."})
 
         # hết budget — ép trả JSON
-        resp = self.chat(msgs, tools=[t.schema() for t in self.tools], json_mode=True)
+        disp = _LiveDisplay(max_rounds, max_rounds)
+        resp = self.chat(msgs, tools=[t.schema() for t in self.tools], json_mode=True,
+                         on_token=disp.on_token, on_reasoning=disp.on_reasoning)
+        disp.done()
         result["final_text"] = resp.get("content", "")
         for f in parse_findings_json(result["final_text"]):
             self.ledger.add(f)
@@ -256,7 +314,7 @@ def _print_banner(cfg: dict):
     print(f"{MAGENTA}{'═' * 64}{RESET}")
     print(f"{BOLD}{GREEN}AIXSEC-X{RESET} — AI Web Exploitation Assistant  "
           f"{DIM}(local LLM • Kali Linux){RESET}")
-    print(f"{DIM}Brand:{RESET} {CYAN}aixsecu.vn{RESET}   {DIM}Mode:{RESET} "
+    print(f"{DIM}Brand:{RESET} {CYAN}aixsecu.com{RESET}   {DIM}Mode:{RESET} "
           f"{YELLOW}{cfg.get('auto_exec', 'ask')}{RESET}")
     print(f"{MAGENTA}{'═' * 64}{RESET}")
 

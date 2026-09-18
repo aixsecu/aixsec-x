@@ -48,41 +48,11 @@ class InjectionGuard:
         return "<untrusted tool output>\n" + text + "\n</untrusted tool output>"
 
 
-def ollama_chat(messages: list, tools: list | None = None, config: dict | None = None,
-                json_mode: bool = False) -> dict:
-    """Gọi Ollama /api/chat. Trả {"content", "tool_calls":[{name,arguments}]}."""
-    from config import load_config
-    cfg = config or load_config()
-    payload = {
-        "model": cfg["model"],
-        "messages": messages,
-        "stream": False,
-        "think": cfg.get("think", False),
-        "options": {"temperature": cfg["temperature"], "num_ctx": cfg["num_ctx"]},
-    }
-    if tools:
-        payload["tools"] = tools
-    if json_mode:
-        payload["format"] = "json"
-    try:
-        r = requests.post(cfg["ollama_url"] + "/api/chat", json=payload,
-                          headers=ollama_headers(cfg),
-                          timeout=int(cfg["tool_timeout"]) * 4 + 30)
-        r.raise_for_status()
-    except requests.exceptions.ConnectionError:
-        base = str(cfg["ollama_url"]).rstrip("/")
-        return {"content": ("[!] Không kết nối được Ollama tại " + base + ".\n"
-                             "    • Máy chủ đã chạy 'ollama serve' chưa?\n"
-                             "    • Remote? Phải set OLLAMA_HOST=0.0.0.0 trên máy chủ.\n"
-                             "    • Firewall máy chủ mở 11434/tcp chưa?\n"
-                             "    • Chẩn đoán: python3 agent.py --check-ollama"),
-                "tool_calls": []}
-    except requests.exceptions.Timeout:
-        return {"content": "[!] Ollama timeout — model đang load hoặc quá lớn.", "tool_calls": []}
-    except Exception as e:
-        return {"content": f"[!] Lỗi Ollama: {e}", "tool_calls": []}
+def _parse_tool_calls(msg: dict) -> list:
+    """Chuẩn hóa tool_calls từ Ollama (arguments có thể là JSON string).
 
-    msg = r.json().get("message", {})
+    Trả list {"name", "arguments"} — arguments luôn là dict.
+    """
     calls = []
     for tc in msg.get("tool_calls", []) or []:
         fn = tc.get("function", {})
@@ -93,7 +63,92 @@ def ollama_chat(messages: list, tools: list | None = None, config: dict | None =
             except (json.JSONDecodeError, TypeError):
                 args = {"_raw": args}
         calls.append({"name": fn.get("name", ""), "arguments": args or {}})
-    return {"content": (msg.get("content") or "").strip(), "tool_calls": calls}
+    return calls
+
+
+def _conn_error(cfg: dict) -> dict:
+    base = str(cfg["ollama_url"]).rstrip("/")
+    return {"content": ("[!] Không kết nối được Ollama tại " + base + ".\n"
+                         "    • Máy chủ đã chạy 'ollama serve' chưa?\n"
+                         "    • Remote? Phải set OLLAMA_HOST=0.0.0.0 trên máy chủ.\n"
+                         "    • Firewall máy chủ mở 11434/tcp chưa?\n"
+                         "    • Chẩn đoán: python3 agent.py --check-ollama"),
+            "tool_calls": []}
+
+
+def ollama_chat(messages: list, tools: list | None = None, config: dict | None = None,
+                json_mode: bool = False, on_token=None, on_reasoning=None) -> dict:
+    """Gọi Ollama /api/chat. Trả {"content", "tool_calls":[{name,arguments}]}.
+
+    stream=True (mặc định qua WEBX_STREAM): đọc NDJSON từng dòng, gọi
+    on_reasoning(chunk) / on_token(chunk) live để agent hiển thị lên màn hình.
+    Nếu đứt kết nối giữa chừng, trả thông báo thân thiện (không raise).
+    """
+    from config import load_config
+    cfg = config or load_config()
+    stream = bool(cfg.get("stream", False))
+    payload = {
+        "model": cfg["model"],
+        "messages": messages,
+        "stream": stream,
+        "think": cfg.get("think", False),
+        "options": {"temperature": cfg["temperature"], "num_ctx": cfg["num_ctx"]},
+    }
+    if tools:
+        payload["tools"] = tools
+    if json_mode:
+        payload["format"] = "json"
+    try:
+        tmo = int(cfg.get("llm_timeout") or (int(cfg["tool_timeout"]) * 4 + 30))
+        r = requests.post(cfg["ollama_url"] + "/api/chat", json=payload,
+                          headers=ollama_headers(cfg),
+                          timeout=tmo, stream=stream)
+        r.raise_for_status()
+    except requests.exceptions.ConnectionError:
+        return _conn_error(cfg)
+    except requests.exceptions.Timeout:
+        return {"content": "[!] Ollama timeout — model đang load hoặc quá lớn.", "tool_calls": []}
+    except Exception as e:
+        return {"content": f"[!] Lỗi Ollama: {e}", "tool_calls": []}
+
+    if not stream:
+        msg = r.json().get("message", {})
+        return {"content": (msg.get("content") or "").strip(),
+                "tool_calls": _parse_tool_calls(msg)}
+
+    # ── streaming NDJSON ──
+    parts: list[str] = []
+    raw_calls: list[dict] = []
+    try:
+        for line in r.iter_lines(decode_unicode=True):
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+            except (json.JSONDecodeError, TypeError):
+                continue
+            msg = obj.get("message") or {}
+            tok = msg.get("content")
+            if tok:
+                parts.append(tok)
+                if on_token is not None:
+                    on_token(tok)
+            rsn = msg.get("reasoning")
+            if rsn:
+                if on_reasoning is not None:
+                    on_reasoning(rsn)
+            for tc in msg.get("tool_calls") or []:
+                raw_calls.append(tc)
+            if obj.get("done"):
+                break
+    except requests.exceptions.ConnectionError:
+        return _conn_error(cfg)
+    except requests.exceptions.Timeout:
+        return {"content": "[!] Ollama timeout — model đang load hoặc quá lớn.", "tool_calls": []}
+    except Exception as e:
+        return {"content": f"[!] Lỗi Ollama: {e}", "tool_calls": []}
+    return {"content": "".join(parts).strip(),
+            "tool_calls": _parse_tool_calls({"tool_calls": raw_calls})}
 
 
 def check_ollama(config: dict | None = None) -> str:

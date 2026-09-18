@@ -42,8 +42,8 @@ class FakeChat:
         self.always_tools = always_tools
         self.calls = []
 
-    def __call__(self, messages, tools=None, json_mode=False):
-        self.calls.append({"tools": tools, "json_mode": json_mode})
+    def __call__(self, messages, tools=None, json_mode=False, **kwargs):
+        self.calls.append({"tools": tools, "json_mode": json_mode, "kwargs": kwargs})
         if self.script:
             return self.script.pop(0)
         if self.always_tools:
@@ -425,7 +425,7 @@ class TestOllamaRemote(unittest.TestCase):
         from llm import ollama_chat
         captured = {}
 
-        def fake_post(url, json=None, timeout=None, headers=None):
+        def fake_post(url, json=None, timeout=None, headers=None, stream=False):
             captured["url"] = url
             captured["headers"] = headers
             r = MagicMock()
@@ -450,7 +450,7 @@ class TestOllamaRemote(unittest.TestCase):
         from llm import ollama_chat
         captured = {}
 
-        def fake_post(url, json=None, timeout=None, headers=None):
+        def fake_post(url, json=None, timeout=None, headers=None, stream=False):
             captured["headers"] = headers
             r = MagicMock()
             r.json.return_value = {"message": {"content": "x", "tool_calls": []}}
@@ -503,6 +503,68 @@ class TestOllamaRemote(unittest.TestCase):
         self.assertIn("KHÔNG kết nối", out)
         self.assertIn("OLLAMA_HOST=0.0.0.0", out)
         self.assertIn("ufw allow 11434/tcp", out)
+
+    @staticmethod
+    def _stream_resp(lines):
+        """Fake response streaming NDJSON: iter_lines trả từng dòng JSON."""
+        r = MagicMock()
+        r.iter_lines.return_value = iter(
+            [json.dumps(x, ensure_ascii=False) for x in lines])
+        return r
+
+    def test_ollama_chat_stream_reasoning_tokens_tool_calls(self):
+        """Stream bật: gom NDJSON → content gộp + on_reasoning/on_token + parse tool_calls."""
+        from llm import ollama_chat
+        cfg_s = {"ollama_url": "http://x", "model": "m", "stream": True,
+                 "think": True, "temperature": 0.1, "num_ctx": 4096,
+                 "tool_timeout": 30}
+        lines = [
+            {"message": {"role": "assistant",
+                          "reasoning": "Phân tích endpoint /login..."}},
+            {"message": {"role": "assistant", "content": "He"}},
+            {"message": {"role": "assistant", "content": "llo"}},
+            {"message": {"role": "assistant", "tool_calls": [
+                {"function": {"name": "http_probe",
+                               "arguments": '{"url": "https://abc.vn/"}'}}]}},
+            {"done": True},
+        ]
+        seen = {"tokens": [], "reasoning": [], "stream_flag": None}
+
+        def fake_post(url, json=None, timeout=None, headers=None, stream=False):
+            seen["stream_flag"] = stream
+            return self._stream_resp(lines)
+
+        with patch("llm.requests.post", side_effect=fake_post):
+            out = ollama_chat([{"role": "user", "content": "hi"}], config=cfg_s,
+                              on_token=seen["tokens"].append,
+                              on_reasoning=seen["reasoning"].append)
+        self.assertIs(seen["stream_flag"], True)
+        self.assertEqual(out["content"], "Hello")
+        self.assertEqual(seen["tokens"], ["He", "llo"])
+        self.assertEqual(seen["reasoning"], ["Phân tích endpoint /login..."])
+        self.assertEqual(out["tool_calls"],
+                         [{"name": "http_probe",
+                           "arguments": {"url": "https://abc.vn/"}}])
+
+    def test_ollama_chat_stream_disconnect_midway_friendly(self):
+        """Đứt kết nối giữa chừng khi streaming → thông báo thân thiện, không crash."""
+        from llm import ollama_chat
+        from requests.exceptions import ConnectionError as RequestsConnectionError
+        cfg_s = {"ollama_url": "http://10.0.0.9:11434", "model": "m", "stream": True,
+                 "think": False, "temperature": 0.1, "num_ctx": 4096,
+                 "tool_timeout": 30}
+
+        def fake_post(url, json=None, timeout=None, headers=None, stream=False):
+            r = MagicMock()
+            r.iter_lines.side_effect = RequestsConnectionError("connection reset")
+            return r
+
+        with patch("llm.requests.post", side_effect=fake_post):
+            out = ollama_chat([{"role": "user", "content": "hi"}], config=cfg_s,
+                              on_token=lambda t: None)
+        self.assertIn("Không kết nối", out["content"])
+        self.assertIn("11434/tcp", out["content"])
+        self.assertEqual(out["tool_calls"], [])
 
 
 class TestSast(unittest.TestCase):
