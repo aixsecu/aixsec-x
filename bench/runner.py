@@ -243,14 +243,14 @@ class BenchSession:
         spec = TOOL_INDEX.get(name)
         if not spec:
             return {"name": name, "outcome": "error",
-                    "output": f"[!] Tool '{name}' không có trong registry."}
+                    "output": f"[!] Tool '{name}' not found in registry."}
         for p in spec.scope_params:
             if p in arguments:
                 err = self.policy.check_param(spec.name, p, arguments[p])
                 if err:
                     return {"name": name, "outcome": "scope_rejected", "output": err}
         return {"name": name, "outcome": "ok",
-                "output": self.canned.get(name, "(no canned output cho tool này)")}
+                "output": self.canned.get(name, "(no canned output for this tool)")}
 
     def run(self) -> dict:
         task = self.task
@@ -372,16 +372,16 @@ def main(argv: list[str] | None = None) -> int:
         tasks = tasks[:3]
     if args.offline:
         if args.models:
-            print("[*] --offline bỏ qua --models; chạy scripted personas (scripted-good, scripted-evil).")
+            print("[*] --offline ignores --models; running scripted personas (scripted-good, scripted-evil).")
         models = ["scripted-good", "scripted-evil"]
     else:
         models = [m.strip() for m in (args.models or "").split(",") if m.strip()]
         if not models:
             models = ["scripted-good", "scripted-evil"]
-            print("[*] Không có --models — chạy scripted personas (--offline).")
+            print("[*] No --models given — running scripted personas (--offline).")
         elif not _check_ollama(args.ollama_url):
-            print(f"[!] Không kết nối được Ollama tại {args.ollama_url} ({args.ollama_url}/api/tags).")
-            print("    Chạy: ollama serve (trên Kali) rồi thử lại, hoặc dùng --offline để test harness.")
+            print(f"[!] Cannot reach Ollama at {args.ollama_url} ({args.ollama_url}/api/tags).")
+            print("    Run: ollama serve (on Kali) and retry, or use --offline to test the harness.")
             return 2
 
     print(f"[*] {len(tasks)} tasks × {len(models)} model(s)")

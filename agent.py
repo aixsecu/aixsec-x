@@ -63,9 +63,9 @@ class _LiveDisplay:
 
     def __init__(self, rnd, max_rounds=None):
         self.t0 = time.time()
-        label = f"Vòng {rnd}/{max_rounds}" if rnd else "Vòng kết thúc"
+        label = f"Round {rnd}/{max_rounds}" if rnd else "Final round"
         print(f"\n{CYAN}[*]{RESET} {BOLD}{label}{RESET} — "
-              f"{DIM}model đang xử lý...{RESET}", flush=True)
+              f"{DIM}model processing...{RESET}", flush=True)
 
     @staticmethod
     def _line(chunk, cap: int) -> str:
@@ -84,7 +84,7 @@ class _LiveDisplay:
 
     def done(self):
         dt = time.time() - self.t0
-        print(f"{DIM}  └ model xử lý xong trong {dt:.1f}s{RESET}", flush=True)
+        print(f"{DIM}  └ model finished in {dt:.1f}s{RESET}", flush=True)
 
 
 class WebXAgent:
@@ -107,7 +107,7 @@ class WebXAgent:
         if mode == "ask":
             if spec.risk == "safe":
                 return True
-            ans = input(f"\n[APPROVAL] '{spec.name}' mức rủi ro [{spec.risk}] — cho phép? [y/N] ").strip().lower()
+            ans = input(f"\n[APPROVAL] '{spec.name}' risk [{spec.risk}] — run? [y/N] ").strip().lower()
             return ans == "y"
         if mode == "safe":
             return spec.risk == "safe"
@@ -117,7 +117,7 @@ class WebXAgent:
         spec = TOOL_INDEX.get(name)
         if not spec:
             return {"name": name, "outcome": "error",
-                    "output": f"[!] Tool '{name}' không có trong registry."}
+                    "output": f"[!] Tool '{name}' not found in registry."}
         # scope check
         for p in spec.scope_params:
             if p in arguments:
@@ -127,7 +127,7 @@ class WebXAgent:
         # risk approval
         if not self._risk_ok(spec):
             return {"name": name, "outcome": "denied",
-                    "output": "[!] Operator từ chối chạy tool này."}
+                    "output": "[!] Operator denied this tool."}
         try:
             kw = dict(arguments)
             kw["_timeout"] = self.config["tool_timeout"]
@@ -135,9 +135,9 @@ class WebXAgent:
             return {"name": name, "outcome": "ok", "output": out}
         except TypeError as e:
             return {"name": name, "outcome": "error",
-                    "output": f"[!] Tham số '{name}' không hợp lệ: {e}"}
+                    "output": f"[!] Invalid arguments for '{name}': {e}"}
         except Exception as e:  # noqa: BLE001
-            return {"name": name, "outcome": "error", "output": f"[!] {name} lỗi: {e}"}
+            return {"name": name, "outcome": "error", "output": f"[!] {name} error: {e}"}
 
     # ─────────────────────────────────────────
     # MAIN LOOP
@@ -238,7 +238,7 @@ class WebXAgent:
     def start_recon(self) -> str:
         """Recon sơ bộ tự động + trả context ngắn."""
         if not self.policy.has_scope:
-            return "[!] Chưa có WEBX_TARGETS — khởi tạo recon thất bại."
+            return "[!] No WEBX_TARGETS — recon bootstrap failed."
         target = self.config["targets"][0]
         probe = _try_dispatch(self, "http_probe", {"url": target})
         hdrs = _try_dispatch(self, "headers_recon", {"url": target})
@@ -270,7 +270,7 @@ STATUS_COLOR = {"confirmed": GREEN, "candidate": YELLOW, "ruled_out": RED + DIM}
 
 def _print_findings(agent: WebXAgent):
     if not agent.ledger.all():
-        print(f"\n{CYAN}[ledger]{RESET} Chưa có finding nào được thêm.")
+        print(f"\n{CYAN}[ledger]{RESET} No findings added yet.")
         return
     print(f"\n{CYAN}{'═' * 64}{RESET}")
     print(f"{BOLD}{MAGENTA}    AIXSEC-X FINDINGS LEDGER{RESET}")
@@ -284,7 +284,7 @@ def _print_findings(agent: WebXAgent):
         print(f"{sev_tag} {f.name}  →  {status}  ({f.url or '-'})")
     plan = validation_plan(agent.ledger)
     if plan:
-        print(f"\n{BOLD}{YELLOW}[CẦN XÁC MINH]{RESET}")
+        print(f"\n{BOLD}{YELLOW}[NEEDS VALIDATION]{RESET}")
         for p in plan:
             print(f"  {CYAN}•{RESET} {p['finding']}: " + " | ".join(p['steps']))
 
@@ -293,16 +293,16 @@ def resolve_scope_interactive(cfg: dict) -> dict:
     """Hỏi target web và/hoặc src dirs ngay trên màn hình nếu env chưa đặt.
     Mỗi mục để TRỐNG = phiên này không dùng phần đó: chỉ web, chỉ SAST, hoặc cả 2."""
     if not cfg["targets"]:
-        print("[*] CHƯA khai báo target web (WEBX_TARGETS).")
-        print("    Nhập target được ủy quyền, phân cách bằng dấu phẩy")
-        print("    (vd: https://abc.vn,10.0.0.0/8) — để TRỐNG rồi Enter nếu")
-        print("    phiên này CHỈ phân tích source code:")
+        print("[*] No web target declared (WEBX_TARGETS).")
+        print("    Enter authorized targets, comma-separated")
+        print("    (e.g. https://abc.vn,10.0.0.0/8) — press ENTER to skip if")
+        print("    this session is SOURCE-CODE ANALYSIS only:")
         inp = input(f"{CYAN}{BOLD}aixsec-target>{RESET} ").strip()
         cfg["targets"] = [t.strip() for t in inp.split(",") if t.strip()]
     if not cfg.get("src_dirs"):
-        print("[*] CHƯA khai báo thư mục source (WEBX_SRC_DIRS).")
-        print("    Nhập thư mục code được phép quét SAST, phân cách bằng dấu phẩy")
-        print("    (vd: /var/www/html) — để TRỐNG rồi Enter nếu không dùng sast_scan:")
+        print("[*] No source directory declared (WEBX_SRC_DIRS).")
+        print("    Enter code directories allowed for SAST scanning, comma-separated")
+        print("    (e.g. /var/www/html) — press ENTER to skip if sast_scan is unused:")
         inp = input(f"{MAGENTA}{BOLD}aixsec-src>{RESET} ").strip()
         cfg["src_dirs"] = [d.strip() for d in inp.split(",") if d.strip()]
     return cfg
@@ -314,7 +314,7 @@ def _print_banner(cfg: dict):
     print(f"{MAGENTA}{'═' * 64}{RESET}")
     print(f"{BOLD}{GREEN}AIXSEC-X{RESET} — AI Web Exploitation Assistant  "
           f"{DIM}(local LLM • Kali Linux){RESET}")
-    print(f"{DIM}Brand:{RESET} {CYAN}aixsecu.com{RESET}   {DIM}Mode:{RESET} "
+    print(f"{DIM}Brand:{RESET} {CYAN}aixsecu.vn{RESET}   {DIM}Mode:{RESET} "
           f"{YELLOW}{cfg.get('auto_exec', 'ask')}{RESET}")
     print(f"{MAGENTA}{'═' * 64}{RESET}")
 
@@ -338,8 +338,8 @@ def main():
         cfg = resolve_scope_interactive(cfg)
 
     if not cfg["targets"] and not cfg.get("src_dirs"):
-        print("[!] Chưa khai báo gì — cần ít nhất WEBX_TARGETS (web) hoặc WEBX_SRC_DIRS (source).")
-        print("    Ví dụ:")
+        print("[!] Nothing declared — you need WEBX_TARGETS (web) and/or WEBX_SRC_DIRS (source).")
+        print("    Example:")
         print("    export WEBX_TARGETS=\"https://example.com\"")
         print("    export WEBX_SRC_DIRS=\"/var/www/html\"")
         sys.exit(1)
@@ -353,11 +353,11 @@ def main():
     if do_recon and cfg["targets"]:
         cyan = "\033[96m"
         reset = "\033[0m"
-        print(f"\n{cyan}[{reset}▶{cyan}] Recon sơ bộ...{reset}")
+        print(f"\n{cyan}[{reset}▶{cyan}] Quick recon...{reset}")
         ctx = agent.start_recon()
         print(ctx[:800])
     elif do_recon:
-        print(f"[*] Không có target web — bỏ qua recon (phiên này chỉ SAST).")
+        print(f"[*] No web target — skipping recon (SAST-only session).")
 
     if non_interactive or one_shot:
         prompt_text = one_shot if isinstance(one_shot, str) else \
@@ -369,12 +369,12 @@ def main():
         return
 
     # ── interactive ──
-    print("\n[*] Interactive mode. Gõ 'q' để thoát, '!! <cmd>' chạy shell.")
+    print("\n[*] Interactive mode. Type 'q' to quit, '!! <cmd>' to run shell commands.")
     while True:
         try:
             line = input(f"\n{GREEN}{BOLD}aixsec-x>{RESET} ").strip()
         except (EOFError, KeyboardInterrupt):
-            print("\n[!] Thoát.")
+            print("\n[!] Exiting.")
             break
         if not line:
             continue

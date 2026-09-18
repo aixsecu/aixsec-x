@@ -68,11 +68,11 @@ def _parse_tool_calls(msg: dict) -> list:
 
 def _conn_error(cfg: dict) -> dict:
     base = str(cfg["ollama_url"]).rstrip("/")
-    return {"content": ("[!] Không kết nối được Ollama tại " + base + ".\n"
-                         "    • Máy chủ đã chạy 'ollama serve' chưa?\n"
-                         "    • Remote? Phải set OLLAMA_HOST=0.0.0.0 trên máy chủ.\n"
-                         "    • Firewall máy chủ mở 11434/tcp chưa?\n"
-                         "    • Chẩn đoán: python3 agent.py --check-ollama"),
+    return {"content": ("[!] Cannot reach Ollama at " + base + ".\n"
+                         "    • Is 'ollama serve' running on the server?\n"
+                         "    • Remote? Set OLLAMA_HOST=0.0.0.0 on the server.\n"
+                         "    • Is port 11434/tcp open in the server firewall?\n"
+                         "    • Diagnose: python3 agent.py --check-ollama"),
             "tool_calls": []}
 
 
@@ -107,9 +107,9 @@ def ollama_chat(messages: list, tools: list | None = None, config: dict | None =
     except requests.exceptions.ConnectionError:
         return _conn_error(cfg)
     except requests.exceptions.Timeout:
-        return {"content": "[!] Ollama timeout — model đang load hoặc quá lớn.", "tool_calls": []}
+        return {"content": "[!] Ollama timeout — model may still be loading or too large.", "tool_calls": []}
     except Exception as e:
-        return {"content": f"[!] Lỗi Ollama: {e}", "tool_calls": []}
+        return {"content": f"[!] Ollama error: {e}", "tool_calls": []}
 
     if not stream:
         msg = r.json().get("message", {})
@@ -144,9 +144,9 @@ def ollama_chat(messages: list, tools: list | None = None, config: dict | None =
     except requests.exceptions.ConnectionError:
         return _conn_error(cfg)
     except requests.exceptions.Timeout:
-        return {"content": "[!] Ollama timeout — model đang load hoặc quá lớn.", "tool_calls": []}
+        return {"content": "[!] Ollama timeout — model may still be loading or too large.", "tool_calls": []}
     except Exception as e:
-        return {"content": f"[!] Lỗi Ollama: {e}", "tool_calls": []}
+        return {"content": f"[!] Ollama error: {e}", "tool_calls": []}
     return {"content": "".join(parts).strip(),
             "tool_calls": _parse_tool_calls({"tool_calls": raw_calls})}
 
@@ -169,14 +169,14 @@ def check_ollama(config: dict | None = None) -> str:
         r.raise_for_status()
         ver = (r.json() or {}).get("version", "?")
     except (requests.exceptions.ConnectionError, ConnectionError):
-        return ("[✗] KHÔNG kết nối được Ollama tại {0}\n"
-                "    • Máy chủ đã chạy 'ollama serve' chưa?\n"
-                "    • Remote: phải set OLLAMA_HOST=0.0.0.0 trên máy chủ "
-                "(mặc định Ollama chỉ nghe localhost).\n"
-                "    • Firewall máy chủ mở 11434/tcp chưa?  (ufw allow 11434/tcp)\n"
-                "    • Thử tay:  curl {0}/api/version".format(base))
+        return ("[✗] CANNOT reach Ollama at {0}\n"
+                "    • Is 'ollama serve' running on the server?\n"
+                "    • Remote: set OLLAMA_HOST=0.0.0.0 on the server "
+                "(Ollama only listens on localhost by default).\n"
+                "    • Is port 11434/tcp open in the server firewall?  (ufw allow 11434/tcp)\n"
+                "    • Test manually:  curl {0}/api/version".format(base))
     except Exception as e:  # noqa: BLE001
-        return "[✗] Lỗi khi gọi {0}: {1}".format(base, e)
+        return "[✗] Error calling {0}: {1}".format(base, e)
 
     outs = ["[✓] Ollama server: {0}  (version {1})".format(base, ver)]
     try:
@@ -184,16 +184,16 @@ def check_ollama(config: dict | None = None) -> str:
         r.raise_for_status()
         names = [m.get("name", "") for m in (r.json() or {}).get("models", [])]
     except Exception as e:  # noqa: BLE001
-        outs.append("[!] Không lấy được danh sách model (/api/tags): {0}".format(e))
+        outs.append("[!] Could not list models (/api/tags): {0}".format(e))
         names = []
     if names:
-        outs.append("[i] Model trên server ({0}): {1}".format(len(names), ", ".join(names[:15])))
+        outs.append("[i] Models on server ({0}): {1}".format(len(names), ", ".join(names[:15])))
     else:
-        outs.append("[i] Server chưa có model nào — pull trên MÁY CHỦ, không phải máy client.")
+        outs.append("[i] Server has no models yet — pull ON THE SERVER, not the client.")
     want = str(cfg.get("model") or "")
     if names and want in names:
-        outs.append("[✓] WEBX_MODEL='{0}' CÓ trên server — sẵn sàng dùng.".format(want))
+        outs.append("[✓] WEBX_MODEL='{0}' found on server — ready to use.".format(want))
     elif names:
-        outs.append("[✗] WEBX_MODEL='{0}' KHÔNG có trên server.\n"
-                    "    Chạy trên MÁY CHỦ:  ollama pull {0}".format(want))
+        outs.append("[✗] WEBX_MODEL='{0}' NOT found on server.\n"
+                    "    Run ON THE SERVER:  ollama pull {0}".format(want))
     return "\n".join(outs)

@@ -483,7 +483,7 @@ class TestOllamaRemote(unittest.TestCase):
                                 "model": "qwen2.5:7b"})
         self.assertIn("Ollama server: http://192.168.1.50:11434", out)
         self.assertIn("version 0.5.4", out)
-        self.assertIn("CÓ trên server", out)
+        self.assertIn("found on server", out)
 
     def test_check_ollama_model_missing_gives_pull_hint(self):
         from llm import check_ollama
@@ -492,7 +492,7 @@ class TestOllamaRemote(unittest.TestCase):
                 {"models": [{"name": "llama3.2:3b"}]})):
             out = check_ollama({"ollama_url": "http://192.168.1.50:11434",
                                 "model": "qwen2.5:7b"})
-        self.assertIn("KHÔNG có trên server", out)
+        self.assertIn("NOT found on server", out)
         self.assertIn("ollama pull qwen2.5:7b", out)
 
     def test_check_ollama_unreachable_fixes_hints(self):
@@ -500,7 +500,7 @@ class TestOllamaRemote(unittest.TestCase):
         with patch("llm.requests.get", side_effect=ConnectionError("refused")):
             out = check_ollama({"ollama_url": "http://192.168.1.50:11434",
                                 "model": "qwen2.5:7b"})
-        self.assertIn("KHÔNG kết nối", out)
+        self.assertIn("CANNOT reach Ollama", out)
         self.assertIn("OLLAMA_HOST=0.0.0.0", out)
         self.assertIn("ufw allow 11434/tcp", out)
 
@@ -562,7 +562,7 @@ class TestOllamaRemote(unittest.TestCase):
         with patch("llm.requests.post", side_effect=fake_post):
             out = ollama_chat([{"role": "user", "content": "hi"}], config=cfg_s,
                               on_token=lambda t: None)
-        self.assertIn("Không kết nối", out["content"])
+        self.assertIn("Cannot reach Ollama", out["content"])
         self.assertIn("11434/tcp", out["content"])
         self.assertEqual(out["tool_calls"], [])
 
