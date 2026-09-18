@@ -178,6 +178,7 @@ python3 agent.py --non-interactive                # run automatically
 | `WEBX_TEMPERATURE` | `0.1` | Sampling temperature |
 | `WEBX_PROMPT_STYLE` | `auto` | `auto`=model-name heuristic (≤9B→compact, ≥14B→full); `compact`=short prompt for small models; `full`=full prompt |
 | `WEBX_OUTPUT_CAP` | `5000` | Max characters of tool output fed into the context |
+| `WEBX_NUM_PREDICT` | `0` | **v1.4.2** hard cap on tokens the model may generate per call. `0`=unlimited (default). Set `512-2048` if the model writes long essays that slow each round — risk: the final JSON may be cut off if set too low |
 
 Make env vars permanent by appending them to `~/.zshrc` (Kali's default shell
 is zsh; use `~/.bashrc` if you are on bash):
@@ -383,6 +384,24 @@ better than long prompts. `prompts.py` ships 2 variants with auto-selection:
   marked `⚠ thiếu bằng chứng` + reasons, so the operator can verify manually.
   (Validated against the v1.4 live run: the 2 hallucinated findings
   `dynamic_404`/`openresty_config` are flagged, the 3 real ones pass.)
+- **v1.4.2 depth rule (active check every round):** root cause of "shallow"
+  runs was recon eating the first 2 rounds (249 s of model essays on a 9B) and
+  planning active tools the machine doesn't have. Now: recon is capped at
+  **max 2 rounds**; **from round 3 every round MUST run at least 1 ACTIVE
+  check** (ffuf_dir, sqlmap_check, sqli_manual_test, sqli_blind_extract,
+  nikto_scan, nuclei_scan-if-installed); tools are batched 2-5 per round; and
+  commentary between tool calls is capped at **2 short sentences** (no essays).
+- **v1.4.2 unavailable-tool detection:** `tools.available_tools()` probes every
+  binary-backed tool once at startup (`shutil.which`) — `nuclei` and `arjun`
+  are commonly missing on Kali and were silently burning rounds on
+  outcome=error. The banner and the system prompt now print
+  `⚠ TOOLS KHÔNG KHẢ DỤNG (binary thiếu): nuclei_scan(nuclei), …` with the
+  binary names, so the 9B model never plans around dead tools and you know
+  exactly what to `apt install`.
+- **v1.4.2 fix live-display wrap:** `_LiveDisplay._flush` used textwrap with
+  `break_long_words=True`, splitting `**ffuf_dir**` across a wrap boundary as
+  `**ff` / `uf_dir**`. Now `break_long_words=False, break_on_hyphens=False` —
+  long words jump to the next line whole.
 - `build_system_prompt(cfg)` — `WEBX_PROMPT_STYLE=auto` (default): model name
   containing `14b/32b/70b/72b/122b` → `full`, otherwise → `compact`. Manual
   override: `export WEBX_PROMPT_STYLE=compact|full`.
