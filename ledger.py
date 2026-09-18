@@ -29,6 +29,11 @@ class Finding:
     confidence: float = 0.0
     evidence: list[str] = field(default_factory=list)
     reproduction_steps: list[str] = field(default_factory=list)
+    evidence_gaps: list[str] = field(default_factory=list)
+
+    @property
+    def has_evidence_gap(self) -> bool:
+        return bool(self.evidence_gaps)
 
     @property
     def key(self) -> tuple:
@@ -94,6 +99,89 @@ def parse_findings_json(text: str) -> list[Finding]:
     return out
 
 
+def host_of(url: str) -> str:
+    """Rút hostname (lower) từ URL; rỗng nếu không phải URL http(s)."""
+    m = re.match(r"https?://([^/]+)", (url or "").strip())
+    return (m.group(1) if m else "").lower().strip(".")
+
+
+# Token công nghệ: nếu được khai báo trong finding nhưng không xuất hiện
+# nguyên văn trong BẤT KỲ tool output OK nào của host → nghi bịa.
+_TECH_TOKENS = [
+    "openresty", "nginx", "apache", "iis", "litespeed", "caddy", "varnish",
+    "fastly", "cloudflare", "ladi", "express", "tomcat", "jboss",
+    "wordpress", "joomla", "drupal", "magento", "shopify", "prestashop",
+    "opencart", "laravel", "django", "rails", "spring", "asp.net", "php",
+]
+
+
+def _host_evidence(history: list[dict]) -> dict:
+    """history: transcript calls [{name, args, outcome, output}].
+    Chỉ dùng kết quả outcome=ok có nội dung thật (bỏ duplicate/blocked/error
+    và output bắt đầu bằng '[!]'). Trả {host: {"tools": set, "text": str-lower}}."""
+    ev: dict = {}
+    for c in history or []:
+        if c.get("outcome") != "ok":
+            continue
+        out = c.get("output") or ""
+        if out.lstrip().startswith("[!]"):
+            continue
+        args = c.get("args") or {}
+        u = str(args.get("url") or args.get("host") or "")
+        h = host_of(u)
+        if not h:
+            continue
+        e = ev.setdefault(h, {"tools": set(), "text": ""})
+        e["tools"].add(str(c.get("name", "")))
+        e["text"] += " " + out.lower()
+    return ev
+
+
+def check_findings_evidence(findings: list[Finding], history: list[dict]) -> int:
+    """Đối chiếu từng finding với tool output thật của phiên; ghi evidence_gaps.
+    Trả số finding bị gắn cờ thiếu bằng chứng. KHÔNG xóa finding — giữ để
+    operator tự xác minh, chỉ đánh dấu rõ ràng."""
+    ev = _host_evidence(history)
+    flagged = 0
+    for f in findings or []:
+        gaps: list[str] = []
+        h = host_of(f.url)
+        nd = f"{f.name} {f.description} {f.service}".lower()
+        if not f.url:
+            gaps.append("finding không có URL — không đối chiếu được bằng chứng")
+        elif h not in ev:
+            gaps.append(
+                f"không có tool output OK nào cho host '{h}' trong phiên này — "
+                "mọi chi tiết đều chưa được hỗ trợ")
+        else:
+            e = ev[h]
+            text = e["text"]
+            if ("404" in nd or "error page" in nd or "not found page" in nd):
+                if "404" not in text:
+                    gaps.append("mô tả nói về 404/error page nhưng không tool output "
+                                "nào trong phiên cho thấy trạng thái 404 trên host này")
+            if "config" in f.name.lower():
+                gaps.append("'cấu hình phát hiện được' — toolset không đọc được cấu hình "
+                            "server, chỉ thấy banner/headers (không có cơ sở)")
+            if "waf" in nd and "waf_detect" not in e["tools"]:
+                gaps.append("nhắc đến WAF nhưng chưa chạy waf_detect trên host này")
+            for tok in _TECH_TOKENS:
+                if tok in nd and tok not in text:
+                    gaps.append(f"khai báo công nghệ '{tok}' nhưng token này không xuất hiện "
+                                "trong bất kỳ tool output OK nào của host")
+                    break
+            if not (e["tools"] & {"http_probe", "headers_recon", "detect_cms",
+                                  "waf_detect", "_ffuf_dir", "ffuf_dir",
+                                  "nikto_scan", "nuclei_scan", "param_discovery",
+                                  "subdomain_probe"}):
+                gaps.append("host chỉ mới xuất hiện qua subdomain_enum/dns_lookup — "
+                            "chưa probe thật (info-only)")
+        f.evidence_gaps = gaps
+        if gaps:
+            flagged += 1
+    return flagged
+
+
 def validation_plan(ledger: Ledger) -> list[dict]:
     """Sinh kế hoạch xác minh cho từng finding chưa confirmed."""
     plan = []
@@ -122,6 +210,9 @@ def render_markdown(ledger: Ledger, target: str, plan: list | None = None) -> st
         if f.url:
             lines.append(f"- URL: {f.url}")
         lines.append(f"- Mô tả: {f.description}")
+        if f.evidence_gaps:
+            lines.append("- ⚠ THIẾU BẰNG CHỨNG TRONG PHIÊN (có thể model bịa):")
+            lines += [f"  - {g}" for g in f.evidence_gaps]
         if f.cves:
             lines.append(f"- CVE: {', '.join(f.cves)}")
         if f.evidence:

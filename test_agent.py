@@ -19,7 +19,8 @@ from urllib.parse import unquote_plus
 sys.path.insert(0, __file__.rsplit("/", 1)[0])
 
 from agent import (WebXAgent, SYSTEM_PROMPT, resolve_scope_interactive)  # noqa: E402
-from ledger import Ledger, Finding, parse_findings_json, validation_plan, render_markdown  # noqa: E402
+from ledger import (Ledger, Finding, parse_findings_json, validation_plan,
+                   render_markdown, check_findings_evidence)  # noqa: E402
 from scope import ScopePolicy  # noqa: E402
 from llm import InjectionGuard  # noqa: E402
 
@@ -878,6 +879,131 @@ class TestLiveDisplayBuffer(unittest.TestCase):
         lines = out.getvalue().splitlines()
         content_lines = [l for l in lines if "▸" in l or "↳" in l]
         self.assertLess(len(content_lines), 50)
+
+
+class TestEvidenceGuard(unittest.TestCase):
+    """v1.4.1: check_findings_evidence — phát hiện finding do model BỊA
+    (không có tool output nào hỗ trợ trong phiên) thay vì chỉ dựa vào prompt
+    (prompt rule v1.4 đã chứng minh là chưa đủ với model 9B)."""
+
+    @staticmethod
+    def _call(name, out, url="https://abc.vn", outcome="ok"):
+        args = {"url": url} if url else {}
+        return {"name": name, "args": args, "outcome": outcome, "output": out}
+
+    @staticmethod
+    def _f(name, url="https://abc.vn", **kw):
+        return Finding(name=name, url=url, **kw)
+
+    # ── G1: 404/error-page claim ──────────────────────────────────
+    def test_404_claim_without_evidence_flagged(self):
+        history = [self._call("http_probe", "status 200, server: nginx")]
+        f = self._f("Dynamic 404 page",
+                    description="Path không tồn tại trả về 404 page riêng")
+        self.assertEqual(check_findings_evidence([f], history), 1)
+        self.assertTrue(any("404" in g for g in f.evidence_gaps))
+
+    def test_404_claim_backed_by_output_ok(self):
+        history = [self._call("http_probe", "status 404 — server: nginx")]
+        f = self._f("Dynamic 404 page", description="path lạ trả 404")
+        self.assertEqual(check_findings_evidence([f], history), 0, f.evidence_gaps)
+
+    # ── G2: config claim luôn bị cờ ───────────────────────────────
+    def test_config_claim_always_flagged(self):
+        history = [self._call("http_probe", "server: openresty")]
+        f = self._f("OpenResty config lộ thông tin")
+        self.assertEqual(check_findings_evidence([f], history), 1)
+        self.assertTrue(any("cấu hình" in g for g in f.evidence_gaps))
+
+    # ── G4: tech token ────────────────────────────────────────────
+    def test_tech_token_supported_by_probe(self):
+        history = [self._call("http_probe", "server: openresty, x-cache: ladi")]
+        f = self._f("OpenResty + LADI CDN exposed")
+        self.assertEqual(check_findings_evidence([f], history), 0, f.evidence_gaps)
+
+    def test_tech_token_missing_flagged(self):
+        history = [self._call("http_probe", "server: nginx, date: now")]
+        f = self._f("WordPress detected", description="phát hiện wp-login")
+        self.assertEqual(check_findings_evidence([f], history), 1)
+        self.assertTrue(any("wordpress" in g for g in f.evidence_gaps))
+
+    # ── G3: WAF ───────────────────────────────────────────────────
+    def test_waf_claim_without_waf_detect_flagged(self):
+        history = [self._call("http_probe", "server: cloudflare")]
+        f = self._f("WAF Cloudflare bảo vệ site")
+        self.assertEqual(check_findings_evidence([f], history), 1)
+        self.assertTrue(any("waf_detect" in g for g in f.evidence_gaps))
+
+    def test_waf_claim_with_waf_detect_ok(self):
+        history = [self._call("http_probe", "server: nginx"),
+                   self._call("waf_detect", "[+] Cloudflare WAF hiện diện")]
+        f = self._f("WAF hiện diện")
+        self.assertEqual(check_findings_evidence([f], history), 0, f.evidence_gaps)
+
+    # ── G6: host chưa từng có output OK ───────────────────────────
+    def test_host_without_ok_evidence_flagged(self):
+        history = [self._call("http_probe", "status 200", url="https://abc.vn")]
+        f = self._f("Vuln X", url="https://other.vn/path")
+        self.assertEqual(check_findings_evidence([f], history), 1)
+        self.assertTrue(any("other.vn" in g for g in f.evidence_gaps))
+
+    # ── duplicate/error/[!] không tính là bằng chứng ──────────────
+    def test_duplicate_and_error_outputs_ignored(self):
+        history = [
+            self._call("http_probe", "[!] Tool được gọi lặp...", outcome="duplicate"),
+            self._call("http_probe", "[!] timeout", outcome="error"),
+            self._call("http_probe", "[!] blocked", outcome="blocked"),
+            self._call("http_probe", "[!] binary not found", outcome="ok"),
+        ]
+        f = self._f("OpenResty exposed")
+        # duplicate/error/[!] đều bị bỏ qua → host không có bằng chứng thật
+        self.assertEqual(check_findings_evidence([f], history), 1)
+        self.assertTrue(any("không có tool output OK" in g for g in f.evidence_gaps))
+
+    # ── subdomain mới tìm thấy mà chưa probe → chưa đủ bằng chứng ──
+    def test_discovered_subdomain_not_probed_flagged(self):
+        """subdomain_enum chỉ tìm ra h1, KHÔNG có lệnh probe nào lên h1
+        (cả dns_lookup lẫn subdomain_enum đều không nằm trong nhóm
+        probe-like) → finding trên h1 phải bị cờ thiếu bằng chứng."""
+        history = [self._call("subdomain_enum", "thấy host mới: https://h1.abc.vn",
+                              url="https://abc.vn")]
+        f = self._f("H1 exposed", url="https://h1.abc.vn")
+        self.assertEqual(check_findings_evidence([f], history), 1)
+        self.assertTrue(any("không có tool output OK" in g for g in f.evidence_gaps))
+
+    # ── tái hiện live-run v1.4 trên hoisach ───────────────────────
+    def test_live_run_scenario_hoisach(self):
+        """3 finding thật (openresty/csp/ladi) phải qua được guard;
+        2 finding bịa (dynamic_404, openresty_config) phải bị cờ."""
+        probe_out = ("status 200 | server: openresty | content-type: text/html "
+                     "| content-security-policy: default-src https: data: "
+                     "'unsafe-inline' 'unsafe-eval' | set-cookie: LADI_CLIENT_ID")
+        history = [self._call("http_probe", probe_out,
+                              url="https://hoisach.dinhtibooks.com.vn")]
+        findings = [
+            Finding("OpenResty server exposed",
+                    url="https://hoisach.dinhtibooks.com.vn",
+                    description="Server banner lộ openresty"),
+            Finding("CSP quá permissive",
+                    url="https://hoisach.dinhtibooks.com.vn",
+                    description="CSP cho phép unsafe-inline/unsafe-eval + data:"),
+            Finding("LADI CDN tham gia",
+                    url="https://hoisach.dinhtibooks.com.vn",
+                    description="Set-Cookie LADI_CLIENT_ID trên response"),
+            Finding("Dynamic 404 page",
+                    url="https://hoisach.dinhtibooks.com.vn",
+                    description="Path lạ trả về trang 404 tùy biến"),
+            Finding("OpenResty config rò rỉ",
+                    url="https://hoisach.dinhtibooks.com.vn",
+                    description="Cấu hình server hiển thị trực tiếp"),
+        ]
+        n = check_findings_evidence(findings, history)
+        self.assertEqual(n, 2)  # chỉ dynamic_404 + config bị cờ
+        self.assertEqual(findings[0].evidence_gaps, [])
+        self.assertEqual(findings[1].evidence_gaps, [])
+        self.assertEqual(findings[2].evidence_gaps, [])
+        self.assertTrue(any("404" in g for g in findings[3].evidence_gaps))
+        self.assertTrue(any("cấu hình" in g for g in findings[4].evidence_gaps))
 
 
 if __name__ == "__main__":

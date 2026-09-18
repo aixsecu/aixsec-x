@@ -349,6 +349,19 @@ Model 7B/9B (vd: `huihui_ai/qwen3.5-abliterated:9b`) tuân theo **ít quy tắc*
   báo **reachable/status** — model KHÔNG được bịa headers, CSP, port, WAF hay
   tech stack chưa hề quan sát. Finding về subdomain phải kèm tool run thật
   (trong scope). Giới hạn: tối đa 6 findings/report.
+- **v1.4.1 — Evidence guard dạng xác định (deterministic):** chỉ dựa vào prompt
+  là KHÔNG đủ với model 7B/9B — model 9B vẫn có thể thêm finding chưa hề quan
+  sát. `ledger.check_findings_evidence()` giờ đối chiếu TỪNG finding được commit
+  với transcript tool thật của phiên: claim về 404/error-page phải có chữ "404"
+  trong tool output; token công nghệ (openresty, nginx, cloudflare, wordpress,
+  laravel, …) phải xuất hiện nguyên văn trong tool output OK của đúng host đó;
+  claim WAF phải có lần chạy `waf_detect`; finding kiểu "phát hiện cấu hình
+  server" luôn bị cờ (không tool nào đọc được config); host không có output OK
+  nào hoặc chỉ mới biết qua subdomain/dns đều bị cờ. Kết quả duplicate/blocked/
+  `[!]` KHÔNG tính là bằng chứng. Finding KHÔNG bị xóa — vẫn giữ trong
+  ledger/terminal kèm dấu `⚠ thiếu bằng chứng` + lý do để operator tự xác minh.
+  (Đã kiểm chứng bằng live-run v1.4: 2 finding bịa `dynamic_404`/`openresty_config`
+  bị cờ đúng, 3 finding thật qua được.)
 - `build_system_prompt(cfg)` — `WEBX_PROMPT_STYLE=auto` (mặc định): tên model chứa `14b/32b/70b/72b/122b` → `full`, còn lại → `compact`. Ghi đè thủ công: `export WEBX_PROMPT_STYLE=compact|full`.
 
 ```bash

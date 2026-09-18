@@ -23,14 +23,15 @@ import time
 
 # ── local imports ──
 from config import load_config
-from ledger import (Ledger, parse_findings_json, render_markdown, validation_plan)
+from ledger import (Ledger, parse_findings_json, render_markdown, validation_plan,
+                   check_findings_evidence)
 from llm import InjectionGuard, ollama_chat
 from prompts import SYSTEM_PROMPT, build_system_prompt
 from scope import ScopePolicy
 from tools import TOOL_REGISTRY, TOOL_INDEX
 
 # ── terminal colors (AIXSEC-X style) ──
-VERSION = "1.4"
+VERSION = "1.4.1"
 
 RED = "\033[91m"
 GREEN = "\033[92m"
@@ -236,8 +237,7 @@ class WebXAgent:
                 result["final_text"] = resp.get("content", "")
                 if not self._looks_like_json(result["final_text"]):
                     return result
-                for f in parse_findings_json(result["final_text"]):
-                    self.ledger.add(f)
+                self._commit_findings(result)
                 try:
                     d = json.loads(self._strip_fence(result["final_text"]))
                     result["risk_level"] = d.get("risk_level", "UNKNOWN")
@@ -297,6 +297,7 @@ class WebXAgent:
                     else f"{RED}[✗]{RESET}"
                 print(f"{tag} {name} → outcome={r.get('outcome', '?')} ({dt:.1f}s)",
                       flush=True)
+                r.setdefault("args", args)  # giữ args để đối chiếu bằng chứng
                 results.append(r)
             disp.done()
             self.transcript.append({"round": rnd, "type": "tools", "calls": results})
@@ -330,15 +331,18 @@ class WebXAgent:
         if forced:
             msgs.append({"role": "user", "content":
                         "Các tool gọi ở round trước đều trả duplicate/blocked — "
-                        "không còn thông tin mới. KHÔNG gọi tool nữa. Tổng hợp dữ liệu "
-                        "đã thu thập được và trả final JSON ngay."})
+                        "không còn thông tin mới. KHÔNG gọi tool nữa. Tổng hợp DỮ LIỆU "
+                        "THẬT TỪ [TOOL RESULTS] ở trên và trả final JSON ngay. "
+                        "Chỉ đưa vào finding những gì thật sự xuất hiện trong tool output "
+                        "của phiên này (ghi nguồn trong description). KHÔNG bịa thêm "
+                        "404/error-page, cấu hình server, WAF/CMS hoặc chi tiết nào "
+                        "khác nếu chưa có tool output hỗ trợ."})
         disp = _LiveDisplay(0 if forced else max_rounds, max_rounds)
         resp = self.chat(msgs, tools=[t.schema() for t in self.tools], json_mode=True,
                          on_token=disp.on_token, on_reasoning=disp.on_reasoning)
         disp.done()
         result["final_text"] = resp.get("content", "")
-        for f in parse_findings_json(result["final_text"]):
-            self.ledger.add(f)
+        self._commit_findings(result)
         try:
             d = json.loads(result["final_text"]) if result["final_text"].strip().startswith("{") else {}
             result["risk_level"] = d.get("risk_level", "UNKNOWN")
@@ -357,6 +361,25 @@ class WebXAgent:
     @staticmethod
     def _looks_like_json(t: str) -> bool:
         return t.strip().startswith("{") or "findings" in t[:200]
+
+    def _history(self) -> list[dict]:
+        """Toàn bộ tool calls của phiên (args + outcome + output) để đối chiếu bằng chứng."""
+        out: list[dict] = []
+        for rnd in self.transcript:
+            if rnd.get("type") == "tools":
+                out.extend(rnd.get("calls") or [])
+        return out
+
+    def _commit_findings(self, result: dict) -> None:
+        """Parse final JSON → đối chiếu từng finding với tool output thật (evidence
+        guard v1.4.1) → thêm vào ledger. Finding thiếu bằng chứng vẫn được giữ
+        nhưng đánh dấu evidence_gaps để operator biết cần xác minh thủ công."""
+        findings = parse_findings_json(result.get("final_text", ""))
+        if findings:
+            flagged = check_findings_evidence(findings, self._history())
+            result["evidence_flagged"] = flagged
+        for f in findings:
+            self.ledger.add(f)
 
     # ─────────────────────────────────────────
     # SESSION MGMT
@@ -402,13 +425,21 @@ def _print_findings(agent: WebXAgent):
     print(f"{BOLD}{MAGENTA}    AIXSEC-X FINDINGS LEDGER{RESET}")
     print(f"{CYAN}{'═' * 64}{RESET}")
     sev = {"critical": 0, "high": 1, "medium": 2, "low": 3, "info": 4}
+    n_gap = 0
     for f in sorted(agent.ledger.all(), key=lambda x: sev.get(x.severity, 5)):
         color = SEV_COLOR.get(f.severity, CYAN)
         st = STATUS_COLOR.get(f.status, RESET)
         sev_tag = f"{BOLD}{color}[{f.severity.upper():<8}]{RESET}"
         status = f"{st}{f.status}{RESET}"
-        print(f"{sev_tag} {f.name}  →  {status}  ({f.url or '-'})")
+        warn = f" {DIM}⚠ {len(f.evidence_gaps)} thiếu bằng chứng{RESET}" if f.evidence_gaps else ""
+        print(f"{sev_tag} {f.name}  →  {status}  ({f.url or '-'}){warn}")
+        for g in f.evidence_gaps:
+            print(f"        {RED}⚠ {g}{RESET}")
+            n_gap += 1
     plan = validation_plan(agent.ledger)
+    if n_gap:
+        print(f"\n{RED}[!] {n_gap} cảnh báo thiếu bằng chứng — những finding này có thể"
+              f" do model bịa. Xác minh thủ công trước khi dùng.{RESET}")
     if plan:
         print(f"\n{BOLD}{YELLOW}[NEEDS VALIDATION]{RESET}")
         for p in plan:

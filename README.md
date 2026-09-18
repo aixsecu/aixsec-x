@@ -370,6 +370,19 @@ better than long prompts. `prompts.py` ships 2 variants with auto-selection:
   is reported as **reachable/status only** — the model must not invent headers,
   CSP, ports, WAF or tech stacks it never observed. Subdomain findings require an
   actual (in-scope) tool run. Cap: max 6 findings per report.
+- **v1.4.1 evidence guard (deterministic):** prompt rules alone are not enough for
+  7B/9B models — a 9B model can pad the report with findings it never observed.
+  `ledger.check_findings_evidence()` now cross-checks EVERY committed finding
+  against the session's real tool transcript: 404/error-page claims need a "404"
+  in some tool output; tech tokens (openresty, nginx, cloudflare, wordpress,
+  laravel, ...) must literally appear in an ok tool output for that host; WAF
+  claims need a `waf_detect` run; "server config" findings are always flagged
+  (no tool reads server config); hosts with zero ok tool output or known only via
+  subdomain/dns discovery are flagged. duplicate/blocked/`[!]` results never
+  count as evidence. Findings are NOT deleted — they stay in the ledger/terminal
+  marked `⚠ thiếu bằng chứng` + reasons, so the operator can verify manually.
+  (Validated against the v1.4 live run: the 2 hallucinated findings
+  `dynamic_404`/`openresty_config` are flagged, the 3 real ones pass.)
 - `build_system_prompt(cfg)` — `WEBX_PROMPT_STYLE=auto` (default): model name
   containing `14b/32b/70b/72b/122b` → `full`, otherwise → `compact`. Manual
   override: `export WEBX_PROMPT_STYLE=compact|full`.
