@@ -32,8 +32,8 @@ from tools import (TOOL_REGISTRY, TOOL_INDEX, TOOL_BINS, TOOL_TIMEOUTS,
                    available_tools)
 
 # ── terminal colors (AIXSEC-X style) ──
-VERSION = "1.4.4"
 
+VERSION = "1.4.4"
 RED = "\033[91m"
 GREEN = "\033[92m"
 YELLOW = "\033[93m"
@@ -231,6 +231,7 @@ class WebXAgent:
             # v1.4.4: chỉ đo thời gian THỰC THI tool — chờ operator duyệt
             # (_risk_ok/input()) nằm ngoài try này nên không bị tính vào duration.
             t0 = time.time()
+
             out = spec.exec_fn(**kw)
             dt = round(time.time() - t0, 1)
             # v1.4.4: output mở đầu '[!]' = lỗi thực thi (timeout, thiếu binary,
