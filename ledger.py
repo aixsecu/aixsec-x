@@ -99,14 +99,15 @@ def validation_plan(ledger: Ledger) -> list[dict]:
     plan = []
     for f in ledger.by_status("candidate") + ledger.by_status("needs_validation"):
         steps = []
+        focus = (f.service or "").split()[-1] if f.service else ""
         if f.cves:
-            steps.append(f"Tìm template nuclei cho {', '.join(f.cves)} và chạy trên {f.url or 'target'}")
+            steps.append(f"Tra cứu {', '.join(f.cves)} và so khớp version/stack thực tế trên {f.url or 'target'}")
         if f.url:
-            steps.append(f"Chạy nuclei -tags {f.service.split()[-1] if f.service else 'cve'} "
-                         f"hoặc payload thủ công để xác nhận trên {f.url}")
+            svc = f" — kỳ vọng service {focus}" if focus else ""
+            steps.append(f"Xác minh thủ công (không phụ thuộc nuclei): curl -sSI {f.url}{svc}")
             steps.append("Ghi request/response đối chứng: control vs payload")
         if f.port:
-            steps.append(f"Verify dịch vụ thực tế trên port {f.port}")
+            steps.append(f"Verify cổng/dịch vụ thực tế trên {f.url or 'target'} (vd: curl -skI --max-time 10)")
         if not steps:
             steps.append("Xác minh thủ công với bằng chứng request/response")
         plan.append({"finding": f.name, "url": f.url, "status": f.status,

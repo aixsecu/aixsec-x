@@ -30,6 +30,8 @@ from scope import ScopePolicy
 from tools import TOOL_REGISTRY, TOOL_INDEX
 
 # ── terminal colors (AIXSEC-X style) ──
+VERSION = "1.4"
+
 RED = "\033[91m"
 GREEN = "\033[92m"
 YELLOW = "\033[93m"
@@ -56,13 +58,29 @@ class _LiveDisplay:
 
     Mỗi lượt (round) dùng 1 đối tượng: khởi tạo in header, callback từ
     ollama_chat streaming đẩy từng dòng, done() chốt elapsed time.
+
+    v1.4: content KHÔNG in từng token nữa (trước đây mỗi token 1 dòng "▸ x"
+    → màn hình ngập ~700 dòng khi model phun final JSON). Giờ buffer token
+    và chỉ in khi gặp newline hoặc khi đủ dài → in theo dòng có wrap theo
+    độ rộng terminal (first line "▸ ", dòng nối "↳ ").
     """
 
     REASON_CAP = 250   # ký tự tối đa mỗi dòng reasoning
     CONTENT_CAP = 600  # ký tự tối đa mỗi dòng nội dung
+    LINE_WRAP = 150    # độ rộng wrap mặc định (được điều chỉnh theo terminal)
+    MAX_LINES = 200    # cứng giới hạn số dòng content hiển thị mỗi lượt (chống ngập)
 
     def __init__(self, rnd, max_rounds=None):
         self.t0 = time.time()
+        self._buf = ""
+        self._lines = 0
+        self._done = False
+        try:
+            import shutil
+            cols = shutil.get_terminal_size((self.LINE_WRAP, 24)).columns
+            self._wrap = max(60, min(220, cols))
+        except Exception:  # noqa: BLE001
+            self._wrap = self.LINE_WRAP
         label = f"Round {rnd}/{max_rounds}" if rnd else "Final round"
         print(f"\n{CYAN}[*]{RESET} {BOLD}{label}{RESET} — "
               f"{DIM}model processing...{RESET}", flush=True)
@@ -72,17 +90,58 @@ class _LiveDisplay:
         s = "".join(chunk) if isinstance(chunk, (list, tuple)) else str(chunk)
         return " ".join(s.split())[:cap]
 
+    def _flush(self):
+        """In buffer hiện tại thành các dòng wrap (▸ dòng đầu, ↳ dòng nối)."""
+        self._buf = (self._buf or "").rstrip()
+        if not self._buf:
+            return
+        try:
+            import textwrap
+            raw = textwrap.wrap(self._buf, self._wrap) or [self._buf]
+        except Exception:  # noqa: BLE001
+            raw = [self._buf[:self._wrap]]
+        on = int(self._lines) < int(self.MAX_LINES)
+        for i, line in enumerate(raw):
+            self._lines += 1
+            if not on:
+                continue  # đã quá MAX_LINES — bỏ qua phần còn lại
+            if i == 0:
+                print(f"{GREEN}  ▸{RESET} {GREEN}{line}{RESET}", flush=True)
+            else:
+                print(f"{DIM}  ↳{RESET} {GREEN}{line}{RESET}", flush=True)
+        self._buf = ""
+
     def on_reasoning(self, chunk: str):
+        self._lines += 1
         s = self._line(chunk, self.REASON_CAP)
         if s:
             print(f"{DIM}  ✦ think:{RESET} {DIM}{s}{RESET}", flush=True)
 
     def on_token(self, token: str):
-        s = self._line(token, self.CONTENT_CAP)
-        if s:
-            print(f"{GREEN}  ▸{RESET} {GREEN}{s}{RESET}", flush=True)
+        if self._done:
+            return
+        s = (token or "")
+        if not s:
+            return
+        if "\n" in s:
+            parts = s.split("\n")
+            for i, p in enumerate(parts):
+                if i < len(parts) - 1:
+                    self._buf += p
+                    self._flush()
+                else:
+                    self._buf += p
+        else:
+            self._buf += s
+            # dòng quá dài → in sớm để không treo cả dòng JSON khổng lồ
+            if len(self._buf) >= self._wrap:
+                self._flush()
 
     def done(self):
+        if self._done:
+            return  # idempotent — không in "finished" lần thứ 2
+        self._done = True
+        self._flush()
         dt = time.time() - self.t0
         print(f"{DIM}  └ model finished in {dt:.1f}s{RESET}", flush=True)
 
@@ -379,7 +438,7 @@ def _print_banner(cfg: dict):
     for line in _AIXSEC_ART.splitlines():
         print(f"{CYAN}{line.rstrip()}{RESET}")
     print(f"{MAGENTA}{'═' * 64}{RESET}")
-    print(f"{BOLD}{GREEN}AIXSEC-X{RESET} — AI Web Exploitation Assistant  "
+    print(f"{BOLD}{GREEN}AIXSEC-X v{VERSION}{RESET} — AI Web Exploitation Assistant  "
           f"{DIM}(local LLM • Kali Linux){RESET}")
     print(f"{DIM}Brand:{RESET} {CYAN}aixsecu.com{RESET}   {DIM}Mode:{RESET} "
           f"{YELLOW}{cfg.get('auto_exec', 'ask')}{RESET}")

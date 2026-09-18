@@ -19,7 +19,9 @@ def load_config() -> dict:
         "num_ctx": int(os.environ.get("WEBX_NUM_CTX", "16384")),
 
         # ── Agent loop ──
-        "max_rounds": int(os.environ.get("WEBX_MAX_ROUNDS", "12")),
+        # 8 vòng mặc định: cân bằng độ sâu khai thác vs thời gian/chi phí LLM
+        # (12 vòng trên máy 4 vCPU có thể chạy 20-30 phút/vòng model 9B).
+        "max_rounds": int(os.environ.get("WEBX_MAX_ROUNDS", "8")),
         "tool_timeout": int(os.environ.get("WEBX_TOOL_TIMEOUT", "90")),
         #   WEBX_LLM_TIMEOUT: giây tối đa chờ model trả lời MỖI lượt gọi Ollama
         #   (mặc định 300s — model 9B trên CPU có thể mất 1-3 phút/lượt)

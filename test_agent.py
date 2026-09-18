@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
 """Test AIXSEC-X (aixsec-x) — chạy offline (mock Ollama), không cần model/tool hệ thống."""
+import contextlib
+import io
 import json
 import os
 import re
@@ -747,6 +749,135 @@ class TestSast(unittest.TestCase):
             self.assertIn("Sup3rS3cr3t", out)      # secret vẫn quét mọi file
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
+
+
+class TestWordlistResolver(unittest.TestCase):
+    """v1.4: resolve_wordlist — alias/basename/tail-match → đường dẫn tồn tại."""
+
+    def test_empty_defaults_to_common(self):
+        from tools import resolve_wordlist
+        p = resolve_wordlist("")
+        self.assertTrue(p.endswith("common.txt"))
+        self.assertTrue(os.path.exists(p))
+
+    def test_common_alias(self):
+        from tools import resolve_wordlist
+        for wl in ("common", "common.txt", "SecLists/common-words.txt",
+                   "common-words.txt", "top500", "top500.txt"):
+            p = resolve_wordlist(wl)
+            self.assertIn("common.txt", p, f"alias '{wl}' → {p}")
+
+    def test_raft_aliases(self):
+        from tools import resolve_wordlist
+        p = resolve_wordlist("raft-medium")
+        self.assertTrue(p.endswith("raft-medium-directories.txt"), p)
+        self.assertTrue(os.path.isfile(p))
+        p = resolve_wordlist("raft-small")
+        self.assertTrue(p.endswith("raft-small-directories.txt"), p)
+
+    def test_dirbuster_aliases(self):
+        from tools import resolve_wordlist
+        p = resolve_wordlist("dirbuster-small")
+        self.assertIn("DirBuster-2007", p)
+        self.assertTrue(os.path.isfile(p))
+        p = resolve_wordlist("dirbuster-big")
+        self.assertIn("DirBuster-2007", p)
+
+    def test_suffix_path_shape(self):
+        from tools import resolve_wordlist
+        # model hay đưa "raft-medium-directories/2.3medium.txt" (sai) —
+        # resolver phải báo lỗi rõ ràng thay vì đốt 120s
+        with self.assertRaises(ValueError):
+            resolve_wordlist("raft-medium-directories/2.3medium.txt")
+
+    def test_absolute_path(self):
+        from tools import resolve_wordlist
+        real = "/usr/share/seclists/Discovery/Web-Content/raft-large-files.txt"
+        if os.path.isfile(real):
+            self.assertEqual(resolve_wordlist(real), real)
+        with self.assertRaises(ValueError):
+            resolve_wordlist("/nonexistent/wl.txt")
+
+    def test_basename_subdir_walk(self):
+        from tools import resolve_wordlist
+        p = resolve_wordlist("combined_words.txt")
+        self.assertTrue(os.path.isfile(p), p)
+
+    def test_missing_raises_friendly(self):
+        from tools import resolve_wordlist
+        with self.assertRaises(ValueError) as cm:
+            resolve_wordlist("definitely-not-a-list-xyz.txt")
+        msg = str(cm.exception)
+        self.assertIn("không tìm thấy", msg.lower())
+        self.assertIn("Alias hỗ trợ", msg)
+
+
+class TestLiveDisplayBuffer(unittest.TestCase):
+    """v1.4: _LiveDisplay buffer token — không in 1 token/dòng, wrap theo width."""
+
+    def _display(self, wrap=40):
+        from agent import _LiveDisplay
+        d = _LiveDisplay(1, max_rounds=8)
+        d._wrap = wrap  # ép width để test wrap ổn định
+        return d
+
+    def test_buffer_no_newline_accumulates(self):
+        d = self._display(wrap=100)
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            d.on_token("a")
+            d.on_token("b")
+            d.on_token("c")
+        self.assertEqual(d._buf, "abc")  # chưa flush — không in tới tấp
+        self.assertNotIn("abc", out.getvalue())
+
+    def test_flush_on_wrap(self):
+        d = self._display(wrap=10)
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            for c in "abcdefghij":  # 10 ký tự = đủ wrap → flush 1 dòng
+                d.on_token(c)
+        printed = out.getvalue()
+        self.assertEqual(d._buf, "")  # đã flush hết
+        self.assertIn("▸", printed)
+        # KHÔNG có các dòng "▸ x" lẻ từng token như v1.3
+        self.assertNotIn("▸ a\n", printed)
+
+    def test_newline_flushes(self):
+        d = self._display(wrap=100)
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            d.on_token("line1\nline2")
+        printed = out.getvalue()
+        self.assertIn("line1", printed)
+        self.assertEqual(d._buf, "line2")  # phần sau newline chờ flush tiếp
+
+    def test_done_flushes_remainder(self):
+        d = self._display(wrap=100)
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            d.on_token("tail")
+            d.done()
+        self.assertIn("tail", out.getvalue())
+        self.assertIn("finished", out.getvalue())
+
+    def test_done_is_idempotent(self):
+        d = self._display(wrap=100)
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            d.on_token("x")
+            d.done()
+            d.on_token("y")  # sau done → bỏ qua
+            d.done()
+        self.assertEqual(d._buf, "")
+        self.assertNotIn("y", out.getvalue())
+        self.assertEqual(out.getvalue().count("finished"), 1)
+
+    def test_long_json_no_line_spam(self):
+        """Final round hay phun JSON ~700 token — không được ra ~700 dòng."""
+        d = self._display(wrap=80)
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            for i in range(700):
+                d.on_token(str(i % 10))
+            d.done()
+        lines = out.getvalue().splitlines()
+        content_lines = [l for l in lines if "▸" in l or "↳" in l]
+        self.assertLess(len(content_lines), 50)
 
 
 if __name__ == "__main__":
