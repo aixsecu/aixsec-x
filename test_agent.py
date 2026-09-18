@@ -351,7 +351,8 @@ class TestPlanOnlyGuard(unittest.TestCase):
 
 
 class TestSQLiManualTest(unittest.TestCase):
-    """v1.4.3: sqli_manual_test hỗ trợ POST form data (method='post' + data)."""
+    """v1.4.4: sqli_manual_test v2 — quote-differential (test/test'/test'') trước,
+    fallback time-based theo engine (mysql SLEEP / mssql WAITFOR DELAY)."""
 
     def _exec(self, **kw):
         from tools import _sqli_manual_test
@@ -370,21 +371,38 @@ class TestSQLiManualTest(unittest.TestCase):
              patch("requests.get", return_value=resp) as mg:
             out = self._exec(url="https://abc.vn/WebTinTuc/TimKiem",
                              param="q", method="post", data="q=test")
-        self.assertEqual(mp.call_count, 2)                # baseline + delay
+        # v2: baseline + quote-single + quote-double + time-based (4 POST)
+        posts = [c[1]["data"] for c in mp.call_args_list]
+        self.assertEqual(posts, [{"q": "test"}, {"q": "test'"},
+                                 {"q": "test''"},
+                                 {"q": "test' AND SLEEP(3)-- -"}])
+        self.assertEqual(mp.call_count, 4)
         self.assertEqual(mg.call_count, 0)                # không dùng GET
         self.assertEqual(mp.call_args_list[0][0][0],
                          "https://abc.vn/WebTinTuc/TimKiem")
-        self.assertEqual(mp.call_args_list[0][1]["data"], {"q": "1"})
-        self.assertEqual(mp.call_args_list[1][1]["data"], {"q": "1 AND SLEEP(3)"})
-        self.assertIn("baseline: status=200", out)
-        self.assertIn("delay: status=200", out)
+        # auto → không có header DB → mặc định mysql; quote-diff âm tính (mock
+        # đồng nhất) → rơi vào time-based → NOT_CONFIRMED
+        self.assertIn("engine=mysql", out)
+        self.assertIn("time-based", out)
+        self.assertIn("NOT_CONFIRMED", out)
 
-    def test_post_param_prefix_stripped(self):
+    def test_post_ignores_garbage_data_uses_param(self):
+        # v1.4.4: tham số 'data' KHÔNG còn dùng — payload luôn build từ param;
+        # data truyền rác (kiểu v1.4.3) phải bị bỏ qua.
         resp = self._mock_resp()
         with patch("requests.post", return_value=resp) as mp:
             self._exec(url="https://abc.vn/x", param="q", method="post",
-                       data="param=1")
-        self.assertEqual(mp.call_args_list[0][1]["data"], {"q": "1"})
+                       data="param=1&junk=x")
+        self.assertEqual(mp.call_args_list[0][0][0], "https://abc.vn/x")
+        self.assertEqual(mp.call_args_list[0][1]["data"], {"q": "test"})
+
+    def test_mssql_engine_uses_waitfor(self):
+        resp = self._mock_resp()
+        with patch("requests.post", return_value=resp) as mp:
+            self._exec(url="https://abc.vn/x", param="q", method="post",
+                       engine="mssql", delay=3)
+        last = mp.call_args_list[-1][1]["data"]
+        self.assertEqual(last, {"q": "test' AND WAITFOR DELAY '0:0:3'-- -"})
 
     def test_get_default_query_string(self):
         resp = self._mock_resp()
@@ -393,8 +411,267 @@ class TestSQLiManualTest(unittest.TestCase):
             self._exec(url="https://abc.vn/x", param="id")
         self.assertEqual(mp.call_count, 0)
         urls = [c[0][0] for c in mg.call_args_list]
-        self.assertEqual(urls, ["https://abc.vn/x?id=1",
-                                "https://abc.vn/x?id=1 AND SLEEP(3)"])
+        self.assertEqual(urls, ["https://abc.vn/x?id=test",
+                                "https://abc.vn/x?id=test'",
+                                "https://abc.vn/x?id=test''",
+                                "https://abc.vn/x?id=test' AND SLEEP(3)-- -"])
+
+
+class QuoteDiffHandler(BaseHTTPRequestHandler):
+    """Giả lập app chèn được qua quote: nháy đơn LÀM VỠ truy vấn (500/100B),
+    nháy đơn kép KHỚP baseline (200/500B) — không cần SLEEP."""
+
+    def do_GET(self):
+        decoded = unquote_plus(self.path)
+        if "'" in decoded and "''" not in decoded:
+            body = b"x" * 100
+            self.send_response(500)
+        else:
+            body = b"k" * 500
+            self.send_response(200)
+        self.send_header("Content-Type", "text/html")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, *args):
+        pass
+
+
+class TestQuoteDifferential(unittest.TestCase):
+    """v1.4.4: sqli_manual_test xác nhận chèn qua KHÁC BIỆT quote — không cần
+    engine, không cần SLEEP (trường hợp thật: form tìm kiếm MSSQL tbu.edu.vn)."""
+    server = None
+
+    @classmethod
+    def setUpClass(cls):
+        cls.server = HTTPServer(("127.0.0.1", 0), QuoteDiffHandler)
+        cls.port = cls.server.server_address[1]
+        cls.thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
+        cls.thread.start()
+
+    @classmethod
+    def tearDownClass(cls):
+        if cls.server:
+            cls.server.shutdown()
+            cls.server.server_close()
+
+    def test_quote_differential_confirmed(self):
+        from tools import _sqli_manual_test
+        out = _sqli_manual_test(
+            url=f"http://127.0.0.1:{self.port}/search", param="q",
+            method="get", engine="auto")
+        self.assertIn("CONFIRMED", out)
+        self.assertIn("quote-differential", out)
+        self.assertNotIn("time-based", out)
+
+
+class FormsPageHandler(BaseHTTPRequestHandler):
+    """Trang có 2 form (action relative + absolute), trang không form, trang 404."""
+
+    def do_GET(self):
+        path = self.path.split("?", 1)[0]
+        if path == "/":
+            body = (b"<html><body>"
+                    b"<form action='/search' method='POST'>"
+                    b"<input name='keyword' type='text'>"
+                    b"<input type='hidden' name='lang' value='vi'>"
+                    b"</form>"
+                    b"<form action='https://abc.vn/login' method='get'>"
+                    b"<input type='password' name='pass'>"
+                    b"</form>"
+                    b"</body></html>")
+            self.send_response(200)
+        elif path == "/nofo":
+            body = b"<html><body>khong co form</body></html>"
+            self.send_response(200)
+        else:
+            body = b"not found"
+            self.send_response(404)
+        self.send_header("Content-Type", "text/html")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, *args):
+        pass
+
+
+class TestFindForms(unittest.TestCase):
+    """v1.4.4: find_forms đọc form THẬT (action/method/inputs) — agent không còn
+    đoán URL/param khi test SQLi qua form."""
+    server = None
+
+    @classmethod
+    def setUpClass(cls):
+        cls.server = HTTPServer(("127.0.0.1", 0), FormsPageHandler)
+        cls.port = cls.server.server_address[1]
+        cls.thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
+        cls.thread.start()
+
+    @classmethod
+    def tearDownClass(cls):
+        if cls.server:
+            cls.server.shutdown()
+            cls.server.server_close()
+
+    def test_parses_forms_absolute_actions(self):
+        from tools import _find_forms
+        out = _find_forms(url=f"http://127.0.0.1:{self.port}/")
+        self.assertIn("2 form(s)", out)
+        self.assertIn(f"POST http://127.0.0.1:{self.port}/search", out)
+        self.assertIn("GET https://abc.vn/login", out)
+        self.assertIn("keyword(text)", out)
+        self.assertIn("lang(hidden)", out)
+        self.assertIn("pass(password)", out)
+
+    def test_no_forms(self):
+        from tools import _find_forms
+        out = _find_forms(url=f"http://127.0.0.1:{self.port}/nofo")
+        self.assertIn("KHÔNG có <form>", out)
+
+    def test_error_status_404(self):
+        from tools import _find_forms
+        out = _find_forms(url=f"http://127.0.0.1:{self.port}/missing")
+        self.assertTrue(out.startswith("[!]"))
+        self.assertIn("trả 404", out)
+
+
+class TestSqlEngineGuess(unittest.TestCase):
+    """v1.4.4: _guess_engine đoán DB backend từ headers cho engine=auto."""
+
+    def _resp(self, headers):
+        class R:
+            pass
+        r = R()
+        r.headers = headers
+        return r
+
+    def test_aspnet_iis_to_mssql(self):
+        from tools import _guess_engine
+        r = self._resp({"X-Powered-By": "ASP.NET",
+                        "Server": "Microsoft-IIS/10.0",
+                        "Set-Cookie": "ASP.NET_SessionId=xyz123"})
+        self.assertEqual(_guess_engine(r), "mssql")
+
+    def test_php_to_mysql(self):
+        from tools import _guess_engine
+        r = self._resp({"X-Powered-By": "PHP/7.4.33",
+                        "Server": "nginx/1.24"})
+        self.assertEqual(_guess_engine(r), "mysql")
+
+    def test_no_signal(self):
+        from tools import _guess_engine
+        r = self._resp({})
+        self.assertEqual(_guess_engine(r), "")
+
+
+class TestTimeoutOutcome(unittest.TestCase):
+    """v1.4.4: output mở đầu '[!]' (vd Timeout) → outcome=error để gate/fail-count đúng."""
+
+    def _dispatch_nikto(self, run_cmd_out, tool_timeout=180):
+        from tools import TOOL_INDEX
+        with patch("tools._need", return_value=None), \
+             patch("tools.run_cmd", return_value=run_cmd_out):
+            a = WebXAgent(config=cfg({"tool_timeout": tool_timeout}),
+                          chat=FakeChat(script=[]))
+            return a._dispatch("nikto_scan", {"url": "https://abc.vn/"})
+
+    def test_timeout_is_error(self):
+        r = self._dispatch_nikto("[!] Timeout sau 170s.")
+        self.assertEqual(r["outcome"], "error")
+        self.assertIn("exec_time", r)
+        self.assertIsInstance(r["exec_time"], float)
+
+    def test_normal_is_ok(self):
+        r = self._dispatch_nikto("- Nikto v2.5.0\n+ Server: nginx")
+        self.assertEqual(r["outcome"], "ok")
+        self.assertLess(r["exec_time"], 5)
+
+
+class TestNiktoMaxtime(unittest.TestCase):
+    """v1.4.4: nikto -maxtime = _timeout-10 (floor 30) — cap 180s → -maxtime 170."""
+
+    def _run(self, tool_timeout):
+        caught = {}
+
+        def fake_run_cmd(argv, timeout=90, max_chars=5000):
+            caught["argv"] = argv
+            caught["timeout"] = timeout
+            return "scan ok"
+
+        with patch("tools._need", return_value=None), \
+             patch("tools.run_cmd", side_effect=fake_run_cmd):
+            a = WebXAgent(config=cfg({"tool_timeout": tool_timeout}),
+                          chat=FakeChat(script=[]))
+            r = a._dispatch("nikto_scan", {"url": "https://abc.vn/"})
+        return r, caught
+
+    def test_capped_timeout_maxtime(self):
+        r, caught = self._run(180)
+        self.assertEqual(r["outcome"], "ok")
+        self.assertEqual(caught["timeout"], 180)
+        self.assertEqual(caught["argv"][-1], "170")
+
+    def test_floor_30(self):
+        r, caught = self._run(10)
+        self.assertEqual(r["outcome"], "ok")
+        self.assertEqual(caught["argv"][-1], "30")
+
+
+class TestDispatchExecTime(unittest.TestCase):
+    """v1.4.4: exec_time đo THỰC THI tool, không gồm thời gian chờ operator duyệt."""
+
+    def test_excludes_approval_wait(self):
+        from tools import TOOL_INDEX
+
+        def slow_approve(prompt):
+            time.sleep(0.3)
+            return "y"
+
+        with patch("builtins.input", side_effect=slow_approve), \
+             patch.object(TOOL_INDEX["nikto_scan"], "exec_fn",
+                          lambda **kw: "scan ok"):
+            a = WebXAgent(config=cfg({"auto_exec": "ask"}),
+                          chat=FakeChat(script=[]))
+            r = a._dispatch("nikto_scan", {"url": "https://abc.vn/"})
+        self.assertEqual(r["outcome"], "ok")
+        self.assertLess(r["exec_time"], 0.2)   # 0.3s chờ duyệt KHÔNG tính vào
+
+
+class TestPromptRules(unittest.TestCase):
+    """v1.4.4: prompt bắt buộc find_forms trước khi test SQLi qua form;
+    nikto/nuclei KHÔNG phát hiện được SQLi."""
+
+    def test_compact_find_forms_before_sqli(self):
+        self.assertIn("find_forms", SYSTEM_PROMPT_COMPACT)
+        self.assertIn("CANNOT find SQLi", SYSTEM_PROMPT_COMPACT)
+
+    def test_full_find_forms_before_sqli(self):
+        self.assertIn("find_forms", SYSTEM_PROMPT_FULL)
+        self.assertIn("KHÔNG phát hiện được SQLi", SYSTEM_PROMPT_FULL)
+
+
+class TestBlindPocMssql(unittest.TestCase):
+    """v1.4.4: TimeBlindExploiter engine=mssql → payload WAITFOR DELAY;
+    tables()/columns() chưa hỗ trợ mssql → NotImplementedError."""
+
+    def test_payload_and_limitations(self):
+        from sqli_blind_poc import TimeBlindExploiter
+        ex = TimeBlindExploiter("http://127.0.0.1:1/product.php?id=123",
+                                delay=3, threshold=0.7, timeout=5,
+                                engine="mssql")
+        ex.param = "id"
+        ex.orig_value = "123"
+        ex.quote = "'"
+        ex.comment = "-- -"
+        ex.mode = "query"
+        pl = ex._payload("1=1")
+        self.assertIn("WAITFOR DELAY", pl)
+        self.assertIn("'0:0:3'", pl)
+        self.assertIn("-- -", pl)
+        with self.assertRaises(NotImplementedError):
+            ex.tables()
 
 
 class TestToolTimeoutCap(unittest.TestCase):
@@ -477,8 +754,14 @@ class MockSqliHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         decoded = unquote_plus(self.path)
         m = re.search(r"'\s*AND\s*\([^)]*SLEEP\(\s*(\d+(?:\.\d+)?)\s*\)", decoded)
-        if m and ("--" in decoded or "#" in decoded):
-            time.sleep(float(m.group(1)))
+        # v1.4.4: mssql — '; IF (expr) WAITFOR DELAY '0:0:n' -- -
+        mssql = re.search(r"'\s*;\s*IF\s*\([^)]*\)\s*WAITFOR\s+DELAY\s+'0:0:(\d+)'",
+                          decoded)
+        if "--" in decoded or "#" in decoded:
+            if m:
+                time.sleep(float(m.group(1)))
+            elif mssql:
+                time.sleep(float(mssql.group(1)))
         body = b"<html>ok</html>"
         self.send_response(200)
         self.send_header("Content-Type", "text/html")
@@ -530,6 +813,17 @@ class TestSqliBlindExtract(unittest.TestCase):
         self.assertEqual(res["outcome"], "ok")
         self.assertIn("CONFIRMED", res["output"])
         self.assertIn("mode=path", res["output"])
+
+    def test_mssql_engine_detect_confirmed(self):
+        # v1.4.4: engine=mssql → payload '; IF (1=1) WAITFOR DELAY '0:0:1' -- -
+        a = self._agent()
+        res = a._dispatch("sqli_blind_extract", {
+            "url": f"http://127.0.0.1:{self.port}/product.php?id=123",
+            "action": "detect", "delay": 1, "threshold": 0.7,
+            "engine": "mssql"})
+        self.assertEqual(res["outcome"], "ok")
+        self.assertIn("CONFIRMED", res["output"])
+        self.assertIn("mode=query", res["output"])
 
     def test_out_of_scope_rejected(self):
         a = self._agent()
@@ -664,14 +958,16 @@ class TestPocGenerator(unittest.TestCase):
     def test_poc_executor_syntax_error(self):
         a = self._agent()
         res = a._dispatch("poc_executor", {"poc_code": "print("})
-        self.assertEqual(res["outcome"], "ok", res.get("output"))
+        # v1.4.4: output '[!]' → outcome=error (gate/fail-count đúng)
+        self.assertEqual(res["outcome"], "error", res.get("output"))
         self.assertIn("SyntaxError", res["output"])
 
     def test_poc_executor_rejects_non_temp_path(self):
         """Bảo vệ arbitrary file exec: poc_path phải là aixsec-x_poc_* trong tempdir."""
         a = self._agent()
         res = a._dispatch("poc_executor", {"poc_path": "/etc/passwd", "timeout": 10})
-        self.assertEqual(res["outcome"], "ok", res.get("output"))
+        # v1.4.4: '[!]' (guard chặn) → outcome=error
+        self.assertEqual(res["outcome"], "error", res.get("output"))
         self.assertIn("bị từ chối", res["output"])
 
     def test_generate_poc_out_of_scope(self):
@@ -887,7 +1183,8 @@ class TestSast(unittest.TestCase):
         try:
             a = WebXAgent(config=cfg({"src_dirs": [tmp]}), chat=FakeChat())
             res = a._dispatch("sast_scan", {"src_path": os.path.join(tmp, "nope")})
-            self.assertEqual(res["outcome"], "ok")
+            # v1.4.4: src không tồn tại là lỗi thực thi → outcome=error
+            self.assertEqual(res["outcome"], "error")
             self.assertIn("không tồn tại", res["output"])
         finally:
             shutil.rmtree(tmp, ignore_errors=True)

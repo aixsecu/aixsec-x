@@ -290,21 +290,23 @@ aixsec-x> q                                       → thoát
 | sast_scan | sast | safe | Source-code scan: pattern heuristic (PHP/Python/JS/Java) + secret scan; tùy chọn semgrep/gitleaks; scope qua WEBX_SRC_DIRS |
 | waf_detect (wafw00f) / detect_cms (whatweb) | recon | safe | fingerprint |
 | subdomain_enum (subfinder) | recon | safe | |
+| find_forms | recon | safe | **v1.4.4:** GET trang + parse mọi `<form>` → `action` tuyệt đối, `method` thật (get/post), `name/type` input — con đường DUY NHẤT biết endpoint form tìm kiếm (nikto/nuclei không bao giờ thấy form) |
 | param_discovery (arjun) | recon | noisy | |
 | nuclei_scan | active | active | `-severity`, `-tags` |
 | ffuf_dir | active | active | SecLists common.txt |
 | sqlmap_check | active | active | `--batch --smart --current-user --banner` |
-| sqli_manual_test | active | active | time-based SLEEP(3) control/delay |
-| sqli_blind_extract | active | active | **SQLi blind KHÔNG sqlmap** (Python thuần): detect + extract dữ liệu, hỗ trợ query `?id=1` VÀ path `/search/123.html` |
+| sqli_manual_test | active | active | **v1.4.4 v2:** quote-differential (`test'`/`test''`) trước — xác nhận chèn KHÔNG cần engine/SLEEP; fallback time-based SLEEP/WAITFOR DELAY theo `engine=mysql\|mssql\|auto` (auto đoán từ headers: ASP.NET/IIS → mssql, PHP → mysql) |
+| sqli_blind_extract | active | active | **SQLi blind KHÔNG sqlmap** (Python thuần): detect + extract dữ liệu, hỗ trợ query `?id=1` VÀ path `/search/123.html`; **v1.4.4:** `engine=mysql\|mssql` (mssql = `'; IF (..) WAITFOR DELAY '0:0:n'-- -`, version/user qua `DB_NAME()`/`SUSER_SNAME()`; tables/dump mssql chưa hỗ trợ → `sqlmap --dbms=mssql`) |
 | generate_poc | sqli | safe | **Tự SINH POC Python** khai thác SQLi time-based blind (KHÔNG sqlmap): trả `poc_path` (/tmp/aixsec-x_poc_*.py) + snippet 25 dòng — code ~7KB vượt context cap nên không trả inline |
 | poc_executor | sqli | active | **Chạy POC** do generate_poc sinh (chỉ chấp nhận file `aixsec-x_poc_*.py` trong tempdir — chống arbitrary file exec); hoặc `poc_code` nếu code ngắn |
-| nikto_scan | active | noisy | `-maxtime 120` |
+| nikto_scan | active | noisy | **v1.4.4:** `-maxtime` = timeout−10 (sàn 30) tự kết thúc đúng hạn; cap 180 s |
 
 **Khi nào dùng `sqli_blind_extract`:** sqlmap không bắt được đường inject kiểu path
 (`/search/123.html`) hoặc chữ ký tham số lạ — tool này tự detect quote/comment style
 bằng timing, rồi trích xuất dữ liệu bằng binary search `ASCII(SUBSTRING(...))`
 (không cần sqlmap, chỉ cần `requests`). `action=detect|version|database|user|tables|dump`;
-extraction chậm (~10 request/ký tự) nên để `delay` vừa phải.
+`engine=mysql|mssql` (mssql = probe WAITFOR DELAY); extraction chậm
+(~10 request/ký tự) nên để `delay` vừa phải.
 
 ### SQLi fallback — khi sqlmap_check thất bại
 
@@ -380,6 +382,38 @@ Model 7B/9B (vd: `huihui_ai/qwen3.5-abliterated:9b`) tuân theo **ít quy tắc*
   với `break_long_words=True` làm tách `**ffuf_dir**` thành `**ff` + `uf_dir**`.
   Giờ dùng `break_long_words=False, break_on_hyphens=False` — từ dài nhảy
   trọn sang dòng tiếp theo.
+- **v1.4.4 — `find_forms` (form là chỗ SQLi dễ sót #1):** nikto/nuclei/
+  http_probe không bao giờ thấy thẻ `<form>`, nên ô tìm kiếm (case kinh điển:
+  POST `/WebTinTuc/TimKiem`, input ẩn `keyword`) chưa từng được test.
+  `find_forms {url}` GET trang và parse mọi form → `action` tuyệt đối, `method`
+  thật, `name/type` từng input. Cả 2 prompt giờ BẮT BUỘC `find_forms` trước
+  mọi test SQLi qua form (rule 5a compact / full) và nói rõ
+  `nikto_scan`/`nuclei_scan` KHÔNG THỂ tìm SQLi.
+- **v1.4.4 — `sqli_manual_test` v2 (quote-differential):** thay vì mù quáng gửi
+  `AND SLEEP(3)`, tool gửi trước `test` vs `test'` vs `test''`: nếu quote đơn làm
+  hỏng query (500 / lệch size) còn quote kép khớp baseline thì điểm inject ĐƯỢC
+  XÁC NHẬN mà không cần engine hay SLEEP (chạy đúng form tìm kiếm MSSQL thật
+  tbu.edu.vn nơi `--` vô dụng). Chỉ khi quote-differential âm mới fallback
+  time-based, giờ hiểu engine: `engine=mysql` → `SLEEP(n)`, `engine=mssql` →
+  `WAITFOR DELAY '0:0:n'`, `engine=auto` (mặc định) đoán từ headers
+  (ASP.NET/IIS/ASP.NET_SessionId → mssql, PHP → mysql). Trả verdict
+  `CONFIRMED/NOT_CONFIRMED` rõ ràng; bỏ args cũ `baseline`/`delay_payload`
+  (model hay truyền rác kiểu "0.80") và bỏ `data` — payload luôn build từ `param`.
+- **v1.4.4 — MSSQL time-based blind (`sqli_blind_extract`):** `engine=mssql`
+  đổi probe thành `'; IF (expr) WAITFOR DELAY '0:0:n'-- -` (IF là statement →
+  phải đóng SELECT bằng `;` trước) và trích version/user dùng
+  `DB_NAME()`/`SUSER_SNAME()`; `tables()/columns()/dump` ném
+  `NotImplementedError` trên mssql.
+- **v1.4.4 — output `[!]` → `outcome=error`:** mọi output tool bắt đầu bằng
+  `[!]` (timeout, thiếu binary, connect lỗi, sai args) ghi là `outcome=error`,
+  nên cổng đếm fail (chặn cứng sau 3 fail) và nearest-command targeting đếm
+  đúng lượt cần thử lại thay vì coi timeout là scan thành công.
+- **v1.4.4 — `exec_time` trung thực:** `_dispatch` chỉ tính thời gian chạy tool
+  thật (`exec_time`), không tính thời gian chờ operator duyệt trong `input()`
+  — thời lượng scan thật trên terminal, không phải thời lượng round.
+- **v1.4.4 — nikto `-maxtime` = timeout−10 (sàn 30), cap 180 s:** nikto tự
+  dừng ngay trước kill switch của `run_cmd` (120 s hardcode cũ chết giữa lúc in
+  → output rỗng); `TOOL_TIMEOUTS["nikto_scan"]` tăng 120→180 s.
 - **v1.4.3 — Plan-only guard (run không còn chết vì văn bản kế hoạch):**
   model 9B hay trả lượt chỉ bằng VĂN BẢN kế hoạch ("tôi sẽ chạy
   sqli_manual_test...") không kèm `tool_calls` — trước đây bị coi là câu trả

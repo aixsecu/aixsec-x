@@ -32,8 +32,8 @@ from tools import (TOOL_REGISTRY, TOOL_INDEX, TOOL_BINS, TOOL_TIMEOUTS,
                    available_tools)
 
 # ── terminal colors (AIXSEC-X style) ──
-VERSION = "1.4.3"
 
+VERSION = "1.4.4"
 RED = "\033[91m"
 GREEN = "\033[92m"
 YELLOW = "\033[93m"
@@ -228,13 +228,22 @@ class WebXAgent:
             # khi operator cấu hình tool_timeout cao.
             kw["_timeout"] = min(self.config["tool_timeout"],
                                   TOOL_TIMEOUTS.get(name, self.config["tool_timeout"]))
+            # v1.4.4: chỉ đo thời gian THỰC THI tool — chờ operator duyệt
+            # (_risk_ok/input()) nằm ngoài try này nên không bị tính vào duration.
+            t0 = time.time()
+
             out = spec.exec_fn(**kw)
-            return {"name": name, "outcome": "ok", "output": out}
+            dt = round(time.time() - t0, 1)
+            # v1.4.4: output mở đầu '[!]' = lỗi thực thi (timeout, thiếu binary,
+            # connect fail, args sai) → outcome=error để gate/fail-count đúng.
+            oc = "error" if isinstance(out, str) and out.startswith("[!]") else "ok"
+            return {"name": name, "outcome": oc, "output": out, "exec_time": dt}
         except TypeError as e:
             return {"name": name, "outcome": "error",
-                    "output": f"[!] Invalid arguments for '{name}': {e}"}
+                    "output": f"[!] Invalid arguments for '{name}': {e}", "exec_time": 0.0}
         except Exception as e:  # noqa: BLE001
-            return {"name": name, "outcome": "error", "output": f"[!] {name} error: {e}"}
+            return {"name": name, "outcome": "error",
+                    "output": f"[!] {name} error: {e}", "exec_time": 0.0}
 
     # ─────────────────────────────────────────
     # MAIN LOOP
@@ -341,7 +350,10 @@ class WebXAgent:
                         self._failed_urls.discard(url_key)  # URL hồi phục
                     elif oc in ("error", "scope_rejected"):
                         self._failed_urls.add(url_key)
-                dt = time.time() - t0
+                # v1.4.4: ưu tiên exec_time do _dispatch đo (không gồm chờ duyệt);
+                # fallback cho nhánh duplicate/blocked (không qua _dispatch).
+                dt = (r.get("exec_time")
+                      if r.get("exec_time") is not None else time.time() - t0)
                 tag = f"{GREEN}[✔]{RESET}" if r.get("outcome") == "ok" \
                     else f"{RED}[✗]{RESET}"
                 print(f"{tag} {name} → outcome={r.get('outcome', '?')} ({dt:.1f}s)",
