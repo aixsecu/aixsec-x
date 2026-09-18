@@ -225,6 +225,16 @@ Agent không được phép đốt rounds để gọi lại đúng thứ đã ch
   `nuclei_scan`/`param_discovery` khi máy thiếu binary `nuclei`/`arjun`) sẽ bị
   chặn (`outcome=blocked`) và model được chỉ dẫn đổi chiến lược (kiểm tra
   binary/network, đổi tool khác) thay vì thử lại vô hạn.
+- **Chặn theo URL** — một `(tool, URL)` từng fail trong phiên
+  (`error`/`scope_rejected`) sẽ bị chặn (`outcome=blocked`) ngay cho cùng URL,
+  *trước* bước xin phép operator, dù tham số khác có đổi. Chặn được chiêu model
+  gọi lại `nuclei_scan` với `severity low→high` (hoặc đổi `tags`/`wordlist`)
+  trên cùng target. URL nào chạy thành công lại thì được bỏ khỏi danh sách chặn.
+- **Dừng sớm (early stop)** — nếu một round chỉ toàn `duplicate`/`blocked`
+  (tức không tool nào sinh thông tin mới), phiên kết thúc ngay và model bị ép
+  trả final JSON từ dữ liệu đã thu thập — không đốt nốt các round còn lại cho
+  vòng lặp thoái hóa (vd model cứ stream "(calling tools...)" mà không chịu
+  gọi tool nào).
 - Mọi tool-message đưa lại cho model đều kèm ghi chú khi tool đã fail ≥2 lần:
   *"Tool đã fail N lần phiên này — đừng gọi lại trừ khi đổi tham số/chiến lược."*
 

@@ -47,8 +47,10 @@ class FakeChat:
         if self.script:
             return self.script.pop(0)
         if self.always_tools:
+            # host đổi MỖI vòng → không bị dedup/URL-block; round n gọi h{n}.abc.vn
+            n = len(self.calls) + 1
             return {"content": "", "tool_calls": [
-                {"name": "dns_lookup", "arguments": {"host": "abc.vn"}}]}
+                {"name": "dns_lookup", "arguments": {"host": f"h{n}.abc.vn"}}]}
         return {"content": FINAL_JSON, "tool_calls": []}
 
 
@@ -196,10 +198,12 @@ class TestAgentLoop(unittest.TestCase):
         # nuclei thiếu binary (mock which=None) — mỗi vòng tham số KHÁC NHAU nên
         # không bị dedup → fail 3 lần, vòng 4 outcome=blocked (gate cứng) và
         # không gọi _dispatch thêm; model không thể retry vô hạn 1 tool hỏng.
+        # URL khác nhau mỗi vòng (?a={i}) để test NAME-gate thuần túy —
+        # URL-gate (cùng URL) không dính vào
         script = [
             {"content": "", "tool_calls": [
                 {"name": "nuclei_scan",
-                 "arguments": {"url": "https://abc.vn/", "severity": f"low{i}"}}]}
+                 "arguments": {"url": f"https://abc.vn/?a={i}", "severity": f"low{i}"}}]}
             for i in range(1, 5)
         ] + [{"content": FINAL_JSON, "tool_calls": []}]
         a = self._agent(script=script)
@@ -220,6 +224,59 @@ class TestAgentLoop(unittest.TestCase):
         self.assertIn("bị chặn tạm thời", a.transcript[3]["calls"][0]["output"])
         self.assertEqual(res["calls"], 4)
         self.assertEqual(a._fail_counts["nuclei_scan"], 3)
+
+    def test_url_block_skips_approval(self):
+        # Chiêu của model: cùng URL nhưng ĐỔI severity (low→high) để né dedup
+        # exact-args. Giờ URL-gate chặn: (tool, url) đã fail → outcome=blocked
+        # TRƯỚC bước xin phép operator (input) và trước _dispatch; lần xin phép
+        # thứ 2 sẽ làm AssertionError → test fail nếu gate chạy sai.
+        script = [
+            {"content": "", "tool_calls": [
+                {"name": "nuclei_scan",
+                 "arguments": {"url": "https://abc.vn/", "severity": "low"}}]},
+            {"content": "", "tool_calls": [
+                {"name": "nuclei_scan",
+                 "arguments": {"url": "https://abc.vn/", "severity": "high"}}]},
+            {"content": FINAL_JSON, "tool_calls": []},
+        ]
+        a = WebXAgent(config=cfg({"auto_exec": "ask"}), chat=FakeChat(script=script))
+        real = a._dispatch
+        n = {"v": 0}
+
+        def spy(name, args):
+            n["v"] += 1
+            return real(name, args)
+
+        a._dispatch = spy
+        with patch("tools.shutil.which", return_value=None), \
+             patch("builtins.input",
+                   side_effect=["y", AssertionError("approval re-prompted")]) as inp:
+            res = a.run("test")
+        self.assertEqual(n["v"], 1)  # chỉ round 1 được dispatch thật
+        outcomes = [t["calls"][0]["outcome"] for t in a.transcript if t["type"] == "tools"]
+        self.assertEqual(outcomes, ["error", "blocked"])
+        self.assertIn("không thử lại", a.transcript[1]["calls"][0]["output"])
+        self.assertEqual(inp.call_count, 1)  # round 2 không prompt operator
+        self.assertEqual(res["calls"], 2)
+
+    def test_early_stop_all_duplicate(self):
+        # vòng 2 gọi lại y hệt vòng 1 → duplicate; MỌI kết quả của round đều
+        # duplicate/blocked → early stop: không đốt hết 9 rounds, ép model trả
+        # final JSON ngay bằng dữ liệu đã thu thập.
+        script = [
+            {"content": "", "tool_calls": [
+                {"name": "http_probe", "arguments": {"url": "https://abc.vn/"}}]},
+            {"content": "", "tool_calls": [
+                {"name": "http_probe", "arguments": {"url": "https://abc.vn/"}}]},
+        ]
+        a = self._agent(script=script)
+        res = a.run("test")
+        rounds = [t for t in a.transcript if t["type"] == "tools"]
+        self.assertEqual(len(rounds), 2)                          # dừng sớm ở round 2
+        self.assertEqual(rounds[1]["calls"][0]["outcome"], "duplicate")
+        self.assertEqual(res["calls"], 2)
+        self.assertEqual(len(a.ledger.all()), 2)                  # FINAL_JSON ép trả
+        self.assertEqual(res["risk_level"], "HIGH")
 
 
 class TestScopePrompt(unittest.TestCase):

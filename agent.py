@@ -103,8 +103,13 @@ class WebXAgent:
         #    outcome='duplicate' mà KHÔNG thực thi lại.
         #  - _fail_counts: đếm lỗi theo tên tool — fail >=3 lần thì outcome='blocked'
         #    (gate cứng), tránh agent kẹt loop với tool thiếu binary (nuclei/arjun...).
+        #  - _failed_urls: (name, url) đã fail (error/scope_rejected) trong phiên —
+        #    gọi lại cùng URL (dù đổi tham số khác) sẽ bị outcome='blocked' ngay
+        #    trước bước xin phép operator; chặn chiêu model đổi
+        #    severity/tags/wordlist rồi gọi lại cùng đích.
         self._call_cache: dict[str, dict] = {}
         self._fail_counts: dict[str, int] = {}
+        self._failed_urls: set[str] = set()
 
     # ─────────────────────────────────────────
     # TOOL DISPATCH (+ scope check + risk approval)
@@ -161,6 +166,7 @@ class WebXAgent:
 
         max_rounds = self.config["max_rounds"]
         result = {"risk_level": "UNKNOWN", "overall_summary": "", "final_text": "", "calls": 0}
+        forced = False  # dừng sớm: mọi tool đều duplicate/blocked → ép trả JSON ngay
         for rnd in range(1, max_rounds + 1):
             disp = _LiveDisplay(rnd, max_rounds)
             resp = self.chat(msgs, tools=[t.schema() for t in self.tools],
@@ -191,6 +197,8 @@ class WebXAgent:
                 t0 = time.time()
                 key = f"{name}|" + json.dumps(args, sort_keys=True,
                                                default=str, ensure_ascii=False)
+                url_val = str(args.get("url") or args.get("host") or "").rstrip("/")
+                url_key = f"{name}|{url_val}" if url_val else ""
                 if key in self._call_cache:
                     # gọi lặp với đúng tham số đã chạy — không thực thi lại
                     prev = self._call_cache[key].get("outcome", "?")
@@ -199,13 +207,20 @@ class WebXAgent:
                                    f"(kết quả trước: {prev}) — KHÔNG thực thi lại. "
                                    f"Đổi tham số hoặc chuyển sang tool khác."}
                 elif self._fail_counts.get(name, 0) >= 3:
-                    # tool fail liên tục phiên này — gate cứng
+                    # tool fail liên tục phiên này — gate cứng theo tên tool
                     r = {"name": name, "outcome": "blocked",
                          "output": f"[!] Tool '{name}' đã fail "
                                    f"{self._fail_counts.get(name, 0)} lần phiên này — "
                                    f"bị chặn tạm thời. Dừng gọi tool này: kiểm tra "
                                    f"binary/network (vd: which {name}) hoặc "
                                    f"chuyển hướng chiến lược sang tool khác."}
+                elif url_key and url_key in self._failed_urls:
+                    # cùng (tool, url) đã fail trong phiên — không thử lại; chặn
+                    # TRƯỚC bước xin phép operator, dù tham số có đổi (severity/tags)
+                    r = {"name": name, "outcome": "blocked",
+                         "output": f"[!] Tool '{name}' đã fail trước đó trên URL "
+                                   f"'{url_val}' phiên này — không thử lại cùng đích. "
+                                   f"Đổi URL hoặc chuyển sang tool/chiến lược khác."}
                 else:
                     r = self._dispatch(name, args)
                     self._call_cache[key] = r  # cache mọi outcome để dedup lần sau
@@ -214,6 +229,10 @@ class WebXAgent:
                         self._fail_counts[name] = self._fail_counts.get(name, 0) + 1
                     elif oc == "ok":
                         self._fail_counts[name] = 0
+                    if oc == "ok":
+                        self._failed_urls.discard(url_key)  # URL hồi phục
+                    elif oc in ("error", "scope_rejected"):
+                        self._failed_urls.add(url_key)
                 dt = time.time() - t0
                 tag = f"{GREEN}[✔]{RESET}" if r.get("outcome") == "ok" \
                     else f"{RED}[✗]{RESET}"
@@ -223,6 +242,12 @@ class WebXAgent:
             disp.done()
             self.transcript.append({"round": rnd, "type": "tools", "calls": results})
             result["calls"] += len(results)
+
+            if all(r.get("outcome") in ("duplicate", "blocked") for r in results):
+                # cả round chỉ toàn duplicate/blocked — không tool nào sinh dữ liệu
+                # mới; dừng sớm để không đốt nốt budget vào vòng lặp thoái hóa
+                forced = True
+                break
 
             tool_msgs = []
             for r in results:
@@ -242,8 +267,13 @@ class WebXAgent:
                         json.dumps(tool_msgs, ensure_ascii=False)[:12000] +
                         "\n[TOOL RESULTS END]\nTiếp tục. Khi đủ dữ liệu trả JSON cuối cùng."})
 
-        # hết budget — ép trả JSON
-        disp = _LiveDisplay(max_rounds, max_rounds)
+        # hết budget (hoặc dừng sớm vì mọi tool đều duplicate/blocked) — ép trả JSON
+        if forced:
+            msgs.append({"role": "user", "content":
+                        "Các tool gọi ở round trước đều trả duplicate/blocked — "
+                        "không còn thông tin mới. KHÔNG gọi tool nữa. Tổng hợp dữ liệu "
+                        "đã thu thập được và trả final JSON ngay."})
+        disp = _LiveDisplay(0 if forced else max_rounds, max_rounds)
         resp = self.chat(msgs, tools=[t.schema() for t in self.tools], json_mode=True,
                          on_token=disp.on_token, on_reasoning=disp.on_reasoning)
         disp.done()

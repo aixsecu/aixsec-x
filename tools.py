@@ -148,7 +148,9 @@ def _ffuf_dir(**kw):
     _need("ffuf")
     wl = kw.get("wordlist", "/usr/share/seclists/Discovery/Web-Content/common.txt")
     if not os.path.exists(wl):
-        return f"[!] Wordlist không tồn tại: {wl}"
+        # raise (→ outcome=error, bị đếm vào fail-count/URL-block) thay vì trả
+        # chuỗi lỗi với outcome=ok — nếu không agent cứ gọi lại wordlist hỏng
+        raise ValueError(f"[!] Wordlist không tồn tại: {wl}")
     args = ["ffuf", "-u", kw["url"].rstrip("/") + "/FUZZ",
             "-w", wl, "-mc", "200,204,301,302,307,401,403", "-t", "30",
             "-timeout", "10", "-s"]

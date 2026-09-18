@@ -228,6 +228,17 @@ The agent is not allowed to waste rounds re-running the same thing:
   missing), it is hard-blocked (`outcome=blocked`) and the model is told to
   change strategy (check the binary/network, switch tools) instead of retrying
   forever.
+- **Blocked per URL** — once a `(tool, URL)` has failed in this session
+  (`error`/`scope_rejected`), calling the same tool against the **same URL** is
+  rejected (`outcome=blocked`) *before* the approval prompt, even if other
+  arguments change. This stops the model's trick of re-calling `nuclei_scan`
+  with `severity low→high` (or swapping `tags`/`wordlist`) on the same target.
+  A URL that succeeds again is removed from the block list.
+- **Early stop** — if a round contains *only* `duplicate`/`blocked` outcomes
+  (i.e. no tool produced any new information), the run ends immediately and the
+  model is forced to return the final JSON with what it already has — it never
+  burns the remaining rounds on a degenerated loop (such as the model streaming
+  "(calling tools...)" without emitting any tool call).
 - Every tool-message fed back to the model carries a note once a tool has
   failed ≥2 times: *"Tool đã fail N lần phiên này — đừng gọi lại trừ khi đổi
   tham số/chiến lược."*
