@@ -380,6 +380,24 @@ Model 7B/9B (vd: `huihui_ai/qwen3.5-abliterated:9b`) tuân theo **ít quy tắc*
   với `break_long_words=True` làm tách `**ffuf_dir**` thành `**ff` + `uf_dir**`.
   Giờ dùng `break_long_words=False, break_on_hyphens=False` — từ dài nhảy
   trọn sang dòng tiếp theo.
+- **v1.4.3 — Plan-only guard (run không còn chết vì văn bản kế hoạch):**
+  model 9B hay trả lượt chỉ bằng VĂN BẢN kế hoạch ("tôi sẽ chạy
+  sqli_manual_test...") không kèm `tool_calls` — trước đây bị coi là câu trả
+  lời cuối và dừng TOÀN BỘ run sớm (live-run dừng ở round 2-3, ledger trống,
+  dù còn round). Giờ vòng lặp phát hiện lượt plan-only, đẩy lại message cứng
+  ("bắt buộc gọi ÍT NHẤT 1 function call NGAY", nêu tên tool model vừa nhắc
+  vd `sqli_manual_test`), và chỉ sau **2 lượt plan-only liên tiếp** mới ép trả
+  final JSON bằng dữ liệu đã thu thập.
+- **v1.4.3 — sqli_manual_test hỗ trợ POST:** gọi
+  `sqli_manual_test{url, param:'q', method:'post', data:'q=test'}` để gửi form
+  data và tự inject payload SLEEP vào param đó (`q=1 AND SLEEP(3)`); tiền tố
+  `param=` kiểu GET trong `data` được strip/đổi sang param đang test. System
+  prompt đã có hint endpoint POST: `sqlmap_check{url, data}` hoặc
+  `sqli_manual_test{..., method:'post', data}` thay vì pattern GET-only.
+- **v1.4.3 — Trần timeout theo tool:** `TOOL_TIMEOUTS` (param_discovery 60s,
+  detect_cms 90s, subdomain_enum 90s, nikto_scan 120s) — `_dispatch` áp
+  `min(tool_timeout, cap)`, nên scan chậm (live-run arjun mất 427s) không còn
+  đốt trọn budget round kể cả khi operator nâng `WEBX_TOOL_TIMEOUT` toàn cục.
 - `build_system_prompt(cfg)` — `WEBX_PROMPT_STYLE=auto` (mặc định): tên model chứa `14b/32b/70b/72b/122b` → `full`, còn lại → `compact`. Ghi đè thủ công: `export WEBX_PROMPT_STYLE=compact|full`.
 
 ```bash
