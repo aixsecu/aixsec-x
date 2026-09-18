@@ -28,10 +28,11 @@ from ledger import (Ledger, parse_findings_json, render_markdown, validation_pla
 from llm import InjectionGuard, ollama_chat
 from prompts import SYSTEM_PROMPT, build_system_prompt
 from scope import ScopePolicy
-from tools import TOOL_REGISTRY, TOOL_INDEX, TOOL_BINS, available_tools
+from tools import (TOOL_REGISTRY, TOOL_INDEX, TOOL_BINS, TOOL_TIMEOUTS,
+                   available_tools)
 
 # ── terminal colors (AIXSEC-X style) ──
-VERSION = "1.4.2"
+VERSION = "1.4.4"
 
 RED = "\033[91m"
 GREEN = "\033[92m"
@@ -186,6 +187,10 @@ class WebXAgent:
         self._call_cache: dict[str, dict] = {}
         self._fail_counts: dict[str, int] = {}
         self._failed_urls: set[str] = set()
+        # v1.4.3: đếm số lượt model trả VĂN BẢN KẾ HOẠCH không kèm tool call
+        # (plan-only). >=2 lượt liên tiếp → ép trả final JSON bằng dữ liệu đã có
+        # thay vì để vòng lặp quay vòng vô ích. Reset mỗi lượt có tool call thật.
+        self._plan_only = 0
 
     # ─────────────────────────────────────────
     # TOOL DISPATCH (+ scope check + risk approval)
@@ -218,14 +223,26 @@ class WebXAgent:
                     "output": "[!] Operator denied this tool."}
         try:
             kw = dict(arguments)
-            kw["_timeout"] = self.config["tool_timeout"]
+            # v1.4.3: trần timeout theo từng tool — chặn tool chạy vô hạn
+            # không tôn trọng _timeout tốt (vd arjun 427s ở live-run), ngay cả
+            # khi operator cấu hình tool_timeout cao.
+            kw["_timeout"] = min(self.config["tool_timeout"],
+                                  TOOL_TIMEOUTS.get(name, self.config["tool_timeout"]))
+            # v1.4.4: chỉ đo thời gian THỰC THI tool — chờ operator duyệt
+            # (_risk_ok/input()) nằm ngoài try này nên không bị tính vào duration.
+            t0 = time.time()
             out = spec.exec_fn(**kw)
-            return {"name": name, "outcome": "ok", "output": out}
+            dt = round(time.time() - t0, 1)
+            # v1.4.4: output mở đầu '[!]' = lỗi thực thi (timeout, thiếu binary,
+            # connect fail, args sai) → outcome=error để gate/fail-count đúng.
+            oc = "error" if isinstance(out, str) and out.startswith("[!]") else "ok"
+            return {"name": name, "outcome": oc, "output": out, "exec_time": dt}
         except TypeError as e:
             return {"name": name, "outcome": "error",
-                    "output": f"[!] Invalid arguments for '{name}': {e}"}
+                    "output": f"[!] Invalid arguments for '{name}': {e}", "exec_time": 0.0}
         except Exception as e:  # noqa: BLE001
-            return {"name": name, "outcome": "error", "output": f"[!] {name} error: {e}"}
+            return {"name": name, "outcome": "error",
+                    "output": f"[!] {name} error: {e}", "exec_time": 0.0}
 
     # ─────────────────────────────────────────
     # MAIN LOOP
@@ -242,7 +259,8 @@ class WebXAgent:
 
         max_rounds = self.config["max_rounds"]
         result = {"risk_level": "UNKNOWN", "overall_summary": "", "final_text": "", "calls": 0}
-        forced = False  # dừng sớm: mọi tool đều duplicate/blocked → ép trả JSON ngay
+        forced = False  # dừng sớm: round thoái hóa → ép trả JSON ngay
+        self._plan_only = 0  # v1.4.3: reset bộ đếm plan-only mỗi run()
         for rnd in range(1, max_rounds + 1):
             disp = _LiveDisplay(rnd, max_rounds)
             resp = self.chat(msgs, tools=[t.schema() for t in self.tools],
@@ -251,16 +269,39 @@ class WebXAgent:
             if not calls:
                 disp.done()
                 result["final_text"] = resp.get("content", "")
-                if not self._looks_like_json(result["final_text"]):
+                if self._looks_like_json(result["final_text"]):
+                    self._commit_findings(result)
+                    try:
+                        d = json.loads(self._strip_fence(result["final_text"]))
+                        result["risk_level"] = d.get("risk_level", "UNKNOWN")
+                        result["overall_summary"] = d.get("overall_summary", "")
+                    except json.JSONDecodeError:
+                        pass
                     return result
-                self._commit_findings(result)
-                try:
-                    d = json.loads(self._strip_fence(result["final_text"]))
-                    result["risk_level"] = d.get("risk_level", "UNKNOWN")
-                    result["overall_summary"] = d.get("overall_summary", "")
-                except json.JSONDecodeError:
-                    pass
-                return result
+                # v1.4.3: model 9B viết VĂN BẢN KẾ HOẠCH không kèm tool_calls →
+                # KHÔNG được coi là câu trả lời cuối (trước đây return ngay làm
+                # run dừng ở round 2-3 dù còn budget). Đẩy lượt mới ép gọi tool:
+                #  - lần 1: nhắc chung + nêu tên tool model vừa nhắc (nếu có)
+                #  - lần 2 liên tiếp: forced → ép trả final JSON bằng dữ liệu đã thu
+                self._plan_only += 1
+                msgs.append({"role": "assistant", "content": result["final_text"]})
+                mentioned = self._mentioned_tools(result["final_text"])
+                hint = ""
+                if mentioned:
+                    hint = (f"\nVăn bản của bạn nhắc tới tool: "
+                            f"{', '.join(mentioned)}. Gọi function call của "
+                            f"{mentioned[0]} NGAY, đừng mô tả lại kế hoạch.")
+                msgs.append({"role": "user", "content":
+                             "Bạn vừa trả lời CHỈ BẰNG VĂN BẢN kế hoạch và KHÔNG gọi "
+                             "tool call nào — lượt như vậy không được tính là hành "
+                             "động. Bắt buộc: lượt này phải gọi ÍT NHẤT 1 function "
+                             "call (chọn tool phù hợp trong danh sách và gọi "
+                             f"ngay).{hint}"})
+                if self._plan_only >= 2:
+                    forced = True
+                    break
+                continue
+            self._plan_only = 0  # lượt có tool call thật → reset bộ đếm plan-only
 
             # chạy tool tuần tự: in lệnh → dedup/block → dispatch → kết quả kèm thời gian
             results = []
@@ -308,7 +349,10 @@ class WebXAgent:
                         self._failed_urls.discard(url_key)  # URL hồi phục
                     elif oc in ("error", "scope_rejected"):
                         self._failed_urls.add(url_key)
-                dt = time.time() - t0
+                # v1.4.4: ưu tiên exec_time do _dispatch đo (không gồm chờ duyệt);
+                # fallback cho nhánh duplicate/blocked (không qua _dispatch).
+                dt = (r.get("exec_time")
+                      if r.get("exec_time") is not None else time.time() - t0)
                 tag = f"{GREEN}[✔]{RESET}" if r.get("outcome") == "ok" \
                     else f"{RED}[✗]{RESET}"
                 print(f"{tag} {name} → outcome={r.get('outcome', '?')} ({dt:.1f}s)",
@@ -343,11 +387,14 @@ class WebXAgent:
                         json.dumps(tool_msgs, ensure_ascii=False)[:12000] +
                         "\n[TOOL RESULTS END]\nTiếp tục. Khi đủ dữ liệu trả JSON cuối cùng."})
 
-        # hết budget (hoặc dừng sớm vì mọi tool đều duplicate/blocked) — ép trả JSON
+        # hết budget (hoặc dừng sớm vì round thoái hóa: toàn duplicate/blocked
+        # hoặc model chỉ trả văn bản kế hoạch 2 lượt liên tiếp) — ép trả JSON
         if forced:
             msgs.append({"role": "user", "content":
-                        "Các tool gọi ở round trước đều trả duplicate/blocked — "
-                        "không còn thông tin mới. KHÔNG gọi tool nữa. Tổng hợp DỮ LIỆU "
+                        "Vòng lặp không tiến triển: các tool gọi đều trả "
+                        "duplicate/blocked, hoặc bạn chỉ trả văn bản kế hoạch "
+                        "không gọi tool — không còn thông tin mới. KHÔNG gọi tool nữa. "
+                        "Tổng hợp DỮ LIỆU "
                         "THẬT TỪ [TOOL RESULTS] ở trên và trả final JSON ngay. "
                         "Chỉ đưa vào finding những gì thật sự xuất hiện trong tool output "
                         "của phiên này (ghi nguồn trong description). KHÔNG bịa thêm "
@@ -377,6 +424,13 @@ class WebXAgent:
     @staticmethod
     def _looks_like_json(t: str) -> bool:
         return t.strip().startswith("{") or "findings" in t[:200]
+
+    def _mentioned_tools(self, text: str) -> list[str]:
+        """Tên tool đăng ký xuất hiện trong văn bản model — để nhắc model gọi
+        ĐÚNG tool nó vừa nói tới (v1.4.3). Sắp xếp tên dài trước để khớp nét."""
+        low = (text or "").lower()
+        found = [ts.name for ts in self.tools if ts.name.lower() in low]
+        return sorted(found, key=len, reverse=True)
 
     def _history(self) -> list[dict]:
         """Toàn bộ tool calls của phiên (args + outcome + output) để đối chiếu bằng chứng."""
