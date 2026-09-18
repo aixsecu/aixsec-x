@@ -48,7 +48,8 @@ class FakeChat:
         self.calls = []
 
     def __call__(self, messages, tools=None, json_mode=False, **kwargs):
-        self.calls.append({"tools": tools, "json_mode": json_mode, "kwargs": kwargs})
+        self.calls.append({"tools": tools, "json_mode": json_mode,
+                           "kwargs": kwargs, "messages": messages})
         if self.script:
             return self.script.pop(0)
         if self.always_tools:
@@ -282,6 +283,159 @@ class TestAgentLoop(unittest.TestCase):
         self.assertEqual(res["calls"], 2)
         self.assertEqual(len(a.ledger.all()), 2)                  # FINAL_JSON ép trả
         self.assertEqual(res["risk_level"], "HIGH")
+
+
+class TestPlanOnlyGuard(unittest.TestCase):
+    """v1.4.3: model trả VĂN BẢN KẾ HOẠCH không kèm tool_calls KHÔNG được kết
+    thúc run (trước đây return ngay bỏ phí budget — user thấy run dừng round 2-3
+    dù còn round, ledger trống). Hệ thống đẩy lại lượt mới ép gọi tool, nhắc tên
+    tool model vừa nói tới, sau 2 lần liên tiếp thì ép trả final JSON (forced)."""
+
+    def _agent(self, script=None):
+        return WebXAgent(config=cfg(), chat=FakeChat(script=script))
+
+    def test_plan_only_does_not_terminate(self):
+        # round1: tool thật; round2: văn bản kế hoạch (0 tool call); round3: final JSON
+        script = [
+            {"content": "", "tool_calls": [
+                {"name": "http_probe", "arguments": {"url": "https://abc.vn/"}}]},
+            {"content": "Tôi sẽ fuzz thư mục với ffuf_dir và kiểm tra thêm nuclei.",
+             "tool_calls": []},
+            {"content": FINAL_JSON, "tool_calls": []},
+        ]
+        a = self._agent(script=script)
+        res = a.run("test")
+        # KHÔNG dừng ở round 2: findings vẫn được commit, risk vẫn parse
+        self.assertEqual(res["risk_level"], "HIGH")
+        self.assertEqual(len(a.ledger.all()), 2)
+        self.assertEqual(res["calls"], 1)
+        self.assertEqual(len(a.chat.calls), 3)          # 3 lượt chat, không forced
+        self.assertFalse(a.chat.calls[2]["json_mode"])  # final JSON qua lượt thường
+        # lượt round-3 (sau push) phải chứa message bắt buộc gọi function call
+        push = [m for m in a.chat.calls[2]["messages"] if m.get("role") == "user"]
+        self.assertTrue(any("function call" in str(m.get("content", "")) for m in push))
+
+    def test_plan_only_push_mentions_tool(self):
+        # văn bản nhắc sqli_manual_test → push message phải nêu đúng tên tool
+        script = [
+            {"content": "Tôi sẽ dùng sqli_manual_test để kiểm tra baseline time.",
+             "tool_calls": []},
+            {"content": FINAL_JSON, "tool_calls": []},
+        ]
+        a = self._agent(script=script)
+        res = a.run("test")
+        push = [m for m in a.chat.calls[1]["messages"] if m.get("role") == "user"]
+        self.assertTrue(any("sqli_manual_test" in str(m.get("content", "")) for m in push))
+        self.assertEqual(res["risk_level"], "HIGH")
+        self.assertEqual(len(a.ledger.all()), 2)
+
+    def test_two_plan_only_forces_json(self):
+        # 2 lượt plan-only liên tiếp → forced: ép trả final JSON (json_mode=True)
+        script = [
+            {"content": "Tôi sẽ chạy ffuf_dir.", "tool_calls": []},
+            {"content": "Sau đó dùng nuclei_scan.", "tool_calls": []},
+        ]
+        a = self._agent(script=script)
+        res = a.run("test")
+        self.assertTrue(a.chat.calls[2]["json_mode"])    # forced JSON round
+        self.assertEqual(a._plan_only, 2)
+        self.assertEqual(res["calls"], 0)
+        self.assertEqual(res["risk_level"], "HIGH")     # FINAL_JSON ép trả
+        self.assertEqual(len(a.ledger.all()), 2)
+
+    def test_mentioned_tools_ignores_unknown_text(self):
+        a = self._agent()
+        self.assertIn("sqli_manual_test", a._mentioned_tools(
+            "dùng sqli_manual_test trước"))
+        self.assertEqual(a._mentioned_tools("không nhắc tool nào"), [])
+
+
+class TestSQLiManualTest(unittest.TestCase):
+    """v1.4.3: sqli_manual_test hỗ trợ POST form data (method='post' + data)."""
+
+    def _exec(self, **kw):
+        from tools import _sqli_manual_test
+        return _sqli_manual_test(**kw)
+
+    def _mock_resp(self):
+        r = MagicMock()
+        r.status_code = 200
+        r.elapsed.total_seconds.return_value = 1.0
+        r.content = b"hello"
+        return r
+
+    def test_post_injects_into_param(self):
+        resp = self._mock_resp()
+        with patch("requests.post", return_value=resp) as mp, \
+             patch("requests.get", return_value=resp) as mg:
+            out = self._exec(url="https://abc.vn/WebTinTuc/TimKiem",
+                             param="q", method="post", data="q=test")
+        self.assertEqual(mp.call_count, 2)                # baseline + delay
+        self.assertEqual(mg.call_count, 0)                # không dùng GET
+        self.assertEqual(mp.call_args_list[0][0][0],
+                         "https://abc.vn/WebTinTuc/TimKiem")
+        self.assertEqual(mp.call_args_list[0][1]["data"], {"q": "1"})
+        self.assertEqual(mp.call_args_list[1][1]["data"], {"q": "1 AND SLEEP(3)"})
+        self.assertIn("baseline: status=200", out)
+        self.assertIn("delay: status=200", out)
+
+    def test_post_param_prefix_stripped(self):
+        resp = self._mock_resp()
+        with patch("requests.post", return_value=resp) as mp:
+            self._exec(url="https://abc.vn/x", param="q", method="post",
+                       data="param=1")
+        self.assertEqual(mp.call_args_list[0][1]["data"], {"q": "1"})
+
+    def test_get_default_query_string(self):
+        resp = self._mock_resp()
+        with patch("requests.get", return_value=resp) as mg, \
+             patch("requests.post", return_value=resp) as mp:
+            self._exec(url="https://abc.vn/x", param="id")
+        self.assertEqual(mp.call_count, 0)
+        urls = [c[0][0] for c in mg.call_args_list]
+        self.assertEqual(urls, ["https://abc.vn/x?id=1",
+                                "https://abc.vn/x?id=1 AND SLEEP(3)"])
+
+
+class TestToolTimeoutCap(unittest.TestCase):
+    """v1.4.3: _dispatch áp min(tool_timeout cấu hình, TOOL_TIMEOUTS cap theo tool)
+    — scan chậm (arjun 427s live-run) không còn đốt trọn budget round."""
+
+    def test_capped_tool_gets_min(self):
+        from tools import TOOL_INDEX, TOOL_TIMEOUTS
+        caught = {}
+
+        def fake_param(**kw):
+            caught["t"] = kw.get("_timeout")
+            return "done"
+
+        # patch exec_fn NGAY TRONG REGISTRY — _dispatch đọc spec.exec_fn
+        # đã bind lúc build registry nên patch tools._param_discovery không ăn
+        with patch.object(TOOL_INDEX["param_discovery"], "exec_fn",
+                          fake_param), \
+             patch("tools.shutil.which", return_value="/usr/bin/arjun"):
+            a = WebXAgent(config=cfg({"tool_timeout": 300}),
+                          chat=FakeChat(script=[]))
+            r = a._dispatch("param_discovery", {"url": "https://abc.vn/"})
+        self.assertEqual(r["outcome"], "ok")
+        # điều kiện cấu hình 300s nhưng cap param_discovery=60s phải thắng
+        self.assertEqual(caught["t"], TOOL_TIMEOUTS["param_discovery"])
+        self.assertLess(TOOL_TIMEOUTS["param_discovery"], 300)
+
+    def test_uncapped_tool_keeps_config(self):
+        from tools import TOOL_INDEX
+        caught = {}
+
+        def fake_probe(**kw):
+            caught["t"] = kw.get("_timeout")
+            return "status 200"
+
+        with patch.object(TOOL_INDEX["http_probe"], "exec_fn", fake_probe):
+            a = WebXAgent(config=cfg({"tool_timeout": 300}),
+                          chat=FakeChat(script=[]))
+            r = a._dispatch("http_probe", {"url": "https://abc.vn/"})
+        self.assertEqual(r["outcome"], "ok")
+        self.assertEqual(caught["t"], 300)  # không nằm trong cap → giữ nguyên
 
 
 class TestScopePrompt(unittest.TestCase):

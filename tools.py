@@ -80,6 +80,17 @@ _MISSING_HINT: dict[str, str] = {
     "sqlmap": "Dùng sqli_manual_test / sqli_blind_extract (không cần sqlmap).",
 }
 
+# v1.4.3: trần timeout (giây) theo từng tool — chặn tool chạy quá lâu không tôn
+# trọng _timeout tốt (live-run: arjun đốt 427s). _dispatch áp
+# min(tool_timeout cấu hình, cap này). Tool không nằm trong dict dùng thẳng
+# tool_timeout của operator.
+TOOL_TIMEOUTS: dict[str, int] = {
+    "param_discovery": 60,   # arjun -q có thể chạy rất lâu
+    "detect_cms": 90,        # whatweb -a 3 chậm trên site lớn
+    "subdomain_enum": 90,    # subfinder brute từ từ
+    "nikto_scan": 120,       # nikto vốn chậm
+}
+
 
 def available_tools() -> tuple[set, dict]:
     """(set tool khả dụng, dict {tool_name: binary thiếu}) — gọi 1 lần lúc khởi động.
@@ -316,19 +327,48 @@ def _sqlmap_check(**kw):
     return run_cmd(args, kw["_timeout"])
 
 
+def _form_from_payload(payload: str, param: str) -> dict:
+    """Chuyển payload form string sang dict POST data cho đúng param đang test.
+
+    - 'q=test' với param=q  → {"q": "test"}
+    - 'param=1 AND SLEEP(3)' (kiểu GET) → {"q": "1 AND SLEEP(3)"}
+    - 'keyword=x' với param=q → {"q": "x"} (đổi key về param)
+    """
+    p = (payload or "").strip()
+    if p.lower().startswith("param="):
+        p = p[len("param="):]
+    if "=" not in p:
+        return {param: p}
+    from urllib.parse import parse_qsl
+    first_key = p.split("&", 1)[0].split("=", 1)[0].strip()
+    if first_key != param:
+        val = p.split("&", 1)[0].split("=", 1)[1]
+        p = f"{param}={val}"
+    return dict(parse_qsl(p, keep_blank_values=True))
+
+
 def _sqli_manual_test(**kw):
-    """Kiểm tra SQLi thủ công nhẹ nhàng: time-based với 2 payload so sánh."""
+    """Kiểm tra SQLi thủ công nhẹ nhàng: time-based với 2 payload so sánh.
+    GET (?param=payload) hoặc POST (method='post' + data='q=test')."""
     url = kw["url"]
     param = kw["param"]
-    baseline, delay = kw.get("baseline", "id=1"), kw.get("delay_payload", "id=1 AND SLEEP(3)")
+    method = str(kw.get("method", "get")).lower().strip()
+    # default payload theo param thực tế (trước đây cứng 'id=1' — sai param)
+    baseline = kw.get("baseline") or f"{param}=1"
+    delay = kw.get("delay_payload") or f"{param}=1 AND SLEEP(3)"
     import time as t
     import requests
     results = []
     for label, payload in (("baseline", baseline), ("delay", delay)):
         try:
-            sep = "&" if "?" in url else "?"
-            r = requests.get(f"{url}{sep}{payload}", timeout=12,
-                             headers={"User-Agent": "Mozilla/5.0"})
+            if method == "post":
+                r = requests.post(url, data=_form_from_payload(payload, param),
+                                  timeout=12,
+                                  headers={"User-Agent": "Mozilla/5.0"})
+            else:
+                sep = "&" if "?" in url else "?"
+                r = requests.get(f"{url}{sep}{payload}", timeout=12,
+                                 headers={"User-Agent": "Mozilla/5.0"})
             results.append(f"{label}: status={r.status_code} time={r.elapsed.total_seconds():.2f}s "
                            f"len={len(r.content)}")
         except Exception as e:
@@ -829,10 +869,17 @@ TOOL_REGISTRY: list[ToolSpec] = [
                              "data": {"type": "string"}},
               "required": ["url"]}, _sqlmap_check, risk="active"),
     ToolSpec("sqli_manual_test", "Test SQLi time-based thủ công nhẹ (2 request: control vs SLEEP(3)). "
-             "So sánh thời gian phản hồi.",
+             "Hỗ trợ GET (?param=payload) VÀ POST (method='post' + data='q=test') — "
+             "form endpoint không cần biết param chính xác: ghi data 'q=test' rồi "
+             "để tool inject vào đó. So sánh thời gian phản hồi.",
              {"type": "object",
               "properties": {"url": {"type": "string", "pattern": "^https?://"},
-                             "param": {"type": "string"},
+                             "param": {"type": "string",
+                                        "description": "Tham số cần test (vd q hoặc keyword)"},
+                             "method": {"type": "string", "enum": ["get", "post"],
+                                         "description": "get (mặc định) hoặc post"},
+                             "data": {"type": "string",
+                                       "description": "Form data khi method=post, vd 'q=test'"},
                              "baseline": {"type": "string"},
                              "delay_payload": {"type": "string"}},
               "required": ["url", "param"]}, _sqli_manual_test, risk="active"),

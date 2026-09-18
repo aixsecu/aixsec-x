@@ -402,6 +402,26 @@ better than long prompts. `prompts.py` ships 2 variants with auto-selection:
   `break_long_words=True`, splitting `**ffuf_dir**` across a wrap boundary as
   `**ff` / `uf_dir**`. Now `break_long_words=False, break_on_hyphens=False` —
   long words jump to the next line whole.
+- **v1.4.3 plan-only guard (a run no longer dies on plan text):** 9B models
+  often answer a turn with *only* a plan ("I will run sqli_manual_test…") and
+  no `tool_calls` — this used to be treated as the final answer and terminated
+  the entire run early (live runs stopped at round 2-3 with an empty ledger
+  although rounds were left). The run loop now detects a plan-only turn, pushes
+  a hard user message back ("call at least one function call NOW", naming any
+  mentioned tool such as `sqli_manual_test`), and only after **2 consecutive
+  plan-only turns** forces the final JSON from the data already collected.
+- **v1.4.3 sqli_manual_test supports POST:** call
+  `sqli_manual_test{url, param:'q', method:'post', data:'q=test'}` to send form
+  data and inject the SLEEP payload into that param (`q=1 AND SLEEP(3)`); a
+  GET-style `param=` prefix in `data` is stripped/rewritten to the tested
+  param. System prompt now hints POST endpoints to use `sqlmap_check{url,
+  data}` or `sqli_manual_test{..., method:'post', data}` instead of GET-only
+  patterns.
+- **v1.4.3 per-tool timeout caps:** `TOOL_TIMEOUTS` (param_discovery 60 s,
+  detect_cms 90 s, subdomain_enum 90 s, nikto_scan 120 s) — `_dispatch`
+  applies `min(tool_timeout, cap)`, so a long scan (e.g. arjun took 427 s in a
+  live run) can no longer eat the whole round budget even when the operator
+  raised the global `WEBX_TOOL_TIMEOUT`.
 - `build_system_prompt(cfg)` — `WEBX_PROMPT_STYLE=auto` (default): model name
   containing `14b/32b/70b/72b/122b` → `full`, otherwise → `compact`. Manual
   override: `export WEBX_PROMPT_STYLE=compact|full`.
