@@ -5,7 +5,7 @@
 | **English** | **README.md** (this file) |
 | Tiếng Việt | [README.vi.md](README.vi.md) |
 
-**AIXSEC-X** — AI Web Exploitation Assistant · brand **aixsecu.vn**
+**AIXSEC-X** — AI Web Exploitation Assistant · brand **aixsecu.com**
 Runs on a **local LLM (Ollama)** — no cloud, no API key.
 Agent-grade: function calling, scope pinning, validation loop, finding ledger.
 
@@ -204,7 +204,7 @@ at a blank screen:
   ✦ think: Analyze endpoint /login, try SQLi on param id...   (dim — reasoning)
   ▸ Exploiting...                                                       (green — content)
   └ model finished in 42.3s
-[→] http_probe({"url": "https://dinhtibooks.com.vn/"})
+[→] http_probe({"url": "https://example.com/"})
 [✔] http_probe → outcome=ok (1.2s)
 ```
 
@@ -215,6 +215,26 @@ at a blank screen:
   time `[✔/✗]`.
 - Disable with `WEBX_STREAM=0`; if function calling misbehaves while streaming,
   try disabling it, or disabling `WEBX_THINK`.
+
+### Anti-loop protection (no repeated tool calls)
+
+The agent is not allowed to waste rounds re-running the same thing:
+
+- **Deduplication** — calling a tool again with the **exact same arguments**
+  returns `outcome=duplicate` with the previous result's outcome; the tool is
+  NOT executed again.
+- **Hard block after 3 failures** — if a tool fails ≥3 times in one session
+  (e.g. `nuclei_scan`/`param_discovery` when the `nuclei`/`arjun` binary is
+  missing), it is hard-blocked (`outcome=blocked`) and the model is told to
+  change strategy (check the binary/network, switch tools) instead of retrying
+  forever.
+- Every tool-message fed back to the model carries a note once a tool has
+  failed ≥2 times: *"Tool đã fail N lần phiên này — đừng gọi lại trừ khi đổi
+  tham số/chiến lược."*
+
+This keeps CPU-only runs from burning round after round (75–186s each) on
+broken tools. If you see repeated `error`/`blocked` for `nuclei_scan` or
+`param_discovery`, check the binaries first: `which nuclei arjun`.
 
 ### Interactive commands
 
@@ -241,6 +261,10 @@ aixsec-x> q                                         → quit
 5. **Function calling** — Ollama `tools` API instead of regex `[TOOL:]` →
    structured, validate-able arguments.
 6. **No hardcoded credentials** — everything goes through env vars.
+7. **Anti-loop protection** — identical tool calls are deduplicated
+   (`outcome=duplicate`, never re-executed) and a tool failing ≥3 times in a
+   session is hard-blocked (`outcome=blocked`); the model is instructed to
+   switch strategy instead of retrying forever.
 
 ## Tool registry
 

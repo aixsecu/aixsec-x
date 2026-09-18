@@ -5,7 +5,7 @@
 | **Tiếng Việt** | **README.vi.md** (tệp này) |
 | English | [README.md](README.md) |
 
-**AIXSEC-X** — AI Web Exploitation Assistant · thương hiệu **aixsecu.vn**
+**AIXSEC-X** — AI Web Exploitation Assistant · thương hiệu **aixsecu.com**
 Dùng **local LLM (Ollama)** — không cần cloud, không API key.
 Agent-grade: function calling, scope pinning, validation loop, finding ledger.
 
@@ -206,7 +206,7 @@ chờ mù:
   ✦ think: Phân tích endpoint /login, thử SQLi ở param id...   (dim — reasoning)
   ▸ Khai thác...                                                       (xanh — nội dung)
   └ model finished in 42.3s
-[→] http_probe({"url": "https://dinhtibooks.com.vn/"})
+[→] http_probe({"url": "https://example.com/"})
 [✔] http_probe → outcome=ok (1.2s)
 ```
 
@@ -214,6 +214,23 @@ chờ mù:
 - `▸` = nội dung model đang sinh ra.
 - Mỗi lệnh tool được in trước khi chạy `[→]` và kết quả kèm thời gian thực thi `[✔/✗]`.
 - Tắt bằng `WEBX_STREAM=0`; nếu thấy function-calling bị lỗi khi stream, thử tắt hoặc tắt `WEBX_THINK`.
+
+### Bộ chống lặp lại tool-call
+
+Agent không được phép đốt rounds để gọi lại đúng thứ đã chạy:
+
+- **Dedup (chống trùng)** — gọi tool lại với **đúng tham số cũ** sẽ trả
+  `outcome=duplicate` kèm outcome của lần chạy trước; tool KHÔNG bị thực thi lại.
+- **Chặn cứng sau 3 lần fail** — tool fail ≥3 lần trong phiên (vd
+  `nuclei_scan`/`param_discovery` khi máy thiếu binary `nuclei`/`arjun`) sẽ bị
+  chặn (`outcome=blocked`) và model được chỉ dẫn đổi chiến lược (kiểm tra
+  binary/network, đổi tool khác) thay vì thử lại vô hạn.
+- Mọi tool-message đưa lại cho model đều kèm ghi chú khi tool đã fail ≥2 lần:
+  *"Tool đã fail N lần phiên này — đừng gọi lại trừ khi đổi tham số/chiến lược."*
+
+Nhờ đó các phiên chạy CPU-only không đốt hết từng round (75–186s/round) cho
+mấy tool đang hỏng. Nếu thấy `error`/`blocked` lặp lại ở `nuclei_scan` hoặc
+`param_discovery`, hãy kiểm tra binary trước: `which nuclei arjun`.
 
 ### Lệnh interactive
 
@@ -234,6 +251,9 @@ aixsec-x> q                                       → thoát
 4. **Approval flow** — tool noisy/active (nuclei, sqlmap, ffuf, nikto) mặc định hỏi operator trước khi chạy.
 5. **Function calling** — Ollama `tools` API thay regex `[TOOL:]` → args có cấu trúc, validate được.
 6. **Không credential hardcode** — mọi thứ qua env.
+7. **Bộ chống lặp lại** — tool call giống hệt nhau bị dedup (`outcome=duplicate`,
+   không thực thi lại) và tool fail ≥3 lần trong phiên bị chặn cứng
+   (`outcome=blocked`); model được chỉ dẫn đổi chiến lược thay vì retry vô hạn.
 
 ## Tool registry
 

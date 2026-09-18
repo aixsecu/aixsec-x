@@ -98,6 +98,13 @@ class WebXAgent:
         self.transcript: list[dict] = []
         self.tools = TOOL_REGISTRY
         self.extra_context = ""
+        # Bộ chống lặp lại tool-call (chỉ trong vòng lặp run):
+        #  - _call_cache: kết quả theo khóa (name, args) — gọi lại y hệt thì trả
+        #    outcome='duplicate' mà KHÔNG thực thi lại.
+        #  - _fail_counts: đếm lỗi theo tên tool — fail >=3 lần thì outcome='blocked'
+        #    (gate cứng), tránh agent kẹt loop với tool thiếu binary (nuclei/arjun...).
+        self._call_cache: dict[str, dict] = {}
+        self._fail_counts: dict[str, int] = {}
 
     # ─────────────────────────────────────────
     # TOOL DISPATCH (+ scope check + risk approval)
@@ -174,7 +181,7 @@ class WebXAgent:
                     pass
                 return result
 
-            # chạy tool tuần tự: in lệnh → dispatch → kết quả kèm thời gian
+            # chạy tool tuần tự: in lệnh → dedup/block → dispatch → kết quả kèm thời gian
             results = []
             for c in calls:
                 name = c.get("name", "?")
@@ -182,7 +189,31 @@ class WebXAgent:
                 print(f"{YELLOW}[→]{RESET} {BOLD}{name}{RESET}("
                       f"{json.dumps(args, ensure_ascii=False)[:200]})", flush=True)
                 t0 = time.time()
-                r = self._dispatch(name, args)
+                key = f"{name}|" + json.dumps(args, sort_keys=True,
+                                               default=str, ensure_ascii=False)
+                if key in self._call_cache:
+                    # gọi lặp với đúng tham số đã chạy — không thực thi lại
+                    prev = self._call_cache[key].get("outcome", "?")
+                    r = {"name": name, "outcome": "duplicate",
+                         "output": f"[!] Tool được gọi lặp với tham số giống hệt "
+                                   f"(kết quả trước: {prev}) — KHÔNG thực thi lại. "
+                                   f"Đổi tham số hoặc chuyển sang tool khác."}
+                elif self._fail_counts.get(name, 0) >= 3:
+                    # tool fail liên tục phiên này — gate cứng
+                    r = {"name": name, "outcome": "blocked",
+                         "output": f"[!] Tool '{name}' đã fail "
+                                   f"{self._fail_counts.get(name, 0)} lần phiên này — "
+                                   f"bị chặn tạm thời. Dừng gọi tool này: kiểm tra "
+                                   f"binary/network (vd: which {name}) hoặc "
+                                   f"chuyển hướng chiến lược sang tool khác."}
+                else:
+                    r = self._dispatch(name, args)
+                    self._call_cache[key] = r  # cache mọi outcome để dedup lần sau
+                    oc = r.get("outcome")
+                    if oc in ("error", "denied", "scope_rejected"):
+                        self._fail_counts[name] = self._fail_counts.get(name, 0) + 1
+                    elif oc == "ok":
+                        self._fail_counts[name] = 0
                 dt = time.time() - t0
                 tag = f"{GREEN}[✔]{RESET}" if r.get("outcome") == "ok" \
                     else f"{RED}[✗]{RESET}"
@@ -196,8 +227,14 @@ class WebXAgent:
             tool_msgs = []
             for r in results:
                 out = InjectionGuard.sanitize(r["output"], self.config["output_cap"])
+                note = ""
+                if (r.get("outcome") in ("error", "blocked")
+                        and self._fail_counts.get(r["name"], 0) >= 2):
+                    note = (f"\n[GHI CHÚ] Tool '{r['name']}' đã fail "
+                            f"{self._fail_counts[r['name']]} lần phiên này — "
+                            f"đừng gọi lại trừ khi đổi tham số/chiến lược.")
                 tool_msgs.append({"role": "tool", "name": r["name"],
-                                  "content": f"outcome={r['outcome']}\n{out}"})
+                                  "content": f"outcome={r['outcome']}\n{out}{note}"})
             msgs.append({"role": "assistant", "content": resp.get("content", "") or
                         "(calling tools...)"})
             msgs.append({"role": "user", "content":
@@ -314,7 +351,7 @@ def _print_banner(cfg: dict):
     print(f"{MAGENTA}{'═' * 64}{RESET}")
     print(f"{BOLD}{GREEN}AIXSEC-X{RESET} — AI Web Exploitation Assistant  "
           f"{DIM}(local LLM • Kali Linux){RESET}")
-    print(f"{DIM}Brand:{RESET} {CYAN}aixsecu.vn{RESET}   {DIM}Mode:{RESET} "
+    print(f"{DIM}Brand:{RESET} {CYAN}aixsecu.com{RESET}   {DIM}Mode:{RESET} "
           f"{YELLOW}{cfg.get('auto_exec', 'ask')}{RESET}")
     print(f"{MAGENTA}{'═' * 64}{RESET}")
 

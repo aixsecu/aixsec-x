@@ -160,6 +160,67 @@ class TestAgentLoop(unittest.TestCase):
         rounds = [t for t in a.transcript if t["type"] == "tools"]
         self.assertEqual(len(rounds), 9)
 
+    def test_duplicate_call_not_reexecuted(self):
+        # vòng 2 gọi lại đúng (tool, args) của vòng 1 → outcome=duplicate,
+        # KHÔNG gọi _dispatch lần nữa (bộ chống lặp lại của run loop).
+        # nuclei thiếu binary (mock which=None) → outcome=error, được cache;
+        # lần gọi sau y hệt chỉ trả duplicate.
+        script = [
+            {"content": "", "tool_calls": [
+                {"name": "nuclei_scan",
+                 "arguments": {"url": "https://abc.vn/", "severity": "medium"}}]},
+            {"content": "", "tool_calls": [
+                {"name": "nuclei_scan",
+                 "arguments": {"url": "https://abc.vn/", "severity": "medium"}}]},
+            {"content": FINAL_JSON, "tool_calls": []},
+        ]
+        a = self._agent(script=script)
+        real = a._dispatch
+        n = {"v": 0}
+
+        def spy(name, args):
+            n["v"] += 1
+            return real(name, args)
+
+        a._dispatch = spy
+        with patch("tools.shutil.which", return_value=None):
+            res = a.run("test")
+        self.assertEqual(n["v"], 1)  # chỉ thực thi 1 lần thật
+        self.assertEqual(a.transcript[0]["calls"][0]["outcome"], "error")
+        r2 = a.transcript[1]["calls"][0]
+        self.assertEqual(r2["outcome"], "duplicate")
+        self.assertIn("KHÔNG thực thi lại", r2["output"])
+        self.assertEqual(res["calls"], 2)
+
+    def test_blocked_after_3_failures(self):
+        # nuclei thiếu binary (mock which=None) — mỗi vòng tham số KHÁC NHAU nên
+        # không bị dedup → fail 3 lần, vòng 4 outcome=blocked (gate cứng) và
+        # không gọi _dispatch thêm; model không thể retry vô hạn 1 tool hỏng.
+        script = [
+            {"content": "", "tool_calls": [
+                {"name": "nuclei_scan",
+                 "arguments": {"url": "https://abc.vn/", "severity": f"low{i}"}}]}
+            for i in range(1, 5)
+        ] + [{"content": FINAL_JSON, "tool_calls": []}]
+        a = self._agent(script=script)
+        real = a._dispatch
+        n = {"v": 0}
+
+        def spy(name, args):
+            n["v"] += 1
+            return real(name, args)
+
+        a._dispatch = spy
+        with patch("tools.shutil.which", return_value=None):
+            res = a.run("test")
+        self.assertEqual(n["v"], 3)  # 3 lần fail thật, lần 4 bị chặn trước dispatch
+        outcomes = [t["calls"][0]["outcome"] for t in a.transcript if t["type"] == "tools"]
+        self.assertEqual(outcomes[:3], ["error", "error", "error"])
+        self.assertEqual(outcomes[3], "blocked")
+        self.assertIn("bị chặn tạm thời", a.transcript[3]["calls"][0]["output"])
+        self.assertEqual(res["calls"], 4)
+        self.assertEqual(a._fail_counts["nuclei_scan"], 3)
+
 
 class TestScopePrompt(unittest.TestCase):
     """Prompt interactive: từng mục nhập riêng, để trống = bỏ qua, không ép nhập cả 2."""
