@@ -168,7 +168,7 @@ python3 agent.py --non-interactive                # run automatically
 | `WEBX_MODEL` | `qwen2.5:7b` | Ollama model (suggestion: `huihui_ai/qwen3.5-abliterated:9b`) |
 | `WEBX_THINK` | `0` | `1`=enable thinking mode (not recommended together with function calling) |
 | `WEBX_AUTO_EXEC` | `ask` | `ask`=prompt operator before noisy/active tools; `safe`=auto-run only safe tools; `all`=auto-run everything (risky) |
-| `WEBX_MAX_ROUNDS` | `12` | Max tool-call rounds per turn |
+| `WEBX_MAX_ROUNDS` | `8` | Max tool-call rounds per turn (lower = faster/cheaper; a 9B model on a 4 vCPU box can take 20–30 min per round) |
 | `WEBX_TOOL_TIMEOUT` | `90` | Per-tool timeout (seconds) |
 | `WEBX_LLM_TIMEOUT` | `300` | Max time waiting for a model reply per round (seconds); a 9B model on CPU can take 1–3 minutes |
 | `WEBX_STREAM` | `1` | `1`=stream NDJSON from Ollama: live reasoning + content + per-round elapsed time; `0`=off (wait for the full response, no live display) |
@@ -200,7 +200,7 @@ While the model is working, AIXSEC-X shows live output so you are never staring
 at a blank screen:
 
 ```
-[*] Round 1/12 — model processing...
+[*] Round 1/8 — model processing...
   ✦ think: Analyze endpoint /login, try SQLi on param id...   (dim — reasoning)
   ▸ Exploiting...                                                       (green — content)
   └ model finished in 42.3s
@@ -210,11 +210,28 @@ at a blank screen:
 
 - `✦ think:` = the model's reasoning (if the model has thinking, e.g.
   `huihui_ai/qwen3.5-abliterated:9b` + `WEBX_THINK=1`).
-- `▸` = content the model is generating right now.
+- `▸` = content the model is generating right now. Tokens are **buffered and
+  wrapped** into terminal-width lines (continuation lines use `↳`) instead of
+  one line per token, so a long final JSON report no longer floods the screen
+  (~700 lines became <50); content display caps at 200 lines per round.
 - Every tool call is printed before it runs `[→]` and its result with elapsed
   time `[✔/✗]`.
 - Disable with `WEBX_STREAM=0`; if function calling misbehaves while streaming,
   try disabling it, or disabling `WEBX_THINK`.
+
+### Wordlist names for `ffuf_dir` (no more path errors)
+
+`ffuf_dir` auto-resolves short/fuzzy wordlist names to real files, so a wrong
+parameter no longer burns a 120s tool timeout:
+
+- **Aliases:** `common`, `big`, `top500`, `raft`, `raft-medium`, `raft-small`,
+  `raft-large`, `dirbuster` / `dirbuster-small|medium|big`, `combined`.
+- **Bare names / SecLists paths:** `common.txt`, `big.txt`, `SecLists/common-words.txt`,
+  `raft-medium-directories/2.3medium.txt` … are searched under
+  `/usr/share/seclists/Discovery/Web-Content` (+ `ffuf`/`dirb` wordlist dirs).
+- If nothing matches, the tool returns a **friendly error listing valid
+  directories and aliases** — the model can fix the call on the next round
+  instead of guessing blindly. (Requires `seclists`/`ffuf` packages, optional.)
 
 ### Anti-loop protection (no repeated tool calls)
 
@@ -287,7 +304,7 @@ aixsec-x> q                                         → quit
 | subdomain_enum (subfinder) | recon | safe | |
 | param_discovery (arjun) | recon | noisy | |
 | nuclei_scan | active | active | `-severity`, `-tags` |
-| ffuf_dir | active | active | SecLists common.txt |
+| ffuf_dir | active | active | wordlist auto-resolved (alias `common`/`big`/`raft-medium`/`dirbuster-*`… → SecLists path) |
 | sqlmap_check | active | active | `--batch --smart --current-user --banner` |
 | sqli_manual_test | active | active | time-based SLEEP(3) control/delay |
 | sqli_blind_extract | active | active | **Blind SQLi WITHOUT sqlmap** (pure Python): detect + extract data, supports `?id=1` queries AND `/search/123.html` paths |
@@ -348,6 +365,11 @@ better than long prompts. `prompts.py` ships 2 variants with auto-selection:
   sqlmap fails**, final JSON per schema with `cves` defaulting to `[]`).
 - `SYSTEM_PROMPT_FULL` — the original detailed prompt (`SYSTEM_PROMPT` alias kept
   for compatibility).
+- **v1.4 evidence rules (both variants):** every finding must be backed by real
+  tool output from this session. A host only seen in `http_probe` (status/title)
+  is reported as **reachable/status only** — the model must not invent headers,
+  CSP, ports, WAF or tech stacks it never observed. Subdomain findings require an
+  actual (in-scope) tool run. Cap: max 6 findings per report.
 - `build_system_prompt(cfg)` — `WEBX_PROMPT_STYLE=auto` (default): model name
   containing `14b/32b/70b/72b/122b` → `full`, otherwise → `compact`. Manual
   override: `export WEBX_PROMPT_STYLE=compact|full`.

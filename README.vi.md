@@ -170,7 +170,7 @@ Chế độ `--non-interactive`/`--oneshot` chỉ đọc env (không hỏi) — 
 | `WEBX_MODEL` | `qwen2.5:7b` | Model Ollama (gợi ý: `huihui_ai/qwen3.5-abliterated:9b`) |
 | `WEBX_THINK` | `0` | `1`=bật thinking mode (không khuyến nghị khi dùng function calling) |
 | `WEBX_AUTO_EXEC` | `ask` | `ask`=hỏi operator với tool noisy/active; `safe`=chỉ tự chạy tool an toàn; `all`=tự chạy hết (rủi ro) |
-| `WEBX_MAX_ROUNDS` | `12` | Số vòng tool-call tối đa mỗi lượt |
+| `WEBX_MAX_ROUNDS` | `8` | Số vòng tool-call tối đa mỗi lượt (thấp hơn = nhanh/rẻ hơn; model 9B trên máy 4 vCPU có thể mất 20–30 phút/vòng) |
 | `WEBX_TOOL_TIMEOUT` | `90` | Timeout mỗi tool (giây) |
 | `WEBX_LLM_TIMEOUT` | `300` | Timeout tối đa chờ model trả lời mỗi lượt (giây); model 9B trên CPU có thể mất 1–3 phút |
 | `WEBX_STREAM` | `1` | `1`=stream NDJSON từ Ollama, agent hiển thị live reasoning + nội dung đang sinh + thời gian mỗi lượt; `0`=tắt (chờ response đầy đủ, không có hiển thị live) |
@@ -202,7 +202,7 @@ Khi model đang xử lý, AIXSEC-X hiển thị ngay trên màn hình để bạ
 chờ mù:
 
 ```
-[*] Round 1/12 — model processing...
+[*] Round 1/8 — model processing...
   ✦ think: Phân tích endpoint /login, thử SQLi ở param id...   (dim — reasoning)
   ▸ Khai thác...                                                       (xanh — nội dung)
   └ model finished in 42.3s
@@ -211,9 +211,25 @@ chờ mù:
 ```
 
 - `✦ think:` = reasoning của model (nếu model có thinking, vd `huihui_ai/qwen3.5-abliterated:9b` + `WEBX_THINK=1`).
-- `▸` = nội dung model đang sinh ra.
+- `▸` = nội dung model đang sinh ra. Token được **buffer và wrap** theo độ rộng
+  terminal (dòng nối `↳`) thay vì in 1 token/dòng — nên report JSON dài cuối
+  phiên không còn làm ngập màn hình (~700 dòng → <50 dòng); giới hạn cứng 200
+  dòng nội dung mỗi lượt.
 - Mỗi lệnh tool được in trước khi chạy `[→]` và kết quả kèm thời gian thực thi `[✔/✗]`.
 - Tắt bằng `WEBX_STREAM=0`; nếu thấy function-calling bị lỗi khi stream, thử tắt hoặc tắt `WEBX_THINK`.
+
+### Tên wordlist cho `ffuf_dir` (hết lỗi đường dẫn)
+
+`ffuf_dir` tự phân giải tên wordlist ngắn/mơ hồ thành file thật, nên tham số sai
+không còn đốt timeout 120s:
+
+- **Alias:** `common`, `big`, `top500`, `raft`, `raft-medium`, `raft-small`,
+  `raft-large`, `dirbuster` / `dirbuster-small|medium|big`, `combined`.
+- **Tên trần / đường dẫn SecLists:** `common.txt`, `big.txt`, `SecLists/common-words.txt`,
+  `raft-medium-directories/2.3medium.txt` … được tìm trong
+  `/usr/share/seclists/Discovery/Web-Content` (+ thư mục wordlist của `ffuf`/`dirb`).
+- Không khớp gì → tool trả **lỗi thân thiện liệt kê thư mục/alias hợp lệ** để
+  model sửa lại lệnh ở lượt sau thay vì đoán mò. (Cần gói `seclists`/`ffuf`, tùy chọn.)
 
 ### Bộ chống lặp lại tool-call
 
@@ -328,6 +344,11 @@ Model 7B/9B (vd: `huihui_ai/qwen3.5-abliterated:9b`) tuân theo **ít quy tắc*
 
 - `SYSTEM_PROMPT_COMPACT` — 7 luật ngắn, câu mệnh lệnh trực tiếp (function calling, scope, `<untrusted tool output>`, không bịa CVE, thứ tự recon→active, **5b: SQLi fallback → sqli_blind_extract → generate_poc → poc_executor khi sqlmap fail**, JSON cuối đúng schema với `cves` mặc định `[]`).
 - `SYSTEM_PROMPT_FULL` — prompt gốc chi tiết (giữ alias `SYSTEM_PROMPT` cho tương thích).
+- **Luật bằng chứng v1.4 (cả 2 variant):** mọi finding phải có tool output thật
+  trong phiên này. Host mới chỉ thấy ở `http_probe` (status/title) chỉ được
+  báo **reachable/status** — model KHÔNG được bịa headers, CSP, port, WAF hay
+  tech stack chưa hề quan sát. Finding về subdomain phải kèm tool run thật
+  (trong scope). Giới hạn: tối đa 6 findings/report.
 - `build_system_prompt(cfg)` — `WEBX_PROMPT_STYLE=auto` (mặc định): tên model chứa `14b/32b/70b/72b/122b` → `full`, còn lại → `compact`. Ghi đè thủ công: `export WEBX_PROMPT_STYLE=compact|full`.
 
 ```bash

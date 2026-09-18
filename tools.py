@@ -144,13 +144,121 @@ def _nuclei_scan(**kw):
     return run_cmd(args, kw["_timeout"])
 
 
+# ── v1.4: wordlist resolver ──
+# Model nhỏ (9B) hay truyền tên ngắn gọn: "common", "common.txt",
+# "SecLists/common-words.txt", "top500", "raft-medium"... thay vì đường dẫn đầy
+# đủ. Resolver này map alias/basename → đường dẫn tuyệt đối trong SecLists.
+SECLISTS_WEB = "/usr/share/seclists/Discovery/Web-Content"
+
+# alias của wordlist directory-fuzz phổ biến → tên file TRONG Seclists
+# (không trỏ ra ngoài: top500/lowercase… vốn là wordlist dirsearch, không nằm
+# trong gói seclists — fallback về common.txt cho nhỏ/gọn)
+_WL_ALIASES = {
+    "common": "common.txt",
+    "common.txt": "common.txt",
+    "seclists/common-words.txt": "common.txt",
+    "common-words.txt": "common.txt",
+    "top500": "common.txt",
+    "top500.txt": "common.txt",
+    "raft": "raft-medium-directories.txt",
+    "raft-medium": "raft-medium-directories.txt",
+    "raft-medium-words": "raft-medium-words.txt",
+    "raft-small": "raft-small-directories.txt",
+    "raft-small-words": "raft-small-words.txt",
+    "raft-large": "raft-large-directories.txt",
+    "directory-list": "DirBuster-2007_directory-list-2.3-medium.txt",
+    "dirbuster": "DirBuster-2007_directory-list-2.3-medium.txt",
+    "dirbuster-medium": "DirBuster-2007_directory-list-2.3-medium.txt",
+    "dirbuster-big": "DirBuster-2007_directory-list-2.3-big.txt",
+    "dirbuster-small": "DirBuster-2007_directory-list-2.3-small.txt",
+    "big": "big.txt",
+    "big.txt": "big.txt",
+    "combined": "combined_words.txt",
+}
+
+_WL_EXTRA_DIRS = [SECLISTS_WEB, SECLISTS_WEB + "/raft-medium-directories",
+                  SECLISTS_WEB + "/raft-small-directories",
+                  SECLISTS_WEB + "/CMS", SECLISTS_WEB + "/Web-Servers",
+                  "/usr/share/wordlists/ffuf",  # wordlist riêng của ffuf
+                  "/usr/share/wordlists/dirb",
+                  "/usr/share/wordlists",
+                  "/usr/share/dirb/wordlists"]
+
+
+# fmt: off
+def resolve_wordlist(wl: str = "", base_dir: str = SECLISTS_WEB) -> str:
+    """Map chuỗi wordlist (alias/basename/đường dẫn) → file tồn tại.
+
+    Thứ tự: đường dẫn tuyệt đối (tồn tại) → alias (common→common.txt) →
+    basename tìm trong base_dir/thư mục con → tìm theo đuôi đường dẫn
+    ("SecLists/common-words.txt" → common.txt).
+    Không tìm thấy → raise ValueError kèm gợi ý thư mục (để model sửa ngay,
+    không đốt 120s rồi mới error làm hỏng URL-gate như v1.3).
+    """
+    if not wl:
+        wl = "common.txt"
+    wl = wl.strip()
+    if os.path.isabs(wl):
+        if os.path.exists(wl):
+            return wl
+        raise ValueError(f"Wordlist không tồn tại: {wl}")
+    if wl in _WL_ALIASES:
+        cand = os.path.join(base_dir, _WL_ALIASES[wl])
+        if os.path.exists(cand):
+            return cand
+    elif "\\" in wl or wl.lower() in _WL_ALIASES:
+        # tên có dạng "Seclists/common-words.txt" (sai hoa/thường) — so khớp thường hóa
+        norm = wl.replace("\\", "/").lower()
+        for k, v in _WL_ALIASES.items():
+            if norm == k.replace("\\", "/").lower() or norm.endswith("/" + v):
+                cand = os.path.join(base_dir, v)
+                if os.path.exists(cand):
+                    return cand
+    # basename trực tiếp trong base_dir
+    cand = os.path.join(base_dir, wl)
+    if os.path.exists(cand) and os.path.isfile(cand):
+        return cand
+    # tìm đệ quy theo basename trong các thư mục con phổ biến
+    for d in _WL_EXTRA_DIRS:
+        if not os.path.isdir(d):
+            continue
+        p = os.path.join(d, wl)
+        if os.path.exists(p) and os.path.isfile(p):
+            return p
+        for root, _, files in os.walk(d):
+            if wl.lower() in (f.lower() for f in files):
+                return os.path.join(root, wl)
+    # model hay truyền đường dẫn thiếu phần đầu (vd "SecLists/common-words.txt",
+    # "raft-medium-directories/2.3medium.txt") — so trùng basename cuối cùng
+    tail = wl.rstrip("./").replace("\\", "/")
+    for part in reversed(tail.split("/")):
+        if not part:
+            continue
+        for root, dirs, files in os.walk(SECLISTS_WEB):
+            dirs[:] = [d for d in dirs if not d.startswith(".")]
+            if part.lower() in (f.lower() for f in files):
+                return os.path.join(root, part)
+        break  # chỉ thử basename cuối, không lan sang segment giữa
+    raise ValueError(
+        f"Wordlist '{wl}' không tìm thấy. Đường dẫn hợp lệ nằm trong: "
+        f"\n  - {base_dir}/ "
+        f"\n  - {SECLISTS_WEB}/raft-medium-directories/ ..."
+        f"\nAlias hỗ trợ: common, big, top500, raft, raft-medium, "
+        f"dirbuster-*, directory-list-2.3-*"
+        f"\nVí dụ đúng: wordlist='common.txt' hoặc "
+        f"'raft-medium-directories/2.3medium.txt' hoặc "
+        f"đường dẫn tuyệt đối tùy ý")
+# fmt: on
+
+
 def _ffuf_dir(**kw):
     _need("ffuf")
-    wl = kw.get("wordlist", "/usr/share/seclists/Discovery/Web-Content/common.txt")
-    if not os.path.exists(wl):
-        # raise (→ outcome=error, bị đếm vào fail-count/URL-block) thay vì trả
-        # chuỗi lỗi với outcome=ok — nếu không agent cứ gọi lại wordlist hỏng
-        raise ValueError(f"[!] Wordlist không tồn tại: {wl}")
+    try:
+        wl = resolve_wordlist(kw.get("wordlist", ""))
+    except ValueError as e:
+        # lỗi rõ ràng kèm gợi ý — outcome=error nhưng model biết phải sửa gì;
+        # tránh URL-gate nuốt hết ffuf_dir chỉ vì đường dẫn sai
+        raise ValueError(str(e))
     args = ["ffuf", "-u", kw["url"].rstrip("/") + "/FUZZ",
             "-w", wl, "-mc", "200,204,301,302,307,401,403", "-t", "30",
             "-timeout", "10", "-s"]
