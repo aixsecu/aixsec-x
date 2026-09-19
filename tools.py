@@ -319,7 +319,8 @@ def _ffuf_dir(**kw):
         raise ValueError(str(e))
     args = ["ffuf", "-u", kw["url"].rstrip("/") + "/FUZZ",
             "-w", wl, "-mc", "200,204,301,302,307,401,403", "-t", "30",
-            "-timeout", "10", "-s"]
+            "-timeout", "10", "-maxtime", str(int(kw.get("maxtime") or 90)),
+            "-s"]
     if kw.get("extensions"):
         args += ["-e", kw["extensions"]]
     return run_cmd(args, kw["_timeout"])
@@ -566,6 +567,14 @@ def _sqli_manual_test(**kw):
     if verdict == "CONFIRMED":
         lines.append(f"[✓] SQLI CONFIRMED — {method_used} tại param '{param}' "
                      f"({method.upper()} {url})")
+        # v1.4.5: next-step block — CONFIRMED chỉ mới bắt đầu, phải escalate
+        lines.append(
+            "[→] BƯỚC TIẾP THEO: (1) sqli_blind_extract {url, action:'version' hoặc "
+            + (f"'database', engine:'mssql', method:'{method}', param:'{param}', "
+               f"data:'{param}={seed}'" if method == "post" else "engine:'mssql' "
+               "(time-based nếu oracle không ăn)")
+            + "} để trích xuất @@VERSION/DB_NAME()/tables/dump; "
+              "(2) generate_poc → poc_executor với poc_path để chạy POC khai thác.")
     else:
         lines.append(f"[-] SQLI NOT_CONFIRMED — quote-differential âm tính"
                      + (f" và time-based {engine} không tạo phản hồi chậm" if time_rows else "")
@@ -580,6 +589,10 @@ def _sqli_blind_extract(**kw):
 
     Wrap TimeBlindExploiter (sqli_blind_poc.py). Dùng khi sqlmap fail, ví dụ
     path-injection /search/123.html. Extraction rất chậm (mỗi ký tự ~13 probe).
+    v1.4.5: hỗ trợ POST form — truyền method='post' + param + data='kw=...' để
+    detect/extract trên form tìm kiếm (vd /WebTinTuc/TimKiem keyword).
+    v1.4.5: engine=mssql → ưu tiên error-based oracle (CONVERT(int,...) đọc từ
+    lỗi 500) trước time-based; đọc @@VERSION/DB_NAME()/SUSER_SNAME()/tables/dump.
     """
     action = kw.get("action", "detect")
     try:
@@ -599,6 +612,9 @@ def _sqli_blind_extract(**kw):
         threshold=float(kw.get("threshold", 2.5)),
         timeout=int(kw.get("timeout") or 15),
         engine=str(kw.get("engine") or "mysql"),
+        method=str(kw.get("method") or "get"),
+        param=kw.get("param") or None,
+        data=kw.get("data") or None,
     )
     try:
         res = ex.report(action,
@@ -1093,8 +1109,11 @@ TOOL_REGISTRY: list[ToolSpec] = [
               "required": ["url", "param"]}, _sqli_manual_test, risk="active"),
     ToolSpec("sqli_blind_extract",
              "SQLi time-based blind KHÔNG sqlmap: detect & extract dữ liệu bằng Python thuần "
-             "(requests + timing + binary search). Hỗ trợ query (?id=1) VÀ path injection "
-             "(/search/123.html). Dùng KHI sqlmap fail hoặc không bắt được path-injection. "
+             "(requests + timing + binary search). Hỗ trợ query (?id=1), path injection "
+             "(/search/123.html) VÀ POST form (method='post' + param + data='keyword=...'). "
+             "Dùng KHI sqlmap fail hoặc không bắt được path/POST-injection. "
+             "engine=mssql → error-based oracle (đọc giá trị từ lỗi 500 conversion) "
+             "ưu tiên trước time-based. "
              "action=detect|version|database|user|tables|dump (tables cần --db-name tùy chọn; "
              "dump cần table + columns). Extraction chậm (~10 request/ký tự) — delay nhỏ cho "
              "nhanh, lớn cho chắc chắn.",
@@ -1116,7 +1135,13 @@ TOOL_REGISTRY: list[ToolSpec] = [
                   "max_len": {"type": "integer", "minimum": 1, "maximum": 500,
                                "description": "Độ dài tối đa của mỗi giá trị trích xuất"},
                   "engine": {"type": "string", "enum": ["mysql", "mssql"],
-                              "description": "DB engine cho time-based payload: mysql (SLEEP, mặc định) hoặc mssql (WAITFOR DELAY)"}},
+                              "description": "DB engine: mysql (SLEEP, mặc định) hoặc mssql (error-based oracle ưu tiên + WAITFOR DELAY)"},
+                  "method": {"type": "string", "enum": ["get", "post"],
+                              "description": "get (mặc định) hoặc post (form — cần param + data)"},
+                  "param": {"type": "string",
+                            "description": "Tham số/field cần inject (mặc định tự tìm; POST bắt buộc truyền, vd 'keyword')"},
+                  "data": {"type": "string",
+                           "description": "Form data khi method=post, vd 'keyword=tin+tuc'"}},
               "required": ["url"]},
              _sqli_blind_extract, risk="active"),
     ToolSpec("generate_poc",

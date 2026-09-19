@@ -295,8 +295,8 @@ aixsec-x> q                                       → thoát
 | nuclei_scan | active | active | `-severity`, `-tags` |
 | ffuf_dir | active | active | SecLists common.txt |
 | sqlmap_check | active | active | `--batch --smart --current-user --banner` |
-| sqli_manual_test | active | active | **v1.4.4 v2:** quote-differential (`test'`/`test''`) trước — xác nhận chèn KHÔNG cần engine/SLEEP; fallback time-based SLEEP/WAITFOR DELAY theo `engine=mysql\|mssql\|auto` (auto đoán từ headers: ASP.NET/IIS → mssql, PHP → mysql) |
-| sqli_blind_extract | active | active | **SQLi blind KHÔNG sqlmap** (Python thuần): detect + extract dữ liệu, hỗ trợ query `?id=1` VÀ path `/search/123.html`; **v1.4.4:** `engine=mysql\|mssql` (mssql = `'; IF (..) WAITFOR DELAY '0:0:n'-- -`, version/user qua `DB_NAME()`/`SUSER_SNAME()`; tables/dump mssql chưa hỗ trợ → `sqlmap --dbms=mssql`) |
+| sqli_manual_test | active | active | **v1.4.4 v2:** quote-differential (`test'`/`test''`) trước — xác nhận chèn KHÔNG cần engine/SLEEP; fallback time-based SLEEP/WAITFOR DELAY theo `engine=mysql\|mssql\|auto` (auto đoán từ headers: ASP.NET/IIS → mssql, PHP → mysql). **v1.4.5:** khi CONFIRMED tự in khối `[→] BƯỚC TIẾP THEO` (sqli_blind_extract → generate_poc → poc_executor) — model không dừng ở verdict |
+| sqli_blind_extract | active | active | **SQLi blind KHÔNG sqlmap** (Python thuần): detect + extract dữ liệu, hỗ trợ query `?id=1` VÀ path `/search/123.html`; **v1.4.4:** `engine=mysql\|mssql` (mssql = `'; IF (..) WAITFOR DELAY '0:0:n'-- -`, version/user qua `DB_NAME()`/`SUSER_SNAME()`; tables/dump mssql chưa hỗ trợ → `sqlmap --dbms=mssql`). **v1.4.5:** khai thác FORM POST qua `method`/`param`/`data` (body form-encoded, mode=form) + oracle ERROR-BASED MSSQL (0 giây: `' AND CONVERT(int,(SELECT @@VERSION))-- -` → lỗi conversion lộ @@VERSION/DB_NAME()/SUSER_SNAME()) ưu tiên TRƯỚC time-based; oracle không ăn mới fallback WAITFOR DELAY |
 | generate_poc | sqli | safe | **Tự SINH POC Python** khai thác SQLi time-based blind (KHÔNG sqlmap): trả `poc_path` (/tmp/aixsec-x_poc_*.py) + snippet 25 dòng — code ~7KB vượt context cap nên không trả inline |
 | poc_executor | sqli | active | **Chạy POC** do generate_poc sinh (chỉ chấp nhận file `aixsec-x_poc_*.py` trong tempdir — chống arbitrary file exec); hoặc `poc_code` nếu code ngắn |
 | nikto_scan | active | noisy | **v1.4.4:** `-maxtime` = timeout−10 (sàn 30) tự kết thúc đúng hạn; cap 180 s |
@@ -305,8 +305,11 @@ aixsec-x> q                                       → thoát
 (`/search/123.html`) hoặc chữ ký tham số lạ — tool này tự detect quote/comment style
 bằng timing, rồi trích xuất dữ liệu bằng binary search `ASCII(SUBSTRING(...))`
 (không cần sqlmap, chỉ cần `requests`). `action=detect|version|database|user|tables|dump`;
-`engine=mysql|mssql` (mssql = probe WAITFOR DELAY); extraction chậm
-(~10 request/ký tự) nên để `delay` vừa phải.
+`engine=mysql|mssql` (mssql **v1.4.5** = oracle error-based trước:
+`' AND CONVERT(int,(SELECT ...))-- -` làm giá trị lộ ra trong lỗi conversion
+500 — 0 giây chờ; không ăn mới fallback WAITFOR DELAY). Form tìm kiếm POST:
+truyền `method:'post', param:'keyword', data:'keyword=tin tuc'` (mode=form).
+Extraction chậm (~10 request/ký tự) nên để `delay` vừa phải.
 
 ### SQLi fallback — khi sqlmap_check thất bại
 
@@ -382,6 +385,34 @@ Model 7B/9B (vd: `huihui_ai/qwen3.5-abliterated:9b`) tuân theo **ít quy tắc*
   với `break_long_words=True` làm tách `**ffuf_dir**` thành `**ff` + `uf_dir**`.
   Giờ dùng `break_long_words=False, break_on_hyphens=False` — từ dài nhảy
   trọn sang dòng tiếp theo.
+- **v1.4.5 — `sqli_blind_extract` form POST (method/param/data):** case live-run
+  tbu.edu.vn là FORM tìm kiếm — gọi
+  `sqli_blind_extract{url, action, engine:'mssql', method:'post', param:'keyword',
+  data:'keyword=tin tuc'}`: tool định vị form từ `data`, inject probe vào param
+  đó, detect bằng quote/comment style (mode=form) và báo
+  `[✓] SQLi CONFIRMED — form@keyword`. Query kiểu GET (`?id=1`) giữ nguyên.
+- **v1.4.5 — Oracle error-based MSSQL (0 giây chờ, nhanh hơn time-based):**
+  với inject không phải kiểu path, `detect()` bắn oracle error TRƯỚC:
+  `' AND CONVERT(int,(SELECT @@VERSION))-- -` → message 500 "converting the
+  char value '<giá trị lộ>' to data type int" làm lộ giá trị biểu thức
+  (`technique=error-based-mssql`). `@@VERSION`, `DB_NAME()`, `SUSER_SNAME()`
+  rút từng ký tự bằng greedy parse — KHÔNG cần vòng chờ delay. Chỉ khi oracle
+  im lặng mới fallback time-based `WAITFOR DELAY`, nên lượt chạy trước kia tốn
+  N×3s ngủ giờ xong trong ~0s.
+- **v1.4.5 — Khối `[→] BƯỚC TIẾP THEO` trong `sqli_manual_test`:** sau
+  `[✓] SQLI CONFIRMED` tool in khối hướng dẫn escalate
+  (1) `sqli_blind_extract` (action version/database, engine mssql, cùng
+  method/param/data; nhánh GET gợi ý fallback time-based) rồi
+  (2) `generate_poc` → `poc_executor`. Model 9B không còn "dừng ở verdict"
+  — CONFIRMED mới là ĐIỂM BẮT ĐẦU của trích xuất.
+- **v1.4.5 — Guard path-claim sai host trong ledger:** path token của finding
+  (`/admincp`, `/WebTinTuc/TimKiem`) PHẢI xuất hiện trong tool output OK CỦA
+  CÙNG host (`_PATH_TOKENS` regex, strip scheme URL trước, min 3 ký tự). Path
+  chỉ thấy trên host khác (hoặc không đâu) → `⚠ path không có bằng chứng trên
+  host này`. Sửa đúng bệnh live-run: AI báo `https://tbu.edu.vn/admincp` trong
+  khi không tool nào thấy `/admincp` trên tbu.edu.vn. Probe set mở rộng thêm
+  `find_forms`/`sqli_manual_test`/`sqli_blind_extract` để output recon thật
+  được tính là bằng chứng probe.
 - **v1.4.4 — `find_forms` (form là chỗ SQLi dễ sót #1):** nikto/nuclei/
   http_probe không bao giờ thấy thẻ `<form>`, nên ô tìm kiếm (case kinh điển:
   POST `/WebTinTuc/TimKiem`, input ẩn `keyword`) chưa từng được test.
