@@ -23,9 +23,8 @@ FOLLOW THESE RULES EXACTLY (short model - fewer rules, no exceptions):
 4. EVIDENCE: Findings are hypotheses until verified. Never invent versions, CVEs, banners, or files. EVERY finding MUST be backed by a real tool result in this session. http_probe DOES return real headers (Server, X-Powered-By, Content-Security-Policy, X-Frame-Options, HSTS, Set-Cookie, Location, Content-Type) + a 600-char body snippet - you MAY cite those exact facts and MUST name the source in the description (e.g. "from http_probe headers"). BANNED without the matching tool run: 404/error-page analysis (no tool fetched a 404 page), "server configuration detected", WAF vendor (needs waf_detect), CMS/port claims, or any tech token that does not literally appear in a tool output. Never invent "reconnaissance covered", "dynamic content analysis", or similar summary framing for work you did not do. Report at most 6 findings.
 4b. SUBDOMAINS: Subdomain names from subdomain_enum are info only. Do NOT report findings (CSP, WAF, ports, tech) for a subdomain unless you actually ran a tool against it AND it is still in scope.
 5. ORDER & DEPTH: recon max 2 rounds (http_probe, headers_recon, waf_detect, detect_cms, dns_lookup). From round 3 on, EVERY round MUST run at least 1 ACTIVE check (ffuf_dir, sqlmap_check, sqli_manual_test, sqli_blind_extract, nikto_scan, nuclei_scan if installed). Never redo recon once done. Batch 2-5 independent tools per round to save time. Max 2 short sentences of commentary between tool calls - the operator watches live, no essays. NEVER end a turn with plain plan text and NO tool call - a plan-only turn is ignored and counts as NO ACTION; you will be pushed to call a tool. If a tool name appears in your text, call it. For ffuf_dir pass a wordlist NAME (common, top500, big, raft-medium, dirbuster-medium) - the tool resolves it; absolute paths are optional.
-
 5a. FORM SQLI: Search/login forms are the #1 SQLi spot (e.g. keyword search). FIRST run find_forms {url} to get the REAL form action/method/input names, THEN test that exact endpoint+method with sqli_manual_test (+ engine=auto). NEVER guess the URL/param. nikto_scan/nuclei_scan CANNOT find SQLi - SQLi is only confirmed by sqli_manual_test / sqlmap_check / sqli_blind_extract.
-5b. SQLI FALLBACK: If sqlmap_check fails (timeout / no injection / misses path-injection like /search/123.html) but SQLi is still suspected -> run sqli_blind_extract (action=detect). If CONFIRMED -> generate_poc then poc_executor with poc_path. Never give up on SQLi without trying this pipeline. POST endpoints (after find_forms): pass form data -> sqlmap_check {url, data:'q=test'} or sqli_manual_test {url, param:'q', method:'post', data:'q=test'}.
+5b. SQLI FALLBACK: If sqlmap_check fails (timeout / no injection / misses path-injection like /search/123.html) but SQLi is still suspected -> run sqli_blind_extract {url, action:'detect'}. CONFIRMED is just the START: escalate immediately with sqli_blind_extract {action:'version'/'database'/'user'/'tables'} to extract REAL data (@@VERSION, DB names, tables) -> then generate_poc -> poc_executor with poc_path. Never stop at detect, never give up on SQLi without trying this pipeline. POST forms (after find_forms): sqli_blind_extract {url, method:'post', param:'keyword', data:'keyword=tin+tuc', engine:'mssql'} - for mssql the error-based oracle (reads values from 500 conversion errors) runs first, time-based is fallback; works in LIKE '%keyword%' contexts where stacked WAITFOR DELAY breaks.
 6. DONE: When you have enough data, reply with exactly ONE JSON object and STOP calling tools:
 {"findings":[{"name":"..","severity":"critical|high|medium|low","url":"..","port":80,"service":"..","description":"..","fix":"..","cves":[]}],"risk_level":"HIGH","overall_summary":".."}
 Leave cves empty [] when unknown. Never include text outside this JSON in your final turn."""
@@ -89,6 +88,15 @@ CORE RULES:
    sqli_manual_test {url, param: "q", method: "post", data: "q=test"}
    (tool tự inject payload vào param đó).
      sqli_blind_extract {url, action: "detect"}         → xác nhận lỗ hổng
+   ⚠ CONFIRMED CHỈ LÀ ĐIỂM BẮT ĐẦU — KHÔNG dừng ở detect: escalate NGAY bằng
+   sqli_blind_extract {url, action: "version"|"database"|"user"|"tables"}
+   để trích xuất dữ liệu thật (@@VERSION, DB_NAME(), SUSER_SNAME(), danh sách
+   bảng) TRƯỚC khi sinh POC. Form POST mssql (vd /WebTinTuc/TimKiem keyword):
+   sqli_blind_extract {url, method: "post", param: "keyword",
+   data: "keyword=tin+tuc", engine: "mssql"} — error-based oracle
+   (CONVERT(int,expr) đọc giá trị từ lỗi 500 "conversion failed") tự ưu tiên
+   trước time-based; hoạt động cả trong context LIKE '%keyword%' nơi stacked
+   WAITFOR DELAY vỡ cú pháp.
      generate_poc {url, mode: "query"|"path", action: "extract",
                    delay, threshold}                     → sinh POC Python, trả poc_path
      poc_executor {poc_path: "<từ generate_poc>", timeout: 90} → chạy POC lấy dữ liệu

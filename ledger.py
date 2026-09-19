@@ -115,6 +115,22 @@ _TECH_TOKENS = [
 ]
 
 
+def _PATH_TOKENS(text: str) -> list[str]:
+    """Trích path token (/foo/bar) từ văn bản finding (name/description/service/url).
+    Chỉ token đáng tin: ≥2 ký tự sau slash, có chữ/số, không phải root "/" hay
+    scheme "//". Bỏ token vốn là phần host (bắt đầu bằng domain) — những cái đó
+    đã được guard host "h not in ev" xử lý."""
+    text = re.sub(r"https?://[^\s\"'<>)]+", "", (text or ""))  # bỏ URL → hostname
+    toks: list[str] = []
+    for m in re.finditer(r"/([A-Za-z0-9][A-Za-z0-9_\-.+:]{2,}(?:/[A-Za-z0-9_\-.+:%]+)*)", text):
+        t = m.group(1).rstrip(".").lower()
+        if not t or any(c in t for c in ("://",)):
+            continue
+        if len(t) >= 3 and any(c.isalnum() for c in t):
+            toks.append(t)
+    return toks
+
+
 def _host_evidence(history: list[dict]) -> dict:
     """history: transcript calls [{name, args, outcome, output}].
     Chỉ dùng kết quả outcome=ok có nội dung thật (bỏ duplicate/blocked/error
@@ -170,10 +186,20 @@ def check_findings_evidence(findings: list[Finding], history: list[dict]) -> int
                     gaps.append(f"khai báo công nghệ '{tok}' nhưng token này không xuất hiện "
                                 "trong bất kỳ tool output OK nào của host")
                     break
+            # v1.4.5: guard path-claim sai host — path trong finding (name/description/
+            # url) phải xuất hiện trong tool output OK CỦA CÙNG host, nếu không là
+            # bịa đường dẫn (vd "detect /admincp" khi không tool nào thấy /admincp).
+            path_src = f"{f.name} {f.description} {f.service} {f.url}".lower()
+            for pt in _PATH_TOKENS(path_src):
+                if pt not in text:
+                    gaps.append(f"khai báo path '/{pt}' nhưng không tool output OK nào "
+                                f"của host '{h}' chứa '/{pt}'")
+                    break
             if not (e["tools"] & {"http_probe", "headers_recon", "detect_cms",
                                   "waf_detect", "_ffuf_dir", "ffuf_dir",
                                   "nikto_scan", "nuclei_scan", "param_discovery",
-                                  "subdomain_probe"}):
+                                  "subdomain_probe", "find_forms",
+                                  "sqli_manual_test", "sqli_blind_extract"}):
                 gaps.append("host chỉ mới xuất hiện qua subdomain_enum/dns_lookup — "
                             "chưa probe thật (info-only)")
         f.evidence_gaps = gaps
