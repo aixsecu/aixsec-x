@@ -432,6 +432,22 @@ better than long prompts. `prompts.py` ships 2 variants with auto-selection:
   `break_long_words=True`, splitting `**ffuf_dir**` across a wrap boundary as
   `**ff` / `uf_dir**`. Now `break_long_words=False, break_on_hyphens=False` —
   long words jump to the next line whole.
+- **v1.5.4 — Cleaner banner: no box frame, no black bg, Anonymous mask icon:**
+  the old `│…│` box frame + per-line black background (`_BLACK`) + skull icon
+  are GONE. `_SKULL_ART`/`_BLACK` removed → `_ANON_ART` (Anonymous Guy Fawkes
+  V-mask ASCII, `.o. / .888. / .8"888. / 88bodP'` style, drawn in bold red).
+  `_banner()` rewritten: **no frame, no black background**; mask art +
+  AIXSEC-X logo + title are centered inside a W=66 content block (ANSI codes
+  stripped via `vis()`/`center()` helpers so widths stay correct); a `─`
+  separator line (not a frame); status key-value rows left-aligned with a
+  9-char key column (`[>] model/scope/auto-exec/host/session/modules`); the
+  whole block is indented to terminal center via
+  `shutil.get_terminal_size()` (only when `tw > W+6`); `color=None` → auto
+  TTY detection + `NO_COLOR` honored. Test suite v1.5.4: **189 OK** (+2 —
+  `TestBannerUpdate` rewritten with 9 tests: mask+logo present / no box
+  borders / art centered / color has ANSI red but no `ESC[40m` black bg /
+  plain render has no ANSI / missing tools listed / batch-mode label / plain
+  contains core info / `_banner()` prints runnable).
 - **v1.5.3 — `find_forms` REMOVED + wapiti does it all (the 3 requests):**
   **(1) `find_forms` tool deleted entirely** (registry, `_find_forms` source,
   both prompts, ledger probe-set, tests) — `wapiti_scan`'s web crawler now
