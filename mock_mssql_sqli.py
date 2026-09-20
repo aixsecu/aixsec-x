@@ -1,47 +1,41 @@
 #!/usr/bin/env python3
 """
 aixsec-x — mock_mssql_sqli.py
-Mock MSSQL SQLi server (offline test fixture cho v1.4.6).
+Mock MSSQL SQLi server (offline test fixture cho v1.4.7).
 
 Tái dựng hành vi quan sát được của target ASP.NET/MSSQL thật (tbu.edu.vn
-WebTinTuc/TimKiem): form tìm kiếm LIKE/CONTAINS, câu query gốc nằm trong
+WebTinTuc/TimKiem): form tìm kiếm CONTAINS/LIKE, câu query gốc nằm trong
 stored procedure SP_WEB_GetTinTucForWeb (Entity Framework), lỗi SqlException
-dạng multi-error (3 fragment nối bởi \\n), trang lỗi vàng ASP.NET, WAF chặn
-request theo chữ ký payload (đóng kết nối → status 0 hệt live-run v1.4.5).
+dạng multi-error (3 fragment nối bởi \\n), trang lỗi vàng ASP.NET.
 
-Bảng hành vi (đã chốt từ prior session — xem transcript/summary):
-  kw không có quote            → 200 trang kết quả (query hợp lệ)
-  kw = truong' (quote trần)    → 500 EXACT ground-truth 3 fragment:
-       "Incorrect syntax near '') OR"
-       \\t×14 + " CONTAINS(tt.MoTa, ''."
-       "Unclosed quotation mark after the character string ''))'."
-  kw chứa quote + "--" + shape `') AND CONVERT(int,(expr))-- -`
-                               → 500 "Conversion failed ... value '<value>'"
-                                 (oracle error-based ĂN — v1.4.6 shape 1)
-  shape `')) AND CONVERT...-- -` → 500 conversion (shape 2)
-  shape `' AND ...` / `)' AND ...` / `))' AND ...` (sai thứ tự ngoặc-quote)
-                               → 500 syntax error KHÔNG conversion (oracle silent)
-  kw chứa WAITFOR DELAY '0:0:N'
-                               → sleep min(N,5)s → 200 (time-based signal;
-                                 có IF (cond) thì chỉ sleep khi cond TRUE)
-  --waf mode                   → kw chứa chữ ký attack (CONVERT(, WAITFOR,
-                                 '; IF, UNION, --, ASCII(, ...) → đóng kết nối
-                                 ngay (status 0, ~0.02s) — hệt live-run.
-                                 kw='truong' / 'AND' vẫn qua WAF → 500 thật.
+HÀNH VI v1.4.7 — KHỚP probe LIVE tbu.edu.vn 2026-09-20 (6 requests):
+  MẶC ĐỊNH (không --waf) — quote-parity oracle, KHÔNG còn conversion/
+  WAITFOR/time-based (live: chúng đều vỡ cú pháp trên template thật):
+    số quote CHẴN (0, 2, 4...): 200 trang FIXED byte-identical — payload bị
+        hấp thụ trong string literal ('...'' OR 1=1' không bao giờ thực thi),
+        KHÔNG có boolean row-count oracle; chẵn-quote → 200 hệt control.
+    số quote LẺ:                 500 parse-error leak 3 fragment hệt live:
+        "Incorrect syntax near '<token>'"  (token rút từ kw)
+        \\t×14 + " CONTAINS(tt.MoTa, ''."
+        "Unclosed quotation mark after the character string ''))'."
+  --waf mode (LEGACY v1.4.5/6 — để tái hiện các live-run cũ có status-0
+  resets): request chứa chữ ký attack (CONVERT(, WAITFOR, '; IF, UNION,
+  --, ASCII(, ...) → đóng kết nối ngay (status 0, ~0.02s); conversion
+  oracle `')AND CONVERT(...)` → 500 conversion; WAITFOR DELAY → sleep;
+  quote trần → 500 GT_MSG.
 
 API (giống target):
   GET  /                          → trang chủ + form tìm kiếm
   GET|POST /search                → xử lý keyword (param `keyword`)
   GET|POST /WebTinTuc/TimKiem     → alias như /search
 
-Evaluator SQL mini: @@VERSION, DB_NAME(), SUSER_SNAME(), SUBSTRING, ASCII,
-UNICODE, LEN, STUFF+FOR XML PATH (tables/columns), SELECT TOP 1 CAST +
-ROW_NUMBER (dump), so sánh / AND / OR — đủ để chạy toàn bộ pipeline của
-sqli_blind_poc.py error-based + time-based.
+Cốt lõi là hàm PURE `_decide(kw, waf)` → (status|None, body|None, delay_secs)
+— KHÔNG sleep/IO, unit-test được trực tiếp (xem test_agent.py). Evaluator
+SQL mini giữ nguyên cho chế độ --waf legacy (conversion/time-based).
 
 Chạy:
-  python3 mock_mssql_sqli.py                 # 127.0.0.1:8099 (không WAF)
-  python3 mock_mssql_sqli.py --waf           # bật chế độ WAF reset
+  python3 mock_mssql_sqli.py                 # 127.0.0.1:8099 (mặc định parity)
+  python3 mock_mssql_sqli.py --waf           # legacy: WAF reset + conversion + WAITFOR
   python3 mock_mssql_sqli.py --port 8098
 """
 from __future__ import annotations
@@ -129,6 +123,107 @@ CATALOG_RX = re.compile(r"TABLE_CATALOG=N'([^']*)'", re.I)
 TBLNAME_RX = re.compile(r"TABLE_NAME=N'([^']*)'", re.I)
 
 SQL_ESCAPE = re.compile(r"(?i)^SELECT\s+")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# v1.4.7 — quote-parity oracle (hành vi MẶC ĐỊNH, khớp probe live tbu 2026-09-20)
+# ─────────────────────────────────────────────────────────────────────────────
+def _near_token(kw: str) -> str:
+    """Token cho lỗi 'Incorrect syntax near <tok>': đoạn sau quote đầu tiên cho
+    đến quote kế tiếp (hoặc hết kw), lấy WORD đầu tiên; rỗng → ground-truth
+    '') OR (đúng live: test' → near '') OR)."""
+    i = kw.find("'")
+    if i < 0:
+        return ""
+    rest = kw[i + 1:]
+    j = rest.find("'")
+    seg = (rest[:j] if j >= 0 else rest).strip()
+    if not seg:
+        return "') OR"
+    m = re.match(r"\W*(\w+)", seg)
+    return m.group(1) if m else "') OR"
+
+
+def parse_err_msg(kw: str) -> str:
+    """3-fragment parse-error leak cho quote LẺ (shape hệt ground-truth tbu)."""
+    tok = _near_token(kw)
+    return (
+        f"Incorrect syntax near '{tok}\n"
+        f"{_GT_TABS} CONTAINS(tt.MoTa, ''.\n"
+        "Unclosed quotation mark after the character string ''))'."
+    )
+
+
+def _fixed_page() -> str:
+    """Trang 200 FIXED — KHÔNG nhúng kw → byte-identical cho mọi quote chẵn
+    (đúng quan sát live: 99ZZQ và 99ZZQ'' trả sha giống hệt)."""
+    rows = "\n".join(
+        f"<li><a href='#'>{html.escape(r['TieuDe'])}</a></li>" for r in ROWS["TinTuc"])
+    return f"""<!DOCTYPE html>
+<html lang="vi">
+<head><meta charset="utf-8"><title>Kết quả tìm kiếm</title></head>
+<body>
+<h1>Trường Đại học Thủ đô Hà Nội — Tìm kiếm tin tức</h1>
+<form method="post" action="/WebTinTuc/TimKiem">
+<input type="text" name="keyword" value="">
+<input type="submit" value="Tìm kiếm">
+</form>
+<h2>Có N tin tức chứa: &quot;&quot;</h2>
+<ul>
+{rows}
+</ul>
+<p><small>SP_WEB_GetTinTucForWeb · dữ liệu mẫu (mock)</small></p>
+</body>
+</html>
+"""
+
+
+FIXED_PAGE = _fixed_page()
+
+
+def _decide(kw: str, waf: bool) -> tuple[int | None, str | None, int]:
+    """Quyết định phản hồi mock — PURE (không sleep/IO) để unit-test trực tiếp.
+    Trả (status|None, body|None, delay_secs); status=None → đóng kết nối
+    (client thấy status 0 — hệt WAF reset live).
+
+    waf=False (MẶC ĐỊNH v1.4.7): quote-parity — quote lẻ → 500 parse-leak,
+    quote chẵn → 200 FIXED byte-identical. Không conversion/WAITFOR (chúng
+    vỡ cú pháp trên template thật — probe 2026-09-20: tất cả 500, không
+    oracle dữ liệu nào ăn).
+    waf=True (LEGACY v1.4.5/6): WAF_RX → reset; WAITFOR → sleep có điều kiện;
+    CONVERT(...) → 500 conversion oracle; quote trần → 500 GT_MSG.
+    """
+    if waf:
+        if WAF_RX.search(kw):
+            return None, None, 0
+        m = WAITFOR_RX.search(kw)
+        if m:
+            secs = min(int(m.group(1)), 5)
+            cond = extract_if_cond(kw)
+            if cond is not None:
+                try:
+                    if not _truthy(eval_expr(cond)):
+                        secs = 0
+                except Exception:
+                    secs = 0
+            return 200, search_page(kw, delayed=secs), secs
+        if "'" in kw and "--" in kw:
+            cm = CONVERT_RX.match(kw)
+            if cm:
+                try:
+                    val = eval_expr(cm.group("expr"))
+                    msg = conversion_msg(str(val))
+                except Exception as e:  # eval lỗi → conversion với giá trị lạ
+                    msg = conversion_msg(f"<eval error: {e}>")
+                return 500, aspnet_500(msg), 0
+            return 500, aspnet_500(BROKEN_MSG), 0
+        if "'" in kw:
+            return 500, aspnet_500(GT_MSG), 0
+        return 200, search_page(kw), 0
+    # default v1.4.7: quote-parity — KHÔNG có kênh dữ liệu nào (live xác nhận)
+    if kw.count("'") % 2 == 1:
+        return 500, aspnet_500(parse_err_msg(kw)), 0
+    return 200, FIXED_PAGE, 0
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -503,43 +598,19 @@ class Handler(BaseHTTPRequestHandler):
             pass
         self.connection.close()
 
-    # ── xử lý chính ──
+    # ── xử lý chính (ủy quyền cho _decide — v1.4.7) ──
     def _process(self, kw: str):
         mode = "WAF" if self.server.waf else "no-WAF"
-        if self.server.waf and WAF_RX.search(kw):
+        status, body, delay = _decide(kw, self.server.waf)
+        if status is None:
             self.log_action(mode, kw, "RESET (WAF)")
             return self._RESET
-        m = WAITFOR_RX.search(kw)
-        if m:
-            secs = min(int(m.group(1)), 5)
-            cond = extract_if_cond(kw)
-            if cond is not None:
-                try:
-                    if not _truthy(eval_expr(cond)):
-                        secs = 0
-                except Exception:
-                    secs = 0
-            if secs:
-                time.sleep(secs)
-            self.log_action(mode, kw, f"200 (WAITFOR {secs}s)")
-            return search_page(kw, delayed=secs), 200
-        if "'" in kw and "--" in kw:
-            cm = CONVERT_RX.match(kw)
-            if cm:
-                try:
-                    val = eval_expr(cm.group("expr"))
-                    msg = conversion_msg(str(val))
-                except Exception as e:  # eval lỗi → vẫn conversion nhưng giá trị lạ
-                    msg = conversion_msg(f"<eval error: {e}>")
-                self.log_action(mode, kw, "500 (conversion oracle)")
-                return aspnet_500(msg), 500
-            self.log_action(mode, kw, "500 (syntax, oracle silent)")
-            return aspnet_500(BROKEN_MSG), 500
-        if "'" in kw:
-            self.log_action(mode, kw, "500 (ground-truth bare quote)")
-            return aspnet_500(GT_MSG), 500
-        self.log_action(mode, kw, "200 (normal)")
-        return search_page(kw), 200
+        if delay:
+            time.sleep(delay)  # chỉ chế độ --waf legacy (WAITFOR)
+        kind = {200: "200", 500: "500", None: "reset"}.get(status, str(status))
+        label = " (WAITFOR %ds)" % delay if delay else ""
+        self.log_action(mode, kw, kind + label)
+        return body, status
 
     def log_action(self, mode: str, kw: str, result: str):
         k = kw[:48].replace("\n", "\\n")

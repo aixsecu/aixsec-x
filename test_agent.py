@@ -11,7 +11,8 @@ import tempfile
 import threading
 import time
 import unittest
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import (BaseHTTPRequestHandler, HTTPServer,
+                         ThreadingHTTPServer)
 from unittest.mock import MagicMock, patch
 from urllib.parse import unquote_plus
 
@@ -2096,6 +2097,242 @@ class TestLedgerPathGuard(TestEvidenceGuard):
                     description="Có /admincp trên tbu")
         self.assertEqual(check_findings_evidence([f], history), 1)
         self.assertTrue(any("path" in g and "admincp" in g for g in f.evidence_gaps))
+
+
+class TestSqlmapRunner(unittest.TestCase):
+    """v1.4.7: tool sqlmap_runner BOUNDED — assemble argv kỷ luật (technique
+    dedupe + uppercase, --dbms chỉ khi != auto, --data/--cookie khi có), timeout
+    clamp 30..600, input invalid → outcome=error KHÔNG chạy sqlmap, run_cmd
+    timeout = min(secs clamp, _timeout cap TOOL_TIMEOUTS=300), markers → đầu
+    '[✓]', "no parameter(s) found" → đầu '[-]'."""
+
+    def _dispatch(self, args, tool_timeout=600,
+                  run_out=("back-end DBMS: Microsoft SQL Server 2019\n"
+                            "current database: tbu_news\n")):
+        caught = {}
+
+        def fake_run_cmd(argv, timeout=90, max_chars=5000):
+            caught["argv"] = argv
+            caught["timeout"] = timeout
+            caught["max_chars"] = max_chars
+            return run_out
+
+        with patch("tools._need", return_value=None), \
+             patch("tools.run_cmd", side_effect=fake_run_cmd):
+            a = WebXAgent(config=cfg({"tool_timeout": tool_timeout}),
+                          chat=FakeChat(script=[]))
+            r = a._dispatch("sqlmap_runner", args)
+        return r, caught
+
+    def test_args_assembly_disciplined(self):
+        r, c = self._dispatch({"url": "https://abc.vn/WebTinTuc/TimKiem",
+                               "technique": "tteeSS", "dbms": "mssql",
+                               "data": "keyword=tin tuc", "timeout": 120})
+        self.assertEqual(r["outcome"], "ok")
+        # dedupe + uppercase GIỮ thứ tự: t,t,e,e,S,S → T,E,S
+        self.assertEqual(c["argv"], [
+            "sqlmap", "-u", "https://abc.vn/WebTinTuc/TimKiem",
+            "--batch", "--technique", "TES",
+            "--level", "1", "--risk", "1", "--threads", "1",
+            "--timeout", "15", "--retries", "1", "--flush-session",
+            "--dbms", "mssql", "--data", "keyword=tin tuc"])
+        self.assertEqual(c["max_chars"], 4000)  # output bounded
+
+    def test_dbms_auto_omits_flag(self):
+        r, c = self._dispatch({"url": "https://abc.vn/x.php?id=1",
+                               "dbms": "auto"})
+        self.assertEqual(r["outcome"], "ok")
+        self.assertNotIn("--dbms", c["argv"])
+        i = c["argv"].index("--technique")
+        self.assertEqual(c["argv"][i + 1], "BEUSTQ")  # mặc định full set
+
+    def test_cookie_included(self):
+        r, c = self._dispatch({"url": "https://abc.vn/x.php?id=1",
+                               "cookie": "ASP.NET_SessionId=abc123"})
+        self.assertEqual(r["outcome"], "ok")
+        self.assertIn("--cookie", c["argv"])
+        self.assertEqual(c["argv"][-1], "ASP.NET_SessionId=abc123")
+
+    def test_invalid_technique_no_run(self):
+        with patch("tools._need", return_value=None), \
+             patch("tools.run_cmd") as rc:
+            a = WebXAgent(config=cfg({}), chat=FakeChat(script=[]))
+            r = a._dispatch("sqlmap_runner",
+                            {"url": "https://abc.vn/", "technique": "XYZ"})
+        self.assertEqual(r["outcome"], "error")
+        self.assertIn("technique không hợp lệ", r["output"])
+        rc.assert_not_called()
+
+    def test_invalid_dbms_no_run(self):
+        with patch("tools._need", return_value=None), \
+             patch("tools.run_cmd") as rc:
+            a = WebXAgent(config=cfg({}), chat=FakeChat(script=[]))
+            r = a._dispatch("sqlmap_runner",
+                            {"url": "https://abc.vn/", "dbms": "oracle"})
+        self.assertEqual(r["outcome"], "error")
+        self.assertIn("dbms không hợp lệ", r["output"])
+        rc.assert_not_called()
+
+    def test_timeout_clamp_ranges(self):
+        # 10 → clamp lên 30;  9999 → clamp xuống 600 rồi bị _timeout cap 300 thắng
+        r1, c1 = self._dispatch({"url": "https://abc.vn/", "timeout": 10})
+        self.assertEqual(r1["outcome"], "ok")
+        self.assertEqual(c1["timeout"], 30)
+        r2, c2 = self._dispatch({"url": "https://abc.vn/", "timeout": 9999})
+        self.assertEqual(c2["timeout"], 300)  # min(600, TOOL_TIMEOUTS=300)
+
+    def test_operator_tool_timeout_60_wins(self):
+        # operator cấu hình 60s < cap 300 → run_cmd timeout phải 60
+        r, c = self._dispatch({"url": "https://abc.vn/", "timeout": 9999},
+                              tool_timeout=60)
+        self.assertEqual(r["outcome"], "ok")
+        self.assertEqual(c["timeout"], 60)
+
+    def test_markers_head_ok(self):
+        r, c = self._dispatch(
+            {"url": "https://abc.vn/"},
+            run_out=("is vulnerable\nParameter: keyword (POST)\n"
+                     "back-end DBMS: Microsoft SQL Server 2019\n"
+                     "current database: tbu_news\ncurrent user: sa\n"
+                     "Table: tbu_tintuc"))
+        self.assertEqual(r["outcome"], "ok")
+        self.assertIn("[✓] sqlmap XÁC NHẬN khai thác", r["output"])
+        for m in ("is vulnerable", "Parameter:", "back-end DBMS:",
+                  "current database:", "Table:"):
+            self.assertIn(m, r["output"])
+        self.assertIn("[i] lệnh: sqlmap", r["output"])
+
+    def test_no_parameter_marker(self):
+        r, c = self._dispatch(
+            {"url": "https://abc.vn/"},
+            run_out="[INFO] testing connection...\nno parameter(s) found "
+                    "for testing. Going to fallback to full "
+                    "scan...\n[INFO] finished")
+        # đầu '[-]' chứ không '[!]' → outcome ok (chỉ lỗi THỰC THI mới là error)
+        self.assertEqual(r["outcome"], "ok")
+        self.assertIn("[-] sqlmap không thấy tham số để test", r["output"])
+
+    def test_run_without_markers_head(self):
+        r, c = self._dispatch(
+            {"url": "https://abc.vn/"},
+            run_out="[INFO] heuristics detected web page \n"
+                    "custom injection marker not found")
+        self.assertEqual(r["outcome"], "ok")
+        self.assertIn("[-] sqlmap chạy xong KHÔNG thấy dấu hiệu khai thác",
+                      r["output"])
+
+
+class TestMockParityTable(unittest.TestCase):
+    """v1.4.7: mock_mssql_sqli._decide(kw, waf) PURE — unit-test trực tiếp.
+    Default (waf=False): quote-parity — quote LẺ → 500 parse-leak 3 fragment,
+    quote CHẴN → 200 FIXED byte-identical (payload hấp thụ trong string
+    literal — kể cả 'a\' OR \'1\'=\'1' có 4 quote). waf=True (legacy): WAF_RX
+    kiểm tra ĐẦU TIÊN → reset (None,None,0) — NUỐT cả CONVERT lẫn WAITFOR/IF
+    (nhánh WAITFOR sleep và CONVERT conversion không với tới được); quote trần
+    → 500 GT_MSG; sạch → 200 search_page."""
+
+    def test_odd_quote_500_parse_leak(self):
+        import mock_mssql_sqli as mm
+        st, body, d = mm._decide("test'", False)
+        self.assertEqual((st, d), (500, 0))
+        self.assertIn("Incorrect syntax near '", body)
+        self.assertIn("') OR", body)          # _near_token: không có quote sau → '') OR
+        self.assertIn("CONTAINS(tt.MoTa,", body)
+        self.assertIn("Unclosed quotation mark", body)
+
+    def test_even_quote_fixed_byte_identical(self):
+        import mock_mssql_sqli as mm
+        st1, b1, d1 = mm._decide("99ZZQ'' OR 1=1", False)
+        st2, b2, d2 = mm._decide("99ZZQ", False)
+        self.assertEqual((st1, d1), (200, 0))
+        self.assertEqual(b1, mm.FIXED_PAGE)
+        # 2 quote → CHẴN → 200 FIXED hệt CONTROL (byte-identical, không nhúng kw)
+        self.assertEqual(b1, b2)
+
+    def test_classic_true_payload_absorbed(self):
+        import mock_mssql_sqli as mm
+        st, body, d = mm._decide("a' OR '1'='1", False)
+        # 4 quote → CHẴN → template CONTAINS hấp thụ trong string literal,
+        # KHÔNG có boolean row-count oracle → 200 hệt control (không 500)
+        self.assertEqual((st, d), (200, 0))
+        self.assertEqual(body, mm.FIXED_PAGE)
+
+    def test_waf_attack_signatures_reset(self):
+        import mock_mssql_sqli as mm
+        for kw in ("' AND CONVERT(int,(SELECT @@VERSION))-- -",
+                   "'); WAITFOR DELAY '0:0:2'-- -",
+                   "1 UNION SELECT 1,2-- -",
+                   "x' AND SUBSTRING(@@VERSION,1,1)='1'-- -"):
+            self.assertEqual(mm._decide(kw, True), (None, None, 0))
+        # WAITFOR + IF cũng bị WAF_RX nuốt (WAF_RX kiểm tra TRƯỚC nhánh
+        # WAITFOR_RX) → reset, KHÔNG sleep (nhánh sleep là dead code trong --waf)
+        self.assertEqual(mm._decide("IF (1=1) WAITFOR DELAY '0:0:2'", True),
+                         (None, None, 0))
+
+    def test_waf_legacy_quote_and_clean(self):
+        import mock_mssql_sqli as mm
+        st, body, d = mm._decide("test'", True)   # quote trần, không chữ ký WAF
+        self.assertEqual((st, d), (500, 0))
+        self.assertIn("Incorrect syntax", body)   # GT_MSG ground-truth
+        st2, body2, d2 = mm._decide("tin tuc", True)
+        self.assertEqual((st2, d2), (200, 0))
+        self.assertIn("Kết quả tìm kiếm", body2)  # search_page bình thường
+
+
+class TestOracleSilentOutcome(unittest.TestCase):
+    """v1.4.7: mock quote-parity + known_confirmed + action=extract → outcome=
+    error "Oracle trích xuất im lặng" kèm hướng sqlmap_runner/sqlmap_cmd —
+    KHÔNG outcome=ok với '[+] x:' rỗng (regression v1.4.6). Kênh dữ liệu chết:
+    oracle error-based không ăn trên 500 parse-error, _is_true('1=1') im lặng
+    (payload quote lẻ → 500 nhanh, delta 0) → _has_data_channel() False."""
+    server = None
+
+    @classmethod
+    def setUpClass(cls):
+        from mock_mssql_sqli import Handler
+        # HTTPServer đơn-luồng + Handler protocol HTTP/1.1 keep-alive → handler
+        # chặn trong recv, serve_forever không poll → shutdown() treo vô hạn.
+        # ThreadingHTTPServer (daemon_threads=True) → shutdown() trả ngay, các
+        # handler thread kẹt keep-alive là daemon, không giữ process.
+        cls.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        cls.server.waf = False   # v1.4.7 mặc định: quote-parity, không WAF
+        cls.port = cls.server.server_address[1]
+        cls.thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
+        cls.thread.start()
+
+    @classmethod
+    def tearDownClass(cls):
+        if cls.server:
+            cls.server.shutdown()
+            cls.server.server_close()
+
+    def _agent(self):
+        return WebXAgent(config=cfg({"targets": ["localhost", "http://127.0.0.1"],
+                                     "auto_exec": "all", "tool_timeout": 60}),
+                         chat=FakeChat())
+
+    def _extract(self, action):
+        a = self._agent()
+        return a._dispatch("sqli_blind_extract", {
+            "url": f"http://127.0.0.1:{self.port}/WebTinTuc/TimKiem",
+            "method": "post", "param": "keyword", "data": "keyword=tin tuc",
+            "engine": "mssql", "action": action, "delay": 1,
+            "threshold": 0.7, "known_confirmed": True})
+
+    def test_database_silent_error_with_sqlmap_guidance(self):
+        res = self._extract("database")
+        self.assertEqual(res["outcome"], "error")
+        self.assertIn("Oracle trích xuất im lặng", res["output"])
+        self.assertIn("quote-parity", res["output"])
+        self.assertIn("sqlmap_runner", res["output"])  # hướng tool trực tiếp
+        self.assertIn("--dbms=mssql", res["output"])   # sqlmap_cmd cụ thể
+        self.assertIn("--technique=BEUSTQ", res["output"])
+
+    def test_version_silent_error(self):
+        res = self._extract("version")
+        self.assertEqual(res["outcome"], "error")
+        self.assertIn("im lặng", res["output"])
+        self.assertIn("sqlmap", res["output"])
 
 
 if __name__ == "__main__":

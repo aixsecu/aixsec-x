@@ -295,8 +295,9 @@ aixsec-x> q                                       → thoát
 | nuclei_scan | active | active | `-severity`, `-tags` |
 | ffuf_dir | active | active | SecLists common.txt |
 | sqlmap_check | active | active | `--batch --smart --current-user --banner` |
-| sqli_manual_test | active | active | **v1.4.4 v2:** quote-differential (`test'`/`test''`) trước — xác nhận chèn KHÔNG cần engine/SLEEP; fallback time-based SLEEP/WAITFOR DELAY theo `engine=mysql\|mssql\|auto` (auto đoán từ headers: ASP.NET/IIS → mssql, PHP → mysql). **v1.4.5:** khi CONFIRMED tự in khối `[→] BƯỚC TIẾP THEO` (sqli_blind_extract → generate_poc → poc_executor) — model không dừng ở verdict. **v1.4.6:** khối next-step khâu sẵn `known_confirmed:true` (bỏ qua lưới 9 probe — lỗi đã xác nhận); MỌI probe status-0 → nghi WAF chặn payload → in `sqlmap ... --technique=E --batch` (`--form` nếu POST) |
-| sqli_blind_extract | active | active | **SQLi blind KHÔNG sqlmap** (Python thuần): detect + extract dữ liệu, hỗ trợ query `?id=1` VÀ path `/search/123.html`; **v1.4.4:** `engine=mysql\|mssql` (mssql = `'; IF (..) WAITFOR DELAY '0:0:n'-- -`, version/user qua `DB_NAME()`/`SUSER_SNAME()`; tables/dump mssql chưa hỗ trợ → `sqlmap --dbms=mssql`). **v1.4.5:** khai thác FORM POST qua `method`/`param`/`data` (body form-encoded, mode=form) + oracle ERROR-BASED MSSQL (0 giây: lỗi conversion lộ @@VERSION/DB_NAME()/SUSER_SNAME()) ưu tiên TRƯỚC time-based; oracle không ăn mới fallback WAITFOR DELAY. **v1.4.6:** shape oracle SỬA theo ground-truth — chỉ quote-then-paren `') AND CONVERT(int,(..))-- -` / `')) AND ...` ăn (context LIKE có ngoặc; `' AND CONVERT` trần fail); WAF burst detection — ≥2/3 probe status-0 (kết nối bị reset ~0.02s) → dừng sau ĐÚNG 3 request oracle; `known_confirmed:true` (lỗi đã xác nhận phiên trước → bỏ lưới 9 probe); nghi WAF → hướng dẫn `sqlmap --technique=E` (kèm `--form` khi method=post) |
+| sqlmap_runner | active | active | **v1.4.7:** sqlmap BOUNDED — bước khai thác ĐẦU TIÊN sau SQLi CONFIRMED. argv kỷ luật: `--batch`, `--technique` (dedupe + uppercase), `--dbms` chỉ khi != auto, `--data` cho form POST, `--threads 1 --level 1 --risk 1 --timeout 15 --retries 1 --flush-session`. `timeout` clamp 30–600 s; `run_cmd` timeout = min(clamp, cap TOOL_TIMEOUTS 300). technique/dbms không hợp lệ → `[!]` outcome=error, KHÔNG chạy sqlmap. Marker → `[✓] sqlmap XÁC NHẬN khai thác`; "no parameter(s) found" → `[-]` (outcome ok); không marker → `[-]` không thấy dấu hiệu khai thác. Output giới hạn 4000 ký tự |
+| sqli_manual_test | active | active | **v1.4.4 v2:** quote-differential (`test'`/`test''`) trước — xác nhận chèn KHÔNG cần engine/SLEEP; fallback time-based SLEEP/WAITFOR DELAY theo `engine=mysql\|mssql\|auto` (auto đoán từ headers: ASP.NET/IIS → mssql, PHP → mysql). **v1.4.5:** khi CONFIRMED tự in khối `[→] BƯỚC TIẾP THEO` (sqli_blind_extract → generate_poc → poc_executor) — model không dừng ở verdict. **v1.4.6:** khối next-step khâu sẵn `known_confirmed:true` (bỏ qua lưới 9 probe — lỗi đã xác nhận); MỌI probe status-0 → nghi WAF chặn payload → in `sqlmap ... --technique=E --batch` (`--form` nếu POST). **v1.4.7:** khối next-step giờ = sqlmap_runner FIRST (bounded) sau CONFIRMED; sqli_blind_extract/generate_poc/poc_executor CHỈ fallback khi sqlmap_runner không ra dữ liệu |
+| sqli_blind_extract | active | active | **SQLi blind KHÔNG sqlmap** (Python thuần): detect + extract dữ liệu, hỗ trợ query `?id=1` VÀ path `/search/123.html`; **v1.4.4:** `engine=mysql\|mssql` (mssql = `'; IF (..) WAITFOR DELAY '0:0:n'-- -`, version/user qua `DB_NAME()`/`SUSER_SNAME()`; tables/dump mssql chưa hỗ trợ → `sqlmap --dbms=mssql`). **v1.4.5:** khai thác FORM POST qua `method`/`param`/`data` (body form-encoded, mode=form) + oracle ERROR-BASED MSSQL (0 giây: lỗi conversion lộ @@VERSION/DB_NAME()/SUSER_SNAME()) ưu tiên TRƯỚC time-based; oracle không ăn mới fallback WAITFOR DELAY. **v1.4.6:** shape oracle SỬA theo ground-truth — chỉ quote-then-paren `') AND CONVERT(int,(..))-- -` / `')) AND ...` ăn (context LIKE có ngoặc; `' AND CONVERT` trần fail); WAF burst detection — ≥2/3 probe status-0 (kết nối bị reset ~0.02s) → dừng sau ĐÚNG 3 request oracle; `known_confirmed:true` (lỗi đã xác nhận phiên trước → bỏ lưới 9 probe); nghi WAF → hướng dẫn `sqlmap --technique=E` (kèm `--form` khi method=post). **v1.4.7:** oracle im lặng (không lỗi conversion) + time-based chết + action≠detect → `_has_data_channel()` fail-fast → outcome=error "Oracle trích xuất im lặng" + hướng sqlmap_runner/sqlmap_cmd (`--dbms=mssql --technique=BEUSTQ`); SỬA regression v1.4.6 trả `[+] version:` rỗng kiểu thành công |
 | generate_poc | sqli | safe | **Tự SINH POC Python** khai thác SQLi time-based blind (KHÔNG sqlmap): trả `poc_path` (/tmp/aixsec-x_poc_*.py) + snippet 25 dòng — code ~7KB vượt context cap nên không trả inline |
 | poc_executor | sqli | active | **Chạy POC** do generate_poc sinh (chỉ chấp nhận file `aixsec-x_poc_*.py` trong tempdir — chống arbitrary file exec); hoặc `poc_code` nếu code ngắn |
 | nikto_scan | active | noisy | **v1.4.4:** `-maxtime` = timeout−10 (sàn 30) tự kết thúc đúng hạn; cap 180 s |
@@ -313,22 +314,36 @@ DELAY). Form tìm kiếm POST: truyền `method:'post', param:'keyword',
 data:'keyword=tin tuc'` (mode=form). **v1.4.6:** probe bị reset liên tiếp
 (≥2/3 status-0, ~0.02 s) ⇒ nghi WAF — dừng sau ĐÚNG 3 request oracle, in
 `sqlmap --technique=E --batch` (kèm `--form` nếu POST); `known_confirmed:true`
-bỏ lưới 9 probe khi lỗi đã xác nhận ở phiên trước.
+bỏ lưới 9 probe khi lỗi đã xác nhận ở phiên trước. **v1.4.7:** oracle error-based im lặng (không lỗi conversion) + time-based cũng chết → `_has_data_channel()` fail-fast → outcome=error "Oracle trích xuất im lặng" + hướng dẫn `sqlmap_runner`/`sqlmap_cmd` (`--dbms=mssql --technique=BEUSTQ`); KHÔNG trả `[+] version:` rỗng kiểu thành công.
 Extraction chậm (~10 request/ký tự) nên để `delay` vừa phải.
 
 ### SQLi fallback — khi sqlmap_check thất bại
 
 sqlmap không phải lúc nào cũng thắng: timeout, WAF normalize, hoặc **path-injection**
 kiểu `/search/123.html` (sqlmap thường không tìm được vị trí inject trong path).
-Khi đó agent KHÔNG bỏ cuộc — chạy pipeline tự khai thác bằng POC Python tự sinh:
+Khi đó agent KHÔNG bỏ cuộc.
+
+**Thứ tự khai thác v1.4.7 (rule 5b/6b):** sau khi SQLi CONFIRMED
+(`sqli_manual_test`/`sqlmap_check`/detect), bước khai thác ĐẦU TIÊN là
+`sqlmap_runner` bounded (ở bảng registry) — KHÔNG nhảy thẳng sang probe thủ
+công. Chạy `sqlmap_runner` MỘT lần; CHỈ khi fail hoặc không ra dữ liệu mới
+chuyển manual (`sqli_blind_extract` detect → escalate → generate_poc →
+poc_executor). Nếu oracle im lặng (outcome=error "Oracle trích xuất im lặng" /
+extraction_failed — không có kênh dữ liệu nào, vd template quote-parity MSSQL),
+KHÔNG spam payload: thử lại `sqlmap_runner` với `technique:"E"`/`"T"` (mỗi
+kiểu tối đa 1 lần); vẫn fail thì báo giới hạn và dùng `sqlmap_cmd` tool trả về.
 
 ```
-sqli_blind_extract {url, action:"detect"}          # 1. xác nhận lỗ hổng (timing)
+sqli_manual_test / sqlmap_check … ── CONFIRMED ──┐
+                                                ↓
+sqlmap_runner {url, data?, dbms, technique:"BEUSTQ"}   # 1. sqlmap bounded ĐẦU TIÊN
+        ↓ fail / không có dữ liệu
+sqli_blind_extract {url, action:"detect", known_confirmed:true}  # 2. fallback manual
         ↓ CONFIRMED
-generate_poc {url, mode:"query"|"path",          # 2. agent TỰ VIẾT POC Python
+generate_poc {url, mode:"query"|"path",          # 3. agent TỰ VIẾT POC Python
               action:"extract", delay, threshold}  #    (requests + SLEEP + binary search)
         ↓ trả về poc_path (/tmp/aixsec-x_poc_*.py)
-poc_executor   {poc_path, timeout:90}               # 3. agent tự chạy POC lấy dữ liệu
+poc_executor   {poc_path, timeout:90}               # 4. agent tự chạy POC lấy dữ liệu
         ↓
 version / database / user / tables / dump
 ```
@@ -353,7 +368,7 @@ Muốn thêm tool: mở `tools.py`, thêm `ToolSpec(name, description, parameter
 Model 7B/9B (vd: `huihui_ai/qwen3.5-abliterated:9b`) tuân theo **ít quy tắc** tốt hơn prompt dài.
 `prompts.py` cung cấp 2 variant + chọn tự động:
 
-- `SYSTEM_PROMPT_COMPACT` — 7 luật ngắn, câu mệnh lệnh trực tiếp (function calling, scope, `<untrusted tool output>`, không bịa CVE, thứ tự recon→active, **5b: SQLi fallback → sqli_blind_extract → generate_poc → poc_executor khi sqlmap fail**, JSON cuối đúng schema với `cves` mặc định `[]`).
+- `SYSTEM_PROMPT_COMPACT` — 7 luật ngắn, câu mệnh lệnh trực tiếp (function calling, scope, `<untrusted tool output>`, không bịa CVE, thứ tự recon→active, **5b: SQLi SAU CONFIRMED → sqlmap_runner FIRST (bounded); sqli_blind_extract → generate_poc → poc_executor CHỈ khi sqlmap_runner không ra dữ liệu**, JSON cuối đúng schema với `cves` mặc định `[]`).
 - `SYSTEM_PROMPT_FULL` — prompt gốc chi tiết (giữ alias `SYSTEM_PROMPT` cho tương thích).
 - **Luật bằng chứng v1.4 (cả 2 variant):** mọi finding phải có tool output thật
   trong phiên này. Host mới chỉ thấy ở `http_probe` (status/title) chỉ được
@@ -390,6 +405,39 @@ Model 7B/9B (vd: `huihui_ai/qwen3.5-abliterated:9b`) tuân theo **ít quy tắc*
   với `break_long_words=True` làm tách `**ffuf_dir**` thành `**ff` + `uf_dir**`.
   Giờ dùng `break_long_words=False, break_on_hyphens=False` — từ dài nhảy
   trọn sang dòng tiếp theo.
+- **v1.4.7 — `sqlmap_runner` — sqlmap bounded, ĐẦU TIÊN sau CONFIRMED:**
+  `ToolSpec` mới (tools.py `_sqlmap_runner` ~349-392 + registry): argv kỷ luật
+  (`--batch`, `--technique` dedupe+uppercase — allowlist B/E/U/S/T/Q, `--dbms`
+  chỉ khi != `auto`, `--data` cho form POST, `--threads 1 --level 1 --risk 1
+  --timeout 15 --retries 1 --flush-session`); `timeout` clamp 30–600 s;
+  `run_cmd` timeout = min(clamp, `TOOL_TIMEOUTS["sqlmap_runner"]=300`);
+  technique/dbms không hợp lệ → `[!]` outcome=error, sqlmap KHÔNG chạy;
+  parse marker → `[✓] sqlmap XÁC NHẬN khai thác` ("is vulnerable"/"Parameter:"/
+  "back-end DBMS:"/"current database:"/"Table:"), "no parameter(s) found
+  for testing" → `[-]` (outcome ok), không marker → `[-] sqlmap chạy xong
+  KHÔNG thấy dấu hiệu khai thác`; output cắt còn 4000 ký tự. Prompt rule
+  5b (compact) / 6b (full) viết lại: **sqlmap_runner FIRST sau CONFIRMED**,
+  manual chỉ fallback; khối next-step của `sqli_manual_test` (v1.4.5/1.4.6)
+  giờ cũng ra lệnh `sqlmap_runner` đầu tiên.
+- **v1.4.7 — Oracle im lặng → outcome=error, không giả thành công:**
+  regression v1.4.6 — `sqli_blind_extract` action=version/database trên
+  template oracle câm trả `[+] version:` rỗng với outcome=ok. v1.4.7:
+  `_has_data_channel()` fail-fast (1–2 request: oracle error-based không lỗi
+  conversion + `_is_true("1=1")` không delay) → extraction_failed → `[!]`
+  "Oracle trích xuất im lặng — 0 byte" + hướng `sqlmap_runner {url,
+  dbms:"mssql", technique:"BEUSTQ"}` / `sqlmap --dbms=mssql
+  --technique=BEUSTQ` và outcome=error. KHÔNG còn kết luận thành công khi
+  0 byte.
+- **v1.4.7 — Mock MSSQL ground-truth quote-parity (mock_mssql_sqli.py):**
+  mặc định (không `--waf`) mô phỏng ĐÚNG template thật `LIKE N'%<kw>%' OR
+  CONTAINS(tt.MoTa, N'<kw>')`: quote LẺ → 500 kèm 3 fragment parse-leak
+  (`Incorrect syntax near ''') OR`, `Unclosed quotation mark`,
+  `CONTAINS(tt.MoTa,`); quote CHẴN → 200 FIXED byte-identical (payload hấp
+  thụ trong string literal — kể cả `' OR '1'='1` 4 quote; KHÔNG có boolean
+  row-count channel). `--waf` = legacy (WAF_RX kiểm tra trước: mọi chữ ký
+  attack → reset kết nối status-0; quote trần → 500 ground-truth message).
+  Template này KHÔNG có conversion oracle lẫn time-based channel → sqlmap là
+  hy vọng khai thác duy nhất. Test suite v1.4.7: **149 OK**.
 - **v1.4.6 — Sửa shape oracle MSSQL (quote-then-paren):** ground-truth
   tbu.edu.vn cho thấy context tìm kiếm bọc LIKE trong ngoặc, nên payload
   v1.4.5 cũ `' AND CONVERT(int,(expr))-- -` chỉ tạo lỗi syntax (oracle câm).
