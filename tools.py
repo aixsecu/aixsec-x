@@ -420,96 +420,6 @@ def _sqlmap_runner(**kw):
 
 
 
-def _find_forms(**kw):
-    """v1.4.4: GET url → parse <form>: action (resolve tuyệt đối), method, inputs.
-
-    Lý do tồn tại: agent mù với form POST (nikto/nuclei/http_probe không lấy được
-    form) → SQLi trong ô tìm kiếm (vd POST /WebTinTuc/TimKiem param=keyword của
-    tbu.edu.vn) không bao giờ được test. Tool này cho model biết endpoint + method
-    + param để gọi sqli_manual_test ĐÚNG chỗ.
-    """
-    import requests
-    from html.parser import HTMLParser
-    from urllib.parse import urljoin
-
-    url = kw["url"]
-    timeout = max(10, min(int(kw.get("_timeout") or 20), 25))
-
-    class _FormParser(HTMLParser):
-        MAX_FORMS = 15
-        MAX_INPUTS = 30
-
-        def __init__(self, base):
-            super().__init__()
-            self.base = base
-            self.forms: list[dict] = []
-            self._cur: dict | None = None
-
-        def _resolve_action(self, action: str) -> str:
-            if not action or action.strip() in ("#", ""):
-                return self.base
-            return urljoin(self.base, action.strip())
-
-        def handle_startendtag(self, tag, attrs):
-            self.handle_starttag(tag, attrs)  # <input/> self-closing
-
-        def handle_starttag(self, tag, attrs):
-            if len(self.forms) >= self.MAX_FORMS:
-                return
-            a = {k.lower(): (v or "") for k, v in attrs}
-            if tag.lower() == "form":
-                self._cur = {
-                    "action": self._resolve_action(a.get("action", "")),
-                    "method": (a.get("method") or "get").lower(),
-                    "enctype": (a.get("enctype") or ""),
-                    "id": a.get("id", ""),
-                    "name": a.get("name", ""),
-                    "inputs": [],
-                }
-                self.forms.append(self._cur)
-            elif self._cur is not None and tag.lower() in ("input", "textarea", "select"):
-                if len(self._cur["inputs"]) >= self.MAX_INPUTS:
-                    return
-                if tag.lower() == "select":
-                    it = {"name": a.get("name", ""), "type": "select"}
-                elif tag.lower() == "textarea":
-                    it = {"name": a.get("name", ""), "type": "textarea"}
-                else:
-                    it = {"name": a.get("name", ""),
-                          "type": (a.get("type") or "text").lower()}
-                if it["name"]:
-                    self._cur["inputs"].append(it)
-
-        def handle_endtag(self, tag):
-            if tag.lower() == "form":
-                self._cur = None
-
-    try:
-        r = requests.get(url, timeout=timeout, allow_redirects=True,
-                         headers={"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) Firefox/120.0"})
-    except requests.RequestException as e:
-        return f"[!] find_forms — không GET được {url}: {e}"
-    if r.status_code >= 400:
-        return (f"[!] find_forms — {url} trả {r.status_code} ({len(r.content)} B). "
-                f"Thử URL khác (trang chủ / trang đăng nhập / trang có ô tìm kiếm).")
-    parser = _FormParser(r.url or url)
-    parser.feed((r.text or "")[:2_000_000])
-    forms = parser.forms
-    if not forms:
-        return (f"[i] find_forms — {url} → {r.status_code}, {len(r.text)} chars: "
-                f"KHÔNG có <form>. Thử URL khác (trang chủ hoặc trang có ô tìm kiếm/đăng nhập).")
-    lines = [f"[i] find_forms — {url} → {r.status_code}, {len(r.text)} chars, {len(forms)} form(s):"]
-    for i, frm in enumerate(forms, 1):
-        ins = ", ".join(f"{x['name']}({x['type']})" for x in frm["inputs"]) or "(không có input)"
-        extra = f" [enctype={frm['enctype']}]" if frm["enctype"] else ""
-        lines.append(f"  {i}. {frm['method'].upper()} {frm['action']}{extra}")
-        lines.append(f"     inputs: {ins}")
-    lines.append("[i] Ghi chú: gọi sqli_manual_test với url=action, method tương ứng, "
-                 "param=tên input cần test.")
-    return "\n".join(lines)
-
-
-# ─────────────────────────────────────────────
 # TOOLS — WAPITI (v1.5.0): crawler + TOÀN BỘ attack modules
 # ─────────────────────────────────────────────
 # wapiti 3.2.10 (`wapiti --list-modules`): 29 module. Khi KHÔNG truyền -m,
@@ -531,9 +441,11 @@ _WAPITI_MAX_EXPLOIT = 3  # số SQLi tối đa tự đẩy sang sqlmap_runner m�
 # v1.5.0: hướng dẫn BƯỚC TIẾP THEO theo category trong report JSON wapiti
 # (category ổn định theo version — không phải tên module). Category chưa có
 # trong map → fallback dùng solution từ classifications trong report.
-_WAPITI_GUIDANCE: dict[str, str] = {
-    "SQL Injection": "Chạy sqlmap_runner (technique='E', dbms theo DBMS trong finding) — auto nếu exploit=true.",
-    "Blind SQL Injection": "Chạy sqlmap_runner (technique='T', dbms theo DBMS) hoặc sqli_blind_extract cho kênh boolean/time.",
+# v1.5.3: TÁCH hướng dẫn wapiti thành 2 map — HƯỚNG KHAI THÁC và HƯỚNG KHẮC PHỤC.
+# Mục "TỔNG HỢP LỖ HỔNG" trong output wapiti + JSON mapping (rule prompts 6/7) dùng 2 map này.
+_WAPITI_EXPLOIT: dict[str, str] = {
+    "SQL Injection": "sqlmap_runner TRƯỚC (technique='E', dbms theo DBMS trong finding) — nếu THẤT BẠI thì AI tự khai thác: sqli_blind_extract action='detect', known_confirmed=true.",
+    "Blind SQL Injection": "sqlmap_runner TRƯỚC (technique='T', dbms theo DBMS) — nếu THẤT BẠI thì AI tự khai thác: sqli_blind_extract cho kênh boolean/time.",
     "Command execution": "Xác minh bằng poc_executor (gọi endpoint với payload) — không chạy payload phá hoại; ghi nhận RCE nếu xác nhận.",
     "Path Traversal": "poc_executor thử đọc /etc/passwd (Linux) / C:/Windows/win.ini (Windows) theo curl_command; đánh giá mức lộ file.",
     "Server Side Request Forgery": "Gọi oob_listener trước, gửi payload SSRF trỏ interactsh domain trong log để bắt callback OOB.",
@@ -552,7 +464,7 @@ _WAPITI_GUIDANCE: dict[str, str] = {
     "Spring4Shell": "Xác minh phiên bản Spring (5.3.x < 5.3.18 / 5.2.x < 5.2.20) trước khi kết luận.",
     "Subdomain takeover": "Kiểm tra CNAME trỏ domain không tồn tại (dns_lookup/dig) và domain còn claim được không.",
     "NS takeover": "Kiểm tra NS record trỏ nhà cung cấp DNS không hoạt động; đổi NS ngay.",
-    "TLS/SSL misconfigurations": "Re-check bằng detect_cms/sslscan; fix: bỏ TLS < 1.2 và weak cipher.",
+    "TLS/SSL misconfigurations": "Re-check bằng detect_cms/sslscan; bỏ TLS < 1.2 và weak cipher.",
     "HTTP Strict Transport Security (HSTS)": "Bật Strict-Transport-Security (max-age >= 6 tháng) trên HTTPS.",
     "Content Security Policy Configuration": "Thêm CSP header (script-src, object-src...) để giảm XSS.",
     "Clickjacking Protection": "Thêm X-Frame-Options: DENY/SAMEORIGIN hoặc CSP frame-ancestors.",
@@ -560,6 +472,41 @@ _WAPITI_GUIDANCE: dict[str, str] = {
     "HttpOnly Flag cookie": "Thêm thuộc tính HttpOnly cho cookie.",
     "Unencrypted Channels": "Chuyển toàn bộ traffic sang HTTPS + redirect 301 từ HTTP.",
     "Inconsistent Redirection": "Đồng bộ redirect HTTP→HTTPS cho mọi path (tránh redirect loop/leak).",
+    "File upload": "Tải thử file .php nhỏ qua curl theo curl_command; upload trả 'aborted'/size:false → tạm dừng khai thác, retry khi server ổn định.",
+    "_default": "Xác minh thủ công theo curl_command; chọn poc_executor/oob_listener phù hợp loại lỗ hổng.",
+}
+
+_WAPITI_FIX: dict[str, str] = {
+    "SQL Injection": "Prepared statement/parameterized query cho MỌI truy vấn; cấm nối chuỗi SQL với input; phân quyền DB tối thiểu; ẩn chi tiết lỗi DB với client.",
+    "Blind SQL Injection": "Prepared statement kể cả SQL động (ORDER BY/WHERE động); tách dữ liệu người dùng khỏi cú pháp SQL; loại bỏ kênh boolean/time khác biệt.",
+    "Command execution": "Không gọi system()/exec()/passthru()/eval() với input; dùng allowlist hàm + tham số ràng buộc; chạy tiến trình user tối thiểu hoặc sandbox.",
+    "Path Traversal": "Chuẩn hoá đường dẫn (realpath) và kiểm tra prefix thư mục gốc; cấm '..' và đường dẫn tuyệt đối từ input; serve file qua handler an toàn.",
+    "Server Side Request Forgery": "Allowlist host/IP đích; cấm URL tự do từ client; chặn dải IP nội bộ (RFC1918/link-local/metadata); timeout ngắn.",
+    "XXE": "Tắt DTD/external entity khi parse XML (libxml_disable_entity_loader, FEATURE_SECURE_PROCESSING); ngừng dùng XML cho dữ liệu không tin cậy.",
+    "Reflected Cross Site Scripting": "Encode output theo context (HTML/attribute/JS/URL); CSP mạnh; validate input theo allowlist; không nội suy input vào HTML.",
+    "Stored Cross Site Scripting": "Encode khi HIỂN THỊ dữ liệu người dùng đã lưu; CSP; sanitize bằng thư viện chuẩn (vd DOMPurify) nếu cần HTML phong phú.",
+    "HTML Injection": "Encode HTML entities cho mọi output; phân biệt text node với markup; CSP.",
+    "Open Redirect": "Không dùng URL đích từ tham số; validate host theo allowlist; dùng redirect mapping phía server.",
+    "CRLF Injection": "Loại CR/LF khỏi input; không nối input vào header; dùng API set-header của framework.",
+    "Htaccess Bypass": "Chuyển ACL lên tầng server (location/deny) thay vì chỉ .htaccess; tắt HTTP method không cần thiết.",
+    "Backup file": "Xoá file backup/source khỏi docroot; cấm .bak/.old/.zip/.tar trong thư mục web; backup ngoài docroot.",
+    "Potentially dangerous file": "Xoá file thừa khỏi docroot; chặn tải source (.php/.py...); permission tối thiểu.",
+    "Weak credentials": "Mật khẩu mạnh + MFA; khoá tài khoản sau N lần sai; xoá credential mặc định.",
+    "Cross Site Request Forgery": "Token CSRF đồng bộ + SameSite=Strict/Lax cho mọi thao tác thay đổi trạng thái; xác thực lại thao tác nhạy cảm.",
+    "Log4Shell": "Nâng cấp log4j >= 2.17.1; tắt JNDI lookup nếu chưa vá (log4j2.formatMsgNoLookups=true); rà lớp phụ thuộc.",
+    "Spring4Shell": "Nâng cấp Spring Framework 5.3.18+/5.2.20+; rà toàn bộ module dùng ClassLoader mặc định.",
+    "Subdomain takeover": "Xoá/claim lại CNAME trỏ domain chết; không để DNS dangling; theo dõi cảnh báo.",
+    "NS takeover": "Chuyển NS về nhà cung cấp DNS hoạt động; xoá glue record cũ; theo dõi hết hạn domain.",
+    "TLS/SSL misconfigurations": "Bật TLS >= 1.2 (ưu tiên 1.3); tắt weak cipher (RC4/DES); đúng chuỗi certificate.",
+    "HTTP Strict Transport Security (HSTS)": "Thêm header Strict-Transport-Security (max-age >= 31536000, includeSubDomains); đăng ký preload.",
+    "Content Security Policy Configuration": "Thêm CSP: script-src/object-src/base-uri từ nguồn tin cậy; kèm report-uri.",
+    "Clickjacking Protection": "Thêm X-Frame-Options: DENY/SAMEORIGIN hoặc CSP frame-ancestors; không nhúng trang nhạy cảm vào iframe.",
+    "Secure Flag cookie": "Thêm thuộc tính Secure cho cookie trên HTTPS.",
+    "HttpOnly Flag cookie": "Thêm thuộc tính HttpOnly cho cookie phiên.",
+    "Unencrypted Channels": "Chuyển toàn bộ traffic sang HTTPS + redirect 301 từ HTTP; kèm HSTS.",
+    "Inconsistent Redirection": "Đồng bộ redirect HTTP→HTTPS cho mọi path; tránh redirect loop/leak.",
+    "File upload": "Kiểm tra nội dung thật (không tin extension/MIME từ client); lưu ngoài docroot + đổi tên; cấm thực thi thư mục upload; allowlist type/kích thước.",
+    "_default": "Áp dụng fix đúng loại lỗ hổng; xoá dữ liệu nhạy cảm nếu đã lộ; xác minh lại sau khi vá.",
 }
 
 
@@ -731,8 +678,8 @@ def _wapiti_scan(**kw):
     if not findings:
         lines.append("[i] KHÔNG phát hiện lỗ hổng nào trong phạm vi này.")
         lines.append("[→] BƯỚC TIẾP THEO: hẹp phạm vi (scope=page/folder, -d sâu hơn), "
-                     "bật nhóm module (vd 'sql,xss,exec'), hoặc dùng find_forms + "
-                     "sqli_manual_test cho từng endpoint thủ công.")
+                     "bật nhóm module (vd 'sql,xss,exec'), hoặc chạy http_probe tìm "
+                     "thêm endpoint/form rồi wapiti_scan lại từng URL cụ thể.")
         return "\n".join(lines) + f"\n[i] report JSON (bằng chứng): {report_path}"
 
     sev_sort = ["critical", "high", "medium", "low", "info"]
@@ -773,26 +720,30 @@ def _wapiti_scan(**kw):
         if shown >= detail_budget:
             break
 
-    lines.append("[→] BƯỚC TIẾP THEO (xác minh/khai thác theo category):")
-    g_seen: set[str] = set()
-    g_count = 0
+    # ── v1.5.3 (nhiệm vụ 3): TỔNG HỢP LỖ HỔNG — hướng KHAI THÁC + KHẮC PHỤC
+    lines.append("[✓] TỔNG HỢP LỖ HỔNG — HƯỚNG KHAI THÁC & KHẮC PHỤC:")
+    sum_seen: set[tuple] = set()
+    sum_count = 0
     for s in sev_sort:
         for f in by_sev.get(s, []):
-            if f["category"] in g_seen:
+            key = (f["category"], f["method"], f["path"], f["parameter"])
+            if key in sum_seen:
                 continue
-            g_seen.add(f["category"])
-            g = _WAPITI_GUIDANCE.get(f["category"])
-            if not g:
-                cls = (rep["classifications"] or {}).get(f["category"]) or {}
-                sol = (cls.get("sol") or "").strip()
-                g = "Xác minh thủ công theo curl_command" + (
-                    f" — fix: {sol}" if sol else "")
-            lines.append(f"  • {f['category']}: {g}")
-            g_count += 1
-            if g_count >= 10:  # giữ context gọn; phần còn lại nằm trong report JSON
+            sum_seen.add(key)
+            loc = f["method"] + " " + (f["path"] or "?")
+            p = f["parameter"] or "?"
+            ex = _WAPITI_EXPLOIT.get(f["category"], _WAPITI_EXPLOIT["_default"])
+            fx = _WAPITI_FIX.get(f["category"], _WAPITI_FIX["_default"])
+            lines.append(f"[{s.upper()}] {f['category']} — {loc} (param={p})")
+            lines.append(f"    → khai thác: {ex}")
+            lines.append(f"    → khắc phục: {fx}")
+            sum_count += 1
+            if sum_count >= 10:  # giữ context gọn; phần còn lại nằm trong report JSON
                 break
-        if g_count >= 10:
+        if sum_count >= 10:
             break
+    if sum_count == 0:
+        lines.append("[i] (không có finding nào để tổng hợp — chỉ có mục info đã liệt kê trên.)")
 
     # ── AUTO-EXPLOIT: sqlmap FIRST sau khi wapiti CONFIRMED (luật v1.4.7 giữ nguyên)
     if exploit:
@@ -823,6 +774,23 @@ def _wapiti_scan(**kw):
                              f"(param={f['parameter'] or '?'}, dbms={dbms}, "
                              f"technique={tech}, target={target})")
                 lines.append(sql_out)
+                # ── v1.5.3 (nhiệm vụ 2): sqlmap THẤT BẠI → AI TỰ KHAI THÁC
+                _FAIL_MARKS = ("không thấy dấu hiệu", "not injectable",
+                               "no parameter(s)")
+                _sqlmap_failed = (sql_out.lstrip().startswith("[!]")
+                                  or any(m in sql_out.lower() for m in _FAIL_MARKS))
+                if _sqlmap_failed:
+                    eng = dbms if dbms in ("mysql", "mssql") else "mssql"
+                    meth = (f["method"] or "get").lower()
+                    blind_data = data or ""
+                    lines.append(
+                        f"[→] SQLMAP THẤT BẠI #{i} ({f['path']} param={f['parameter'] or '?'}) "
+                        f"— sqlmap không khai thác được (WAF/template hấp thụ/kênh đặc biệt). "
+                        f"AI TỰ KHAI THÁC (v1.5.3): chạy sqli_blind_extract "
+                        f"{{'url': '{target}', 'action': 'detect', 'known_confirmed': true, "
+                        f"'method': '{meth}', 'param': '{f['parameter'] or ''}', "
+                        f"'data': '{blind_data}', 'engine': '{eng}'}} "
+                        f"— KHÔNG gọi lại sqlmap_runner cho url này nữa.")
         else:
             lines.append("[i] Không có SQLi để auto-exploit; các finding khác đã kèm "
                          "payload + hướng dẫn bên trên.")
@@ -895,8 +863,9 @@ def _sqli_manual_test(**kw):
     if engine not in ("mysql", "mssql", "auto"):
         return f"[!] sqli_manual_test: engine phải là mysql|mssql|auto (nhận '{engine}')."
     if not param:
-        return ("[!] sqli_manual_test cần 'param' (tên tham số form). Chạy find_forms "
-                "trước để biết tên input (vd 'keyword') rồi gọi lại với param đó.")
+        return ("[!] sqli_manual_test cần 'param' (tên tham số form). Chạy wapiti_scan "
+                "(crawler tìm form/param) hoặc http_probe trước để biết tên input "
+                "(vd 'keyword') rồi gọi lại với param đó.")
     delay = max(1, int(float(kw.get("delay") or 3)))
     seed = "test"
     req_timeout = max(15, delay + 5)
@@ -998,7 +967,7 @@ def _sqli_manual_test(**kw):
             lines.append(f"[-] SQLI NOT_CONFIRMED — quote-differential âm tính"
                          + (f" và time-based {engine} không tạo phản hồi chậm" if time_rows else "")
                          + ". Thử sqlmap_check/sqli_blind_extract hoặc param khác trong form "
-                           "(find_forms).")
+                           "(tham số từ wapiti_scan/http_probe).")
     lines.append(f"[+] verdict: {verdict}" + (f" — {method_used}" if method_used else ""))
     return "\n".join(lines)
 
@@ -1503,11 +1472,6 @@ TOOL_REGISTRY: list[ToolSpec] = [
     ToolSpec("http_probe", "GET một URL: trả status code, headers chọn lọc, snippet body.",
              {"type": "object", "properties": {"url": {"type": "string", "pattern": "^https?://"}},
               "required": ["url"]}, _http_probe, risk="safe"),
-    ToolSpec("find_forms", "GET một URL rồi parse HTML để liệt kê các form (action, method, input name/type). "
-             "Dùng BẮT BUỘC trước khi test SQLi qua form: model phải biết action + method + tên tham số. "
-             "Không gửi dữ liệu, chỉ đọc trang (risk=safe).",
-             {"type": "object", "properties": {"url": {"type": "string", "pattern": "^https?://"}},
-              "required": ["url"]}, _find_forms, risk="safe"),
     ToolSpec("dns_lookup", "Tra cứu DNS A records của domain.",
              {"type": "object", "properties": {"host": {"type": "string"}},
               "required": ["host"]}, _dns_lookup, risk="safe"),
@@ -1574,7 +1538,7 @@ TOOL_REGISTRY: list[ToolSpec] = [
              "rồi fallback time-based (SLEEP cho mysql, WAITFOR DELAY cho mssql). "
              "Hỗ trợ GET (?param=payload) VÀ POST (method='post' + data='q=test'). "
              "engine=mysql|mssql|auto (auto đoán qua headers). Không cần baseline/delay_payload "
-             "— tool tự đo. Chạy find_forms TRƯỚC để biết action/method/param đúng.",
+             "— tool tự đo. Tham số/form lấy từ wapiti_scan (mục SQLi + parameter) hoặc http_probe.",
              {"type": "object",
               "properties": {"url": {"type": "string", "pattern": "^https?://"},
                              "param": {"type": "string",
@@ -1677,13 +1641,17 @@ TOOL_REGISTRY: list[ToolSpec] = [
 
     # ── WAPITI (v1.5.0) ──
     ToolSpec("wapiti_scan",
-             "v1.5.0: Quét TOÀN BỘ website bằng wapiti (crawler + 29 attack module: "
+             "v1.5.3: Quét TOÀN BỘ website bằng wapiti (crawler + 29 attack module: "
              "sql/timesql, xss/permanentxss, exec, file, xxe, ssrf, ldap, crlf, redirect, "
              "backup, htaccess, buster, csrf, methods, cms, wp_enum, network_device, "
              "log4shell, spring4shell, shellshock, takeover, upload, htp, nikto, wapp, "
              "ssl, brute_login_form...). Mặc định scope=domain (cả website), max_scan_time=300s, "
              "có trần giới hạn, không chạy vô hạn. exploit=true (mặc định): SQLi CONFIRMED "
-             "tự đẩy sang sqlmap_runner (sqlmap-FIRST, max 3 mục). Report JSON lưu /tmp làm "
+             "tự đẩy sang sqlmap_runner (sqlmap-FIRST, max 3 mục); sqlmap THẤT BẠI → "
+             "AI tự khai thác bằng sqli_blind_extract (known_confirmed=true). Cuối output có "
+             "mục TỔNG HỢP LỖ HỔNG — hướng khai thác + khắc phục từng category (dùng viết "
+             "final JSON findings[].fix). THAY CHO công cụ tìm form cũ (đã gỡ v1.5.3): crawler wapiti "
+             "tìm form/param cho sqli_manual_test. Report JSON lưu /tmp làm "
              "bằng chứng. CSP/security headers/cookie flags/https-redirect là CATEGORY trong "
              "report (không phải module chạy riêng) — nằm trong phần info của scan.",
              {"type": "object",
