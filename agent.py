@@ -28,12 +28,20 @@ from ledger import (Ledger, parse_findings_json, render_markdown, validation_pla
                    check_findings_evidence)
 from llm import InjectionGuard, ollama_chat
 from prompts import SYSTEM_PROMPT, build_system_prompt
-from scope import ScopePolicy
+from scope import ScopePolicy, normalize_host
 from tools import (TOOL_REGISTRY, TOOL_INDEX, TOOL_BINS, TOOL_TIMEOUTS,
-                   available_tools)
+                   LONG_RUN_TOOLS, available_tools)
 
 # ── terminal colors (AIXSEC-X style) ──
-VERSION = "1.5.0"
+VERSION = "1.5.1"
+
+# v1.5.1: active-check gate — tool chủ động kiểm tra web (chạy lâu, "noisy").
+# Nếu web scope active mà chưa có tool nào trong set này HOÀN TẤT (outcome=ok),
+# final JSON recon-only bị từ chối và model bị ép gọi wapiti_scan trước.
+ACTIVE_CHECKS: frozenset = frozenset({
+    "wapiti_scan", "ffuf_dir", "sqlmap_check", "sqlmap_runner",
+    "sqli_manual_test", "sqli_blind_extract", "nikto_scan", "nuclei_scan",
+})
 
 RED = "\033[91m"
 GREEN = "\033[92m"
@@ -207,6 +215,11 @@ class WebXAgent:
         # (plan-only). >=2 lượt liên tiếp → ép trả final JSON bằng dữ liệu đã có
         # thay vì để vòng lặp quay vòng vô ích. Reset mỗi lượt có tool call thật.
         self._plan_only = 0
+        # v1.5.1: active-check gate — ghi nhận tool active nào HOÀN TẤT
+        # (outcome=ok) trong phiên; _no_active_json đếm lượt model trả final
+        # JSON khi chưa có active check nào (recon-only).
+        self._active_done: set[str] = set()
+        self._no_active_json = 0
 
     # ─────────────────────────────────────────
     # TOOL DISPATCH (+ scope check + risk approval)
@@ -242,8 +255,14 @@ class WebXAgent:
             # v1.4.3: trần timeout theo từng tool — chặn tool chạy vô hạn
             # không tôn trọng _timeout tốt (vd arjun 427s ở live-run), ngay cả
             # khi operator cấu hình tool_timeout cao.
-            kw["_timeout"] = min(self.config["tool_timeout"],
-                                  TOOL_TIMEOUTS.get(name, self.config["tool_timeout"]))
+            # v1.5.1 (Bug 2): LONG_RUN_TOOLS (wapiti_scan) dùng SÀN
+            # max(tool_timeout, cap) — cap từng tool là MỨC TỐI THIỂU để wapiti
+            # không bị giết ở tool_timeout mặc định 90s giữa chừng scan.
+            cap = TOOL_TIMEOUTS.get(name, self.config["tool_timeout"])
+            if name in LONG_RUN_TOOLS:
+                kw["_timeout"] = max(self.config["tool_timeout"], cap)
+            else:
+                kw["_timeout"] = min(self.config["tool_timeout"], cap)
             # v1.4.4: chỉ đo thời gian THỰC THI tool — chờ operator duyệt
             # (_risk_ok/input()) nằm ngoài try này nên không bị tính vào duration.
             t0 = time.time()
@@ -277,6 +296,8 @@ class WebXAgent:
         result = {"risk_level": "UNKNOWN", "overall_summary": "", "final_text": "", "calls": 0}
         forced = False  # dừng sớm: round thoái hóa → ép trả JSON ngay
         self._plan_only = 0  # v1.4.3: reset bộ đếm plan-only mỗi run()
+        self._active_done = set()  # v1.5.1: reset active-check gate mỗi run()
+        self._no_active_json = 0  # v1.5.1: reset bộ đếm JSON-thiếu-active
         for rnd in range(1, max_rounds + 1):
             disp = _LiveDisplay(rnd, max_rounds)
             resp = self.chat(msgs, tools=[t.schema() for t in self.tools],
@@ -293,6 +314,18 @@ class WebXAgent:
                         result["overall_summary"] = d.get("overall_summary", "")
                     except json.JSONDecodeError:
                         pass
+                    # v1.5.1: active-check gate (Bug 1) — web scope active nhưng
+                    # CHƯA có active check nào hoàn tất → JSON này chỉ là recon-
+                    # only, không được chấp nhận; ép model gọi wapiti_scan.
+                    # >=2 lần liên tiếp → forced (trả JSON bằng dữ liệu thật).
+                    if self._web_scope_active() and not self._active_done:
+                        self._no_active_json += 1
+                        msgs.append({"role": "assistant", "content": result["final_text"]})
+                        msgs.append({"role": "user", "content": self._active_gate_message()})
+                        if self._no_active_json >= 2:
+                            forced = True
+                            break
+                        continue
                     return result
                 # v1.4.3: model 9B viết VĂN BẢN KẾ HOẠCH không kèm tool_calls →
                 # KHÔNG được coi là câu trả lời cuối (trước đây return ngay làm
@@ -378,6 +411,10 @@ class WebXAgent:
             disp.done()
             self.transcript.append({"round": rnd, "type": "tools", "calls": results})
             result["calls"] += len(results)
+            # v1.5.1: ghi nhận active check đã HOÀN TẤT (outcome=ok) trong phiên
+            for r in results:
+                if r.get("outcome") == "ok" and r.get("name") in ACTIVE_CHECKS:
+                    self._active_done.add(r.get("name"))
 
             if all(r.get("outcome") in ("duplicate", "blocked") for r in results):
                 # cả round chỉ toàn duplicate/blocked — không tool nào sinh dữ liệu
@@ -406,8 +443,11 @@ class WebXAgent:
         # hết budget (hoặc dừng sớm vì round thoái hóa: toàn duplicate/blocked
         # hoặc model chỉ trả văn bản kế hoạch 2 lượt liên tiếp) — ép trả JSON
         if forced:
+            gate_note = ("PHIÊN NÀY CHƯA CÓ ACTIVE CHECK NÀO HOÀN TẤT — mọi kết "
+                         "quả chỉ là recon/thông tin thụ động. "
+                         if self._no_active_json >= 2 else "")
             msgs.append({"role": "user", "content":
-                        "Vòng lặp không tiến triển: các tool gọi đều trả "
+                        f"{gate_note}Vòng lặp không tiến triển: các tool gọi đều trả "
                         "duplicate/blocked, hoặc bạn chỉ trả văn bản kế hoạch "
                         "không gọi tool — không còn thông tin mới. KHÔNG gọi tool nữa. "
                         "Tổng hợp DỮ LIỆU "
@@ -416,6 +456,15 @@ class WebXAgent:
                         "của phiên này (ghi nguồn trong description). KHÔNG bịa thêm "
                         "404/error-page, cấu hình server, WAF/CMS hoặc chi tiết nào "
                         "khác nếu chưa có tool output hỗ trợ."})
+        # v1.5.1: hết budget mà web scope active chưa có active check hoàn tất —
+        # nhắc nhở tổng hợp trung thực (không bịa), tránh JSON rỗng/UNKNOWN
+        if (not forced and self._web_scope_active() and not self._active_done):
+            msgs.append({"role": "user", "content":
+                        "⚠ Lưu ý tổng hợp: phiên này CHƯA CÓ ACTIVE CHECK nào "
+                        f"hoàn tất và budget ({max_rounds} round) đã cạn. Không "
+                        "gọi tool nữa — trả final JSON trung thực với dữ liệu "
+                        "recon đã thu; nếu chưa đủ bằng chứng, risk_level=UNKNOWN "
+                        "là kết quả trung thực."})
         disp = _LiveDisplay(0 if forced else max_rounds, max_rounds)
         resp = self.chat(msgs, tools=[t.schema() for t in self.tools], json_mode=True,
                          on_token=disp.on_token, on_reasoning=disp.on_reasoning)
@@ -447,6 +496,57 @@ class WebXAgent:
         low = (text or "").lower()
         found = [ts.name for ts in self.tools if ts.name.lower() in low]
         return sorted(found, key=len, reverse=True)
+
+    def _web_scope_active(self) -> bool:
+        """v1.5.1: web scope đang active (URL http(s)/IP/CIDR/hostname/localhost)
+        — nơi active checks (wapiti/nikto/ffuf...) có ý nghĩa. False khi chưa
+        khai báo WEBX_TARGETS hoặc chỉ có src (WEBX_SRC_DIRS)."""
+        if not self.policy.has_scope:
+            return False
+        for a in self.policy._raw:
+            if a.lower().startswith(("http://", "https://")):
+                return True
+        for d in self.policy.domains:
+            if d in ("localhost", "127.0.0.1", "::1"):
+                return True
+            if re.match(r"^[0-9a-f.:]+(?:/\d{1,2})?$", d):
+                return True
+        return bool(self.policy.domains or self.policy._cidrs)
+
+    def _active_gate_url(self) -> str | None:
+        """URL đề xuất cho wapiti_scan trong gate message (v1.5.1) — ưu tiên
+        raw scope có scheme, fallback http:// domain đầu tiên."""
+        for a in self.policy._raw:
+            low = a.lower()
+            if low.startswith(("http://", "https://")):
+                scheme = low.split("://", 1)[0]
+                host = normalize_host(a)
+                if host:
+                    return f"{scheme}://{host}/"
+        for d in self.policy.domains:
+            if d:
+                return f"http://{d}/"
+        return None
+
+    def _active_gate_message(self) -> str:
+        """v1.5.1: thông báo từ chối final JSON recon-only — bắt buộc lượt
+        tiếp theo gọi active check đầu tiên (wapiti_scan) trước khi tổng hợp."""
+        url = self._active_gate_url() or "<URL-trong-scope>"
+        hint = ""
+        if "wapiti_scan" in self.missing_tools:
+            hint = ("\n[GHI CHÚ] Binary 'wapiti' không thấy trên PATH phiên này — "
+                    "kết quả có thể là lỗi 'not found'. Vẫn gọi wapiti_scan để "
+                    "ghi nhận hành động active check, hoặc chọn active check "
+                    "khác khả dụng (nikto_scan, sqlmap_check...).")
+        return ("Bản tổng hợp JSON của bạn CHƯA HỢP LỆ: phiên này đang active "
+                "trên web scope nhưng CHƯA có active check nào hoàn tất (kết "
+                "quả chỉ là recon/thông tin thụ động). Bắt buộc lượt này gọi "
+                "function call wapiti_scan với {\"url\": "
+                f"{json.dumps(url, ensure_ascii=False)}, "
+                "\"scope\": \"domain\", \"modules\": \"sql,xss,file,exec\", "
+                "\"max_scan_time\": 120} — quét toàn bộ website tìm SQLi/XSS/"
+                "file/exec. Chỉ sau khi tool trả kết quả (kể cả lỗi) lượt sau "
+                "mới được trả final JSON." + hint)
 
     def _history(self) -> list[dict]:
         """Toàn bộ tool calls của phiên (args + outcome + output) để đối chiếu bằng chứng."""

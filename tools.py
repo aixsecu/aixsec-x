@@ -99,6 +99,12 @@ TOOL_TIMEOUTS: dict[str, int] = {
     "wapiti_scan": 600,      # v1.5.0: scan cả website (crawler+attack) — operator tăng WEBX_TOOL_TIMEOUT nếu cần
 }
 
+# v1.5.1: tool QUÉT DÀI — _dispatch dùng SÀN max(tool_timeout, cap) thay vì trần
+# min(). Lý do (Bug 2): min() chặn wapiti_scan ở tool_timeout mặc định 90s →
+# wapiti bị giết giữa chừng (chưa kịp ghi report JSON), vòng chạy mà như không
+# chạy. Cap 600s là mức TỐI THIỂU; operator muốn lâu hơn thì tăng WEBX_TOOL_TIMEOUT.
+LONG_RUN_TOOLS: frozenset = frozenset({"wapiti_scan"})
+
 
 def available_tools() -> tuple[set, dict]:
     """(set tool khả dụng, dict {tool_name: binary thiếu}) — gọi 1 lần lúc khởi động.
@@ -693,7 +699,13 @@ def _wapiti_scan(**kw):
     if kw.get("cookie"):
         args += ["-C", str(kw["cookie"])]
     t0 = time.monotonic()
-    out = run_cmd(args, min(budget, scan_time + 60), max_chars=6000)
+    # v1.5.1 (Bug 2): truyền NGUYÊN budget thay vì min(budget, scan_time+60) —
+    # trước đây run_cmd giết wapiti khi scan_time+60 trôi qua dù budget còn dư,
+    # wapiti chưa kịp ghi report JSON nên outcome=error 'thiếu report' mọi lần.
+    # Budget giờ = max(tool_timeout, 600) nhờ LONG_RUN_TOOLS trong _dispatch, còn
+    # wapiti tự kết thúc khi hết --max-scan-time (nhỏ hơn budget) nên run_cmd chỉ
+    # là lưới an toàn cuối, không cắt ngang scan giữa chừng.
+    out = run_cmd(args, budget, max_chars=6000)
     # 1) lỗi thực thi (timeout / thiếu binary /...) — KHÔNG kết luận gì từ lần chạy này
     if out.startswith("[!]"):
         err_line = out.splitlines()[0].lstrip("[!] ").strip()
