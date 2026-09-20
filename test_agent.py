@@ -2630,14 +2630,17 @@ class TestBannerUpdate(unittest.TestCase):
     def test_color_has_ansi_but_no_black_bg(self):
         b = self._banner(color=True)
         self.assertIn("\x1b[", b)
-        self.assertIn("\x1b[91m", b)    # đỏ — mặt nạ Anonymous
+        self.assertIn("\x1b[91m", b)    # đỏ — số phiên bản ở dòng title
         self.assertIn("\x1b[92m", b)    # xanh — logo AIXSEC-X
         self.assertNotIn("\x1b[40m", b)  # v1.5.4 bỏ nền đen theo dòng
 
-    def test_mask_and_logo_present(self):
+    def test_mask_removed_logo_present(self):
+        # v1.5.6: _ANON_ART (hình `.888.` đọc thành chữ "AAO") đã BỎ theo yêu
+        # cầu user — banner chỉ còn logo AIXSEC-X.
         b = self._banner()
-        self.assertIn(".o.", b)        # mắt trái mặt nạ Anonymous
-        self.assertIn("88bodP", b)     # nụ cười V của mặt nạ
+        self.assertNotIn(".888.", b)
+        self.assertNotIn(".o.", b)
+        self.assertNotIn("88bodP", b)
         self.assertIn("█████╗", b)     # logo AIXSEC-X
 
     def test_no_box_borders(self):
@@ -2646,12 +2649,11 @@ class TestBannerUpdate(unittest.TestCase):
         self.assertNotIn("┌", b)
         self.assertNotIn("└", b)
 
-    def test_art_centered_in_block(self):
+    def test_logo_is_first_content(self):
+        # v1.5.6: không còn art phía trên — logo AIXSEC-X là nội dung đầu tiên
         b = self._banner()
-        for ln in b.splitlines():
-            if ln.strip().startswith(".888."):   # dòng art (bỏ qua indent khối)
-                self.assertTrue(ln.startswith(" "), repr(ln))
-                self.assertTrue(len(ln) - len(ln.lstrip()) >= 2, repr(ln))
+        first = next(ln for ln in b.splitlines() if ln.strip())
+        self.assertIn("█████╗", first)
 
     def test_missing_tools_listed(self):
         b = self._banner(missing={"nuclei_scan": "nuclei"})
