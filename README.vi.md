@@ -114,8 +114,8 @@ alias aixsec='cd ~/aixsec-x && source .venv/bin/activate && python3 agent.py'
 ### System tools trên Kali (áp dụng cho cả 4 cách)
 
 ```bash
-which nuclei ffuf sqlmap httpx subfinder whatweb wafw00f nikto arjun \
-  || sudo apt install -y nuclei ffuf sqlmap httpx subfinder whatweb wafw00f nikto arjun
+which nuclei ffuf sqlmap httpx subfinder whatweb wafw00f nikto arjun wapiti \
+  || sudo apt install -y nuclei ffuf sqlmap httpx subfinder whatweb wafw00f nikto arjun wapiti
 
 # (tùy chọn) SecLists cho ffuf
 sudo apt install -y seclists
@@ -275,7 +275,7 @@ root@aixsec-x:~# q                                          → thoát
 1. **Scope pinning** — tool call có URL/host ngoài `WEBX_TARGETS` bị từ chối bởi `scope.py` (không phụ thuộc LLM tự kiềm chế).
 2. **Injection guard** — output tool (body từ web thù địch) được strip marker/ANSI/control chars trước khi vào context model.
 3. **Validation loop** — LLM chỉ tạo `candidate`; `confirmed` chỉ sau bước xác minh (`ledger.py` status machine) hoặc operator chốt.
-4. **Approval flow** — tool noisy/active (nuclei, sqlmap, ffuf, nikto) mặc định hỏi operator trước khi chạy.
+4. **Approval flow** — tool noisy/active (nuclei, sqlmap, ffuf, nikto, wapiti_scan) mặc định hỏi operator trước khi chạy.
 5. **Function calling** — Ollama `tools` API thay regex `[TOOL:]` → args có cấu trúc, validate được.
 6. **Không credential hardcode** — mọi thứ qua env.
 7. **Bộ chống lặp lại** — tool call giống hệt nhau bị dedup (`outcome=duplicate`,
@@ -301,6 +301,7 @@ root@aixsec-x:~# q                                          → thoát
 | generate_poc | sqli | safe | **Tự SINH POC Python** khai thác SQLi time-based blind (KHÔNG sqlmap): trả `poc_path` (/tmp/aixsec-x_poc_*.py) + snippet 25 dòng — code ~7KB vượt context cap nên không trả inline |
 | poc_executor | sqli | active | **Chạy POC** do generate_poc sinh (chỉ chấp nhận file `aixsec-x_poc_*.py` trong tempdir — chống arbitrary file exec); hoặc `poc_code` nếu code ngắn |
 | nikto_scan | active | noisy | **v1.4.4:** `-maxtime` = timeout−10 (sàn 30) tự kết thúc đúng hạn; cap 180 s |
+| wapiti_scan | active | noisy | **v1.5.0:** máy quét toàn bộ website (wapiti 3.2.10) — TRUYỀN ĐỦ 29 module tấn công qua `-m` (mặc định wapiti chỉ chạy 9 module); bounded: scope `url\|page\|folder\|subdomain\|domain\|punk`, `depth` 1–10, `max_scan_time`/`max_attack_time`, `tasks` 1–8, `timeout`; parse report `-f json` (sắp xếp severity+category, wstg, `curl_command`, loại probe-marker wapiti `%C2%BF%27%22%28`, tách body an toàn CRLF); `exploit=true` (mặc định) → sqlmap-FIRST: tự chạy `sqlmap_runner` trên ≤3 SQLi findings SAU KHI wapiti CONFIRMED (technique E/T, dbms lấy từ `DBMS:` trong info); bản đồ guidance theo category — CSP/headers/cookie-flag là CATEGORY của report, KHÔNG phải tên module |
 
 **Khi nào dùng `sqli_blind_extract`:** sqlmap không bắt được đường inject kiểu path
 (`/search/123.html`) hoặc chữ ký tham số lạ — tool này tự detect quote/comment style
@@ -405,6 +406,7 @@ Model 7B/9B (vd: `huihui_ai/qwen3.5-abliterated:9b`) tuân theo **ít quy tắc*
   với `break_long_words=True` làm tách `**ffuf_dir**` thành `**ff` + `uf_dir**`.
   Giờ dùng `break_long_words=False, break_on_hyphens=False` — từ dài nhảy
   trọn sang dòng tiếp theo.
+- **v1.5.0 — `wapiti_scan`: máy quét toàn site, ĐỦ 29 module wapiti, handoff sqlmap-FIRST:** ToolSpec + `_wapiti_scan` mới (tools.py ~505–815) bọc **wapiti 3.2.10**: chạy crawler + MỌI module tấn công bằng cách truyền `-m backup,brute_login_form,buster,cms,crlf,csrf,exec,file,htaccess,htp,ldap,log4shell,methods,network_device,nikto,permanentxss,redirect,shellshock,spring4shell,sql,ssl,ssrf,takeover,timesql,upload,wapp,wp_enum,xss,xxe` — mặc định wapiti CHỈ chạy 9 module; user yêu cầu rõ "toàn bộ loại tấn công wapiti hỗ trợ". Bounded: scope `url/page/folder/subdomain/domain/punk` (mặc định domain = cả website), depth 1–10, max-scan-time ≤ min(budget−20, 1800), max-attack-time ≤ scan_time/2, tasks 1–8, timeout từng request 5–30 s, `--flush-session --no-bugreport`; `run_cmd` timeout = min(budget, scan+60) để wapiti TỰ kết thúc trước khi bị giết. Parse từ `-f json`: map severity 0–4→info..critical, sort (rank, category, path) DESC, tìm thấy kèm wstg + `curl_command`, body tách qua `.split("\n\n"|"\r\n\r\n")` (http_request trong report chứa CRLF THẬT sau round-trip json.load), `_strip_wapiti_probe` bỏ hậu tố probe `¿'"(` do wapiti chèn để khôi phục giá trị form gốc (`keyword=tin%C2%BF%27%22%28 → keyword=tin`). **Giữ luật sqlmap-FIRST**: `exploit=true` (mặc định) tự chạy `sqlmap_runner` trên tối đa `_WAPITI_MAX_EXPLOIT=3` SQLi findings CHỈ khi wapiti CONFIRMED (category "SQL Injection"/"Blind SQL Injection" → technique E/T, dbms từ `DBMS:` trong info), sql_budget = max(30, min(180, budget−elapsed−5)); mọi finding không phải SQLi trả payload + guidance theo category (CSP/headers/cookie-flag/HSTS là CATEGORY của report, không bịa tên module). Risk `noisy` → nằm trong approval flow. Test suite v1.5.0: **175 OK** (15 test TestWapitiScan mới: argv/allowlist/timing/parse/probe-strip/sqli-target/exploit cap 3/exploit=false/lỗi; + test_all_present học thêm wapiti). E2E xác minh live trên mock MSSQL (`mock_mssql_sqli.py`, localhost:8098): wapiti CONFIRMED `[CRITICAL] SQL Injection (param=keyword) POST /WebTinTuc/TimKiem [module=sql]` (DBMS: Microsoft SQL Server, WSTG-INPV-05); lượt exploit handoff sang sqlmap thật (1.10.8) với `--dbms mssql --technique E --data keyword=default`.
 - **v1.4.9 — `sqlmap_runner`: timeout/lỗi thực thi ≠ "chạy xong":**
   `run_cmd` trả `[!] Timeout sau Ns.` khi tiến trình bị giết vì quá giờ
   (và `[!] ...` cho lỗi thực thi khác). Trước đây `_sqlmap_runner` xếp mọi
