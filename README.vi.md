@@ -295,8 +295,8 @@ aixsec-x> q                                       → thoát
 | nuclei_scan | active | active | `-severity`, `-tags` |
 | ffuf_dir | active | active | SecLists common.txt |
 | sqlmap_check | active | active | `--batch --smart --current-user --banner` |
-| sqli_manual_test | active | active | **v1.4.4 v2:** quote-differential (`test'`/`test''`) trước — xác nhận chèn KHÔNG cần engine/SLEEP; fallback time-based SLEEP/WAITFOR DELAY theo `engine=mysql\|mssql\|auto` (auto đoán từ headers: ASP.NET/IIS → mssql, PHP → mysql). **v1.4.5:** khi CONFIRMED tự in khối `[→] BƯỚC TIẾP THEO` (sqli_blind_extract → generate_poc → poc_executor) — model không dừng ở verdict |
-| sqli_blind_extract | active | active | **SQLi blind KHÔNG sqlmap** (Python thuần): detect + extract dữ liệu, hỗ trợ query `?id=1` VÀ path `/search/123.html`; **v1.4.4:** `engine=mysql\|mssql` (mssql = `'; IF (..) WAITFOR DELAY '0:0:n'-- -`, version/user qua `DB_NAME()`/`SUSER_SNAME()`; tables/dump mssql chưa hỗ trợ → `sqlmap --dbms=mssql`). **v1.4.5:** khai thác FORM POST qua `method`/`param`/`data` (body form-encoded, mode=form) + oracle ERROR-BASED MSSQL (0 giây: `' AND CONVERT(int,(SELECT @@VERSION))-- -` → lỗi conversion lộ @@VERSION/DB_NAME()/SUSER_SNAME()) ưu tiên TRƯỚC time-based; oracle không ăn mới fallback WAITFOR DELAY |
+| sqli_manual_test | active | active | **v1.4.4 v2:** quote-differential (`test'`/`test''`) trước — xác nhận chèn KHÔNG cần engine/SLEEP; fallback time-based SLEEP/WAITFOR DELAY theo `engine=mysql\|mssql\|auto` (auto đoán từ headers: ASP.NET/IIS → mssql, PHP → mysql). **v1.4.5:** khi CONFIRMED tự in khối `[→] BƯỚC TIẾP THEO` (sqli_blind_extract → generate_poc → poc_executor) — model không dừng ở verdict. **v1.4.6:** khối next-step khâu sẵn `known_confirmed:true` (bỏ qua lưới 9 probe — lỗi đã xác nhận); MỌI probe status-0 → nghi WAF chặn payload → in `sqlmap ... --technique=E --batch` (`--form` nếu POST) |
+| sqli_blind_extract | active | active | **SQLi blind KHÔNG sqlmap** (Python thuần): detect + extract dữ liệu, hỗ trợ query `?id=1` VÀ path `/search/123.html`; **v1.4.4:** `engine=mysql\|mssql` (mssql = `'; IF (..) WAITFOR DELAY '0:0:n'-- -`, version/user qua `DB_NAME()`/`SUSER_SNAME()`; tables/dump mssql chưa hỗ trợ → `sqlmap --dbms=mssql`). **v1.4.5:** khai thác FORM POST qua `method`/`param`/`data` (body form-encoded, mode=form) + oracle ERROR-BASED MSSQL (0 giây: lỗi conversion lộ @@VERSION/DB_NAME()/SUSER_SNAME()) ưu tiên TRƯỚC time-based; oracle không ăn mới fallback WAITFOR DELAY. **v1.4.6:** shape oracle SỬA theo ground-truth — chỉ quote-then-paren `') AND CONVERT(int,(..))-- -` / `')) AND ...` ăn (context LIKE có ngoặc; `' AND CONVERT` trần fail); WAF burst detection — ≥2/3 probe status-0 (kết nối bị reset ~0.02s) → dừng sau ĐÚNG 3 request oracle; `known_confirmed:true` (lỗi đã xác nhận phiên trước → bỏ lưới 9 probe); nghi WAF → hướng dẫn `sqlmap --technique=E` (kèm `--form` khi method=post) |
 | generate_poc | sqli | safe | **Tự SINH POC Python** khai thác SQLi time-based blind (KHÔNG sqlmap): trả `poc_path` (/tmp/aixsec-x_poc_*.py) + snippet 25 dòng — code ~7KB vượt context cap nên không trả inline |
 | poc_executor | sqli | active | **Chạy POC** do generate_poc sinh (chỉ chấp nhận file `aixsec-x_poc_*.py` trong tempdir — chống arbitrary file exec); hoặc `poc_code` nếu code ngắn |
 | nikto_scan | active | noisy | **v1.4.4:** `-maxtime` = timeout−10 (sàn 30) tự kết thúc đúng hạn; cap 180 s |
@@ -305,10 +305,15 @@ aixsec-x> q                                       → thoát
 (`/search/123.html`) hoặc chữ ký tham số lạ — tool này tự detect quote/comment style
 bằng timing, rồi trích xuất dữ liệu bằng binary search `ASCII(SUBSTRING(...))`
 (không cần sqlmap, chỉ cần `requests`). `action=detect|version|database|user|tables|dump`;
-`engine=mysql|mssql` (mssql **v1.4.5** = oracle error-based trước:
-`' AND CONVERT(int,(SELECT ...))-- -` làm giá trị lộ ra trong lỗi conversion
-500 — 0 giây chờ; không ăn mới fallback WAITFOR DELAY). Form tìm kiếm POST:
-truyền `method:'post', param:'keyword', data:'keyword=tin tuc'` (mode=form).
+`engine=mysql|mssql` (mssql **v1.4.6** = oracle error-based trước, shape
+quote-then-paren CHUẨN ground-truth: `') AND CONVERT(int,(SELECT ...))-- -`
+/ `')) AND ...` — `' AND CONVERT` trần fail vì `LIKE '%..%'` có ngoặc; lỗi
+500 conversion làm lộ giá trị — 0 giây chờ; không ăn mới fallback WAITFOR
+DELAY). Form tìm kiếm POST: truyền `method:'post', param:'keyword',
+data:'keyword=tin tuc'` (mode=form). **v1.4.6:** probe bị reset liên tiếp
+(≥2/3 status-0, ~0.02 s) ⇒ nghi WAF — dừng sau ĐÚNG 3 request oracle, in
+`sqlmap --technique=E --batch` (kèm `--form` nếu POST); `known_confirmed:true`
+bỏ lưới 9 probe khi lỗi đã xác nhận ở phiên trước.
 Extraction chậm (~10 request/ký tự) nên để `delay` vừa phải.
 
 ### SQLi fallback — khi sqlmap_check thất bại
@@ -385,6 +390,36 @@ Model 7B/9B (vd: `huihui_ai/qwen3.5-abliterated:9b`) tuân theo **ít quy tắc*
   với `break_long_words=True` làm tách `**ffuf_dir**` thành `**ff` + `uf_dir**`.
   Giờ dùng `break_long_words=False, break_on_hyphens=False` — từ dài nhảy
   trọn sang dòng tiếp theo.
+- **v1.4.6 — Sửa shape oracle MSSQL (quote-then-paren):** ground-truth
+  tbu.edu.vn cho thấy context tìm kiếm bọc LIKE trong ngoặc, nên payload
+  v1.4.5 cũ `' AND CONVERT(int,(expr))-- -` chỉ tạo lỗi syntax (oracle câm).
+  v1.4.6 probe 3 shape với quote nằm ở TIỀN TỐ — `'{inner}-- -`,
+  `'){inner}-- -`, `')){inner}-- -` với `inner = " AND CONVERT(int,({expr}))"`
+  — và giữ shape ĐẦU TIÊN bắn ra lỗi conversion 500 (shape 1 hoặc 2 trên
+  context LIKE của MSSQL). Verify end-to-end: `') AND CONVERT(int,(SELECT
+  @@VERSION))-- -` → 500 conversion → @@VERSION rút từng chunk qua
+  `SUBSTRING((x),pos,n)` với greedy-unwrap backtracking.
+- **v1.4.6 — WAF burst detection (dừng sau 3 probe, không rơi lưới 9):** hành
+  vi WAF live-run = probe bị reset status 0 trong ~0.02 s (đóng kết nối, không
+  hồi âm). Oracle `detect()` giờ đếm số lần reset trong 3 probe shape;
+  `if resets >= 2: waf_suspected = True` và DỪNG ngay sau đúng 3 request
+  oracle — KHÔNG rơi vào lưới time-based 9 probe. Report/CLI in:
+  `WAF suspected — probe bị reset (status 0)` + `sqlmap{--form} -u URL
+  --dbms=mssql --technique=E --batch`, CLI exit 1. Mock WAF-reset tái hiện
+  đúng pattern status-0 ~0.02 s.
+- **v1.4.6 — Skip `known_confirmed` (1 baseline + CONFIRMED):** khi lỗi quote
+  /time-based đã xác nhận ở phiên trước (điển hình bởi `sqli_manual_test`
+  CONFIRMED), `TimeBlindExploiter(known_confirmed=True)` bỏ lưới 9 probe
+  quote/comment — chỉ baseline rồi CONFIRMED. Kết nối: schema tool boolean
+  `known_confirmed`, cờ CLI `--known-confirmed`, và khối next-step v1.4.5 giờ
+  khâu sẵn giá trị này để model 9B không chứng minh lại lỗi đã biết. Trên mock
+  luôn-200: 1 request so với 10 khi không có cờ.
+- **v1.4.6 — Hướng dẫn sqlmap `--technique=E` (WAF thắng time-based):** khi
+  nghi WAF (hoặc toàn bộ probe status-0) agent không spam thêm payload — nó
+  in sẵn lệnh sqlmap chạy được, ép kỹ thuật error-based (`--technique=E`),
+  tự thêm `--form` khi inject là form POST. Lý do: WAF chặn probe
+  `WAITFOR`/`CONVERT` thường vẫn lộ qua payload error-based vô hại xử lý bằng
+  pipeline tamper của sqlmap.
 - **v1.4.5 — `sqli_blind_extract` form POST (method/param/data):** case live-run
   tbu.edu.vn là FORM tìm kiếm — gọi
   `sqli_blind_extract{url, action, engine:'mssql', method:'post', param:'keyword',
