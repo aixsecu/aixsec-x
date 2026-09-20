@@ -207,6 +207,12 @@ class WebXAgent:
         # _no_wapiti_json đếm lượt model trả final JSON khi wapiti chưa chạy.
         self._wapiti_done = False
         self._no_wapiti_json = 0
+        # v1.5.6: AI-NATIVE mode (WEBX_AI_NATIVE=1) — model TỰ phân tích lỗ hổng
+        # bằng http_request, KHÔNG bắt buộc wapiti/sqlmap. Gate thay thế:
+        # final JSON chỉ hợp lệ khi có ít nhất 1 http_request outcome=ok
+        # (response THẬT) trong transcript. _no_http_json đếm lượt JSON bị chặn.
+        self.ai_native = bool(self.config.get("ai_native", False))
+        self._no_http_json = 0
 
     # ─────────────────────────────────────────
     # TOOL DISPATCH (+ scope check + risk approval)
@@ -285,6 +291,7 @@ class WebXAgent:
         self._plan_only = 0  # v1.4.3: reset bộ đếm plan-only mỗi run()
         self._wapiti_done = False  # v1.5.2: reset wapiti-first gate mỗi run()
         self._no_wapiti_json = 0   # v1.5.2: reset bộ đếm JSON-thiếu-wapiti
+        self._no_http_json = 0     # v1.5.6: reset bộ đếm JSON-thiếu-http_request (AI-native)
         for rnd in range(1, max_rounds + 1):
             disp = _LiveDisplay(rnd, max_rounds)
             resp = self.chat(msgs, tools=[t.schema() for t in self.tools],
@@ -307,6 +314,20 @@ class WebXAgent:
                     # (sqli_manual_test/sqlmap_runner...) đã ok.
                     # >=2 lần liên tiếp → forced: _auto_wapiti tự chạy wapiti
                     # trước khi ép trả JSON bằng dữ liệu thật.
+                    # v1.5.6: AI-NATIVE mode (WEBX_AI_NATIVE=1) THAY THẾ gate
+                    # này — không bắt buộc wapiti; thay vào đó JSON chỉ hợp lệ
+                    # khi có ít nhất 1 http_request outcome=ok (response THẬT
+                    # do model tự thu thập và phân tích).
+                    if self.ai_native:
+                        if self._web_scope_active() and not self._http_evidence_ok():
+                            self._no_http_json += 1
+                            msgs.append({"role": "assistant", "content": result["final_text"]})
+                            msgs.append({"role": "user", "content": self._ai_native_gate_message()})
+                            if self._no_http_json >= 2:
+                                forced = True
+                                break
+                            continue
+                        return result
                     if self._web_scope_active() and not self._wapiti_done:
                         self._no_wapiti_json += 1
                         msgs.append({"role": "assistant", "content": result["final_text"]})
@@ -436,16 +457,24 @@ class WebXAgent:
         # và wapiti_scan chưa từng chạy (model bỏ qua dù prompt/gate bắt buộc)
         # thì agent TỰ gọi wapiti_scan một lần (bounded) để mọi phiên web-scope
         # đều có kết quả wapiti thật trước khi tổng hợp JSON cuối.
+        # v1.5.6: AI-NATIVE mode KHÔNG chạy auto-wapiti (không bắt buộc wapiti).
         dispatched = self._auto_wapiti(msgs)
         if dispatched:
             result["calls"] += 1
         # hết budget (hoặc dừng sớm vì round thoái hóa: toàn duplicate/blocked
         # hoặc model chỉ trả văn bản kế hoạch 2 lượt liên tiếp) — ép trả JSON
         if forced:
-            gate_note = ("PHIÊN NÀY CHƯA CHẠY WAPITI_SCAN — nếu bước tự chạy ở "
-                         "trên trả lỗi (thiếu binary/network) hoặc bị operator "
-                         "từ chối, hãy phản ánh trung thực trong JSON. "
-                         if self._no_wapiti_json >= 2 and not self._wapiti_done else "")
+            if self.ai_native:
+                gate_note = ("PHIÊN NÀY CHƯA CÓ HTTP_REQUEST THÀNH CÔNG — nếu "
+                             "bạn đã gọi http_request mà đều lỗi (network/scope/"
+                             "timeout), hãy phản ánh trung thực trong JSON. "
+                             if self._no_http_json >= 2
+                             and not self._http_evidence_ok() else "")
+            else:
+                gate_note = ("PHIÊN NÀY CHƯA CHẠY WAPITI_SCAN — nếu bước tự chạy ở "
+                             "trên trả lỗi (thiếu binary/network) hoặc bị operator "
+                             "từ chối, hãy phản ánh trung thực trong JSON. "
+                             if self._no_wapiti_json >= 2 and not self._wapiti_done else "")
             msgs.append({"role": "user", "content":
                         f"{gate_note}Vòng lặp không tiến triển: các tool gọi đều trả "
                         "duplicate/blocked, hoặc bạn chỉ trả văn bản kế hoạch "
@@ -459,13 +488,24 @@ class WebXAgent:
         # v1.5.2: hết budget mà web scope active và wapiti CHƯA chạy được
         # (auto không dispatch: deny/không URL/không spec) — cảnh báo tổng hợp
         # trung thực (không bịa), tránh JSON rỗng/UNKNOWN
-        if (not forced and self._web_scope_active() and not self._wapiti_done):
-            msgs.append({"role": "user", "content":
-                        "⚠ Lưu ý tổng hợp: phiên này WAPITI_SCAN chưa chạy được "
-                        f"và budget ({max_rounds} round) đã cạn. Không gọi tool "
-                        "nữa — trả final JSON trung thực với dữ liệu đã thu; "
-                        "nếu chưa đủ bằng chứng, risk_level=UNKNOWN là kết quả "
-                        "trung thực (đừng bịa dữ liệu scan)."})
+        # v1.5.6: AI-native dùng điều kiện tương đương — chưa có http_request ok.
+        if not forced and self._web_scope_active():
+            if self.ai_native:
+                if not self._http_evidence_ok():
+                    msgs.append({"role": "user", "content":
+                                "⚠ Lưu ý tổng hợp: phiên này CHƯA CÓ HTTP_REQUEST "
+                                "THÀNH CÔNG nào "
+                                f"và budget ({max_rounds} round) đã cạn. Không gọi "
+                                "tool nữa — trả final JSON trung thực với dữ liệu "
+                                "đã thu; nếu chưa đủ bằng chứng, risk_level=UNKNOWN "
+                                "là kết quả trung thực (đừng bịa dữ liệu scan)."})
+            elif not self._wapiti_done:
+                msgs.append({"role": "user", "content":
+                            "⚠ Lưu ý tổng hợp: phiên này WAPITI_SCAN chưa chạy được "
+                            f"và budget ({max_rounds} round) đã cạn. Không gọi tool "
+                            "nữa — trả final JSON trung thực với dữ liệu đã thu; "
+                            "nếu chưa đủ bằng chứng, risk_level=UNKNOWN là kết quả "
+                            "trung thực (đừng bịa dữ liệu scan)."})
         disp = _LiveDisplay(0 if forced else max_rounds, max_rounds)
         resp = self.chat(msgs, tools=[t.schema() for t in self.tools], json_mode=True,
                          on_token=disp.on_token, on_reasoning=disp.on_reasoning)
@@ -552,6 +592,37 @@ class WebXAgent:
                 "file/exec. Chỉ sau khi tool trả kết quả (kể cả lỗi) lượt sau "
                 "mới được trả final JSON." + hint)
 
+    def _http_evidence_ok(self) -> bool:
+        """v1.5.6: AI-NATIVE mode — có ít nhất 1 http_request outcome=ok trong
+        transcript (response THẬT do model tự thu thập) thì final JSON có cơ sở
+        bằng chứng. Chỉ đếm outcome=ok (error/denied/blocked/duplicate không
+        phải response thật)."""
+        for entry in self.transcript:
+            for r in entry.get("calls", []):
+                if (r.get("name") == "http_request"
+                        and r.get("outcome") == "ok"):
+                    return True
+        return False
+
+    def _ai_native_gate_message(self) -> str:
+        """v1.5.6: thông báo từ chối final JSON trong AI-NATIVE mode — KHÔNG
+        bắt buộc wapiti/sqlmap; bắt buộc ít nhất 1 http_request outcome=ok
+        (response thật) trước khi tổng hợp findings."""
+        url = self._active_gate_url() or "<URL-trong-scope>"
+        return ("Bản tổng hợp JSON của bạn CHƯA HỢP LỆ: phiên này đang chạy "
+                "chế độ AI-NATIVE (WEBX_AI_NATIVE=1) — KHÔNG bắt buộc "
+                "wapiti_scan/sqlmap_runner, nhưng MỌI finding phải dựa trên "
+                "response HTTP THẬT do chính bạn thu thập qua tool http_request. "
+                "Hiện chưa có http_request nào outcome=ok trong phiên. Bắt buộc "
+                "lượt này gọi function call http_request với "
+                f"{{\"method\": \"get\", \"url\": "
+                f"{json.dumps(url, ensure_ascii=False)}}} "
+                "(hoặc post kèm body) để lấy response thật, TỰ phân tích "
+                "(quote-differential, error-based, timing, XSS reflection, SSTI, "
+                "path traversal...) rồi mới tổng hợp JSON. Chỉ sau khi có ít "
+                "nhất 1 response http_request thật, lượt sau mới được trả "
+                "final JSON.")
+
     def _auto_wapiti(self, msgs: list) -> bool:
         """v1.5.2 (Bug 3): tự chạy wapiti_scan khi vòng lặp kết thúc mà web
         scope active và wapiti_scan CHƯA chạy (outcome ok/error) trong phiên —
@@ -561,8 +632,14 @@ class WebXAgent:
         Result ghi vào transcript (round=0, auto=True), _call_cache và được đẩy
         vào [TOOL RESULTS] để final round tổng hợp bằng dữ liệu THẬT (kể cả lỗi).
 
+        v1.5.6: AI-NATIVE mode (WEBX_AI_NATIVE=1) KHÔNG chạy auto-wapiti —
+        model tự phân tích bằng http_request, wapiti không bắt buộc.
+
         Return True nếu đã dispatch (mọi outcome kể cả denied/error), False khi
-        không có điều kiện (scope không phải web, đã chạy, thiếu spec/URL)."""
+        không có điều kiện (scope không phải web, đã chạy, AI-native, thiếu
+        spec/URL)."""
+        if self.ai_native:
+            return False
         if not self._web_scope_active() or self._wapiti_done:
             return False
         spec = TOOL_INDEX.get("wapiti_scan")

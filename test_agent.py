@@ -3163,5 +3163,323 @@ class TestWapitiFormSweep(unittest.TestCase):
         sm.assert_not_called()
 
 
+# ─────────────────────────────────────────────
+# v1.5.6: tool http_request (Python-native, bounded) + AI-NATIVE mode
+# (WEBX_AI_NATIVE=1) — model TỰ phân tích lỗ hổng qua http_request,
+# KHÔNG bắt buộc wapiti/sqlmap.
+# ─────────────────────────────────────────────
+
+class EchoHttpHandler(BaseHTTPRequestHandler):
+    """Echo server cho _http_request: GET trả path, POST phản ánh body,
+    /slow ngủ 2s (kiểm tra timeout floor)."""
+
+    def do_GET(self):
+        if self.path.startswith("/slow"):
+            time.sleep(2)
+        body = f"<html>echo path={self.path}</html>".encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html")
+        self.send_header("X-Test-Header", "yes")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_POST(self):
+        length = int(self.headers.get("Content-Length") or 0)
+        data = self.rfile.read(length)
+        body = f"posted:{data.decode(errors='replace')}".encode()
+        self.send_response(201)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, *args):
+        pass
+
+
+class TestHttpRequestTool(unittest.TestCase):
+    """v1.5.6: tool http_request (Python-native, bounded) — test trực tiếp hàm
+    _http_request trên mock server localhost (không cần binary ngoài)."""
+
+    server = None
+
+    @classmethod
+    def setUpClass(cls):
+        cls.server = ThreadingHTTPServer(("127.0.0.1", 0), EchoHttpHandler)
+        cls.port = cls.server.server_address[1]
+        cls.thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
+        cls.thread.start()
+
+    @classmethod
+    def tearDownClass(cls):
+        if cls.server:
+            cls.server.shutdown()
+            cls.server.server_close()
+
+    def _url(self, path="/"):
+        return f"http://127.0.0.1:{self.port}{path}"
+
+    def test_get_returns_status_headers_snippet(self):
+        from tools import _http_request
+        out = _http_request(url=self._url("/product.php?id=1"), method="get")
+        self.assertIn(f"GET {self._url('/product.php?id=1')} → 200", out)
+        self.assertIn("X-Test-Header: yes", out)
+        self.assertIn("body_snippet:", out)
+        self.assertIn("echo path=/product.php?id=1", out)
+
+    def test_post_reflects_body(self):
+        from tools import _http_request
+        out = _http_request(url=self._url("/login"), method="post",
+                            body="user=admin&pass=123")
+        self.assertIn("POST", out)
+        self.assertIn("→ 201", out)
+        self.assertIn("posted:user=admin&pass=123", out)
+
+    def test_invalid_method_rejected(self):
+        from tools import _http_request
+        out = _http_request(url=self._url("/"), method="trace")
+        self.assertTrue(out.startswith(
+            "[!] http_request: method phải là get|post|head|put|options"))
+
+    def test_connection_refused_reported(self):
+        from tools import _http_request
+        import socket
+        s = socket.socket()
+        s.bind(("127.0.0.1", 0))
+        port = s.getsockname()[1]
+        s.close()  # port vừa đóng → connection refused
+        out = _http_request(url=f"http://127.0.0.1:{port}/", method="get")
+        self.assertTrue(out.startswith("[!] http_request: không kết nối được"))
+
+    def test_timeout_capped_at_30(self):
+        from tools import _http_request
+        captured = {}
+
+        class FakeResp:
+            status_code = 200
+            headers = {"Content-Type": "text/plain"}
+            text = "ok"
+            content = b"ok"
+
+        def fake_get(url, headers=None, timeout=None, allow_redirects=None):
+            captured["timeout"] = timeout
+            return FakeResp()
+
+        with patch("requests.get", side_effect=fake_get):
+            out = _http_request(url="http://127.0.0.1:1/", _timeout=999)
+        self.assertEqual(captured["timeout"], 30)  # cap 30s
+        self.assertIn("200", out)
+
+    def test_timeout_floor_at_5(self):
+        from tools import _http_request
+        captured = {}
+
+        class FakeResp:
+            status_code = 200
+            headers = {}
+            text = "ok"
+            content = b"ok"
+
+        def fake_get(url, headers=None, timeout=None, allow_redirects=None):
+            captured["timeout"] = timeout
+            return FakeResp()
+
+        with patch("requests.get", side_effect=fake_get):
+            out = _http_request(url="http://127.0.0.1:1/", _timeout=1)
+        self.assertEqual(captured["timeout"], 5)  # floor 5s
+        self.assertIn("200", out)
+
+    def test_registered_in_registry_with_scope_and_risk(self):
+        from tools import TOOL_INDEX
+        spec = TOOL_INDEX["http_request"]
+        self.assertEqual(spec.risk, "active")
+        self.assertIn("url", spec.scope_params)
+        params = spec.schema()["function"]["parameters"]
+        self.assertEqual(params["required"], ["url"])
+        self.assertEqual(params["properties"]["method"]["enum"],
+                         ["get", "post", "head", "put", "options"])
+
+    def test_out_of_scope_rejected_via_dispatch(self):
+        a = WebXAgent(config=cfg(), chat=FakeChat())
+        res = a._dispatch("http_request", {"url": "https://evil.org/"})
+        self.assertEqual(res["outcome"], "scope_rejected")
+
+
+class TestAiNativeGate(unittest.TestCase):
+    """v1.5.6: AI-NATIVE mode (WEBX_AI_NATIVE=1) — final JSON chỉ hợp lệ khi
+    có ít nhất 1 http_request outcome=ok (response THẬT do model tự thu thập).
+    KHÔNG bắt buộc wapiti/sqlmap; _auto_wapiti bị vô hiệu hóa."""
+
+    def setUp(self):
+        from tools import TOOL_INDEX
+        self._orig_wapiti_exec = TOOL_INDEX["wapiti_scan"].exec_fn
+        self._orig_http_exec = TOOL_INDEX["http_request"].exec_fn
+        TOOL_INDEX["wapiti_scan"].exec_fn = _wapiti_test_stub
+        TOOL_INDEX["http_request"].exec_fn = lambda **kw: "GET ok: 200 (stub)"
+
+    def tearDown(self):
+        from tools import TOOL_INDEX
+        TOOL_INDEX["wapiti_scan"].exec_fn = self._orig_wapiti_exec
+        TOOL_INDEX["http_request"].exec_fn = self._orig_http_exec
+
+    def _agent(self, script=None, extra=None):
+        extra = dict(extra or {})
+        extra.setdefault("ai_native", True)
+        return WebXAgent(config=cfg(extra), chat=FakeChat(script=script))
+
+    def test_json_after_recon_rejected_then_http_ok_accepted(self):
+        from tools import TOOL_INDEX
+        script = [
+            {"content": "", "tool_calls": [
+                {"name": "http_probe", "arguments": {"url": "https://abc.vn/"}}]},
+            {"content": FINAL_JSON, "tool_calls": []},
+            {"content": "", "tool_calls": [
+                {"name": "http_request", "arguments": {
+                    "method": "get", "url": "https://abc.vn/"}}]},
+        ]
+        with patch.object(TOOL_INDEX["http_probe"], "exec_fn",
+                          lambda **kw: "status 200 (stub)"):
+            a = self._agent(script=script)
+            res = a.run("test")
+        # gate chặn đúng 1 lần; sau khi http_request ok JSON được chấp nhận
+        self.assertEqual(a._no_http_json, 1)
+        self.assertTrue(a._http_evidence_ok())
+        self.assertEqual(len(a.chat.calls), 4)
+        self.assertFalse(a.chat.calls[3]["json_mode"])   # không forced
+        gate = [m for m in a.chat.calls[1]["messages"] if m.get("role") == "user"]
+        self.assertTrue(any("http_request" in str(m.get("content", "")) for m in gate))
+        self.assertFalse(a._wapiti_done)   # wapiti KHÔNG bắt buộc trong AI-native
+        self.assertEqual(res["calls"], 2)
+        self.assertEqual(res["risk_level"], "HIGH")
+        self.assertEqual(len(a.ledger.all()), 2)
+
+    def test_http_ok_then_json_accepted_immediately(self):
+        script = [
+            {"content": "", "tool_calls": [
+                {"name": "http_request", "arguments": {
+                    "method": "get", "url": "https://abc.vn/"}}]},
+            {"content": FINAL_JSON, "tool_calls": []},
+        ]
+        a = self._agent(script=script)
+        res = a.run("test")
+        self.assertEqual(len(a.chat.calls), 2)
+        self.assertEqual(a._no_http_json, 0)
+        self.assertFalse(a.chat.calls[1]["json_mode"])
+        self.assertEqual(res["calls"], 1)
+        self.assertEqual(res["risk_level"], "HIGH")
+
+    def test_http_error_does_not_unlock_gate(self):
+        from tools import TOOL_INDEX
+        script = [
+            {"content": "", "tool_calls": [
+                {"name": "http_request", "arguments": {
+                    "method": "get", "url": "https://abc.vn/"}}]},
+            {"content": FINAL_JSON, "tool_calls": []},
+            {"content": "", "tool_calls": [
+                {"name": "http_request", "arguments": {
+                    "method": "get", "url": "https://abc.vn/product.php"}}]},
+        ]
+        with patch.object(TOOL_INDEX["http_request"], "exec_fn",
+                          side_effect=["[!] http_request: không kết nối được",
+                                       "GET ok: 200 (stub)"]):
+            a = self._agent(script=script)
+            res = a.run("test")
+        self.assertEqual(a._no_http_json, 1)   # JSON lần 1 (chưa có http ok)
+        gate = [m for m in a.chat.calls[1]["messages"] if m.get("role") == "user"]
+        self.assertTrue(any("http_request" in str(m.get("content", "")) for m in gate))
+        self.assertFalse(a.chat.calls[1]["json_mode"])
+        self.assertTrue(a._http_evidence_ok())
+        self.assertEqual(res["calls"], 2)
+        self.assertEqual(res["risk_level"], "HIGH")
+
+    def test_two_rejected_jsons_force_final_no_auto_wapiti(self):
+        a = self._agent(script=[{"content": FINAL_JSON, "tool_calls": []}])
+        res = a.run("test")
+        self.assertEqual(len(a.chat.calls), 3)
+        self.assertTrue(a.chat.calls[2]["json_mode"])      # forced json_mode
+        self.assertEqual(a._no_http_json, 2)               # cả 2 JSON đều bị chặn
+        self.assertFalse(a._wapiti_done)  # auto-wapiti KHÔNG chạy (AI-native)
+        forced = [m for m in a.chat.calls[2]["messages"] if m.get("role") == "user"]
+        self.assertTrue(any("Vòng lặp không tiến triển" in str(m.get("content", ""))
+                            for m in forced))
+        self.assertEqual(res["calls"], 0)     # không auto wapiti ở tail
+        self.assertEqual(res["risk_level"], "HIGH")
+        self.assertEqual(len(a.ledger.all()), 2)
+        # transcript KHÔNG có entry auto (không wapiti tự chạy)
+        auto = [t for t in a.transcript if t.get("auto")]
+        self.assertEqual(len(auto), 0)
+        # gate_note AI-native: chưa có http_request thành công
+        user_msgs = [str(m.get("content", "")) for m in a.chat.calls[2]["messages"]
+                     if m.get("role") == "user"]
+        self.assertTrue(any("HTTP_REQUEST THÀNH CÔNG" in u for u in user_msgs))
+
+    def test_auto_wapiti_disabled_in_ai_native(self):
+        a = self._agent(script=[])
+        self.assertTrue(a._web_scope_active())   # web scope đang active
+        self.assertFalse(a._auto_wapiti([]))    # nhưng auto-wapiti bị tắt
+
+    def test_gate_skipped_for_src_only_scope(self):
+        a = self._agent(script=[{"content": FINAL_JSON, "tool_calls": []}],
+                        extra={"targets": []})
+        res = a.run("test")
+        self.assertEqual(len(a.chat.calls), 1)
+        self.assertFalse(a.chat.calls[0]["json_mode"])
+        self.assertEqual(a._no_http_json, 0)
+        user_msgs = [str(m.get("content", "")) for m in a.chat.calls[0]["messages"]
+                     if m.get("role") == "user"]
+        self.assertNotIn("http_request", " ".join(user_msgs))
+        self.assertEqual(res["calls"], 0)
+        self.assertEqual(res["risk_level"], "HIGH")
+
+
+class TestPromptAiNative(unittest.TestCase):
+    """v1.5.6: build_system_prompt nối _AI_NATIVE_RULES khi ai_native=True."""
+
+    def test_ai_native_rules_appended(self):
+        p = build_system_prompt(cfg({"ai_native": True}))
+        self.assertIn("CHẾ ĐỘ AI-NATIVE", p)
+        self.assertIn("http_request", p)
+        self.assertIn("SSTI/template", p)
+
+    def test_no_ai_native_rules_by_default(self):
+        p = build_system_prompt(cfg())
+        self.assertNotIn("CHẾ ĐỘ AI-NATIVE", p)
+        self.assertNotIn("http_request", p)
+
+
+class TestLedgerHttpRequestEvidence(unittest.TestCase):
+    """v1.5.6: http_request outcome=ok được tính là probe evidence — finding
+    trên host chỉ thấy qua http_request KHÔNG bị gắn cờ 'chưa probe thật'."""
+
+    def test_http_request_counts_as_probe_evidence(self):
+        history = [
+            {"name": "http_request", "outcome": "ok",
+             "args": {"method": "get", "url": "https://abc.vn/product.php"},
+             "output": "GET https://abc.vn/product.php → 200 (1234 bytes, 0.3s)\n"
+                       "headers:\n  Content-Type: text/html\nbody_snippet:\n"
+                       "<html>product page id=1</html>"},
+        ]
+        fs = parse_findings_json(FINAL_JSON)
+        flagged = check_findings_evidence(fs, history)
+        self.assertEqual(flagged, 0)
+        for f in fs:
+            self.assertEqual(f.evidence_gaps, [])
+
+    def test_http_request_error_not_evidence(self):
+        # outcome=error KHÔNG phải response thật → host vẫn bị gắn cờ thiếu
+        # tool output OK (không có cơ sở bằng chứng)
+        history = [
+            {"name": "http_request", "outcome": "error",
+             "args": {"method": "get", "url": "https://abc.vn/product.php"},
+             "output": "[!] http_request: không kết nối được"},
+        ]
+        fs = parse_findings_json(FINAL_JSON)
+        flagged = check_findings_evidence(fs, history)
+        self.assertEqual(flagged, 2)
+        for f in fs:
+            self.assertTrue(any("không có tool output OK nào" in g
+                                for g in f.evidence_gaps))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

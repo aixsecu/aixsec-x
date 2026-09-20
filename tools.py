@@ -11,6 +11,7 @@ import os
 import re
 import shutil
 import subprocess
+import time
 from dataclasses import dataclass, field
 
 
@@ -149,6 +150,56 @@ def _http_probe(**kw):
         return f"[!] Không kết nối được: {e}"
     except requests.exceptions.Timeout:
         return "[!] Timeout HTTP"
+
+
+def _http_request(**kw):
+    """v1.5.6: AI-native primitive — gửi request HTTP tùy ý (method/headers/body)
+    và trả response THẬT (status, headers, body snippet, thời gian) để model TỰ
+    phân tích lỗ hổng (quote-differential, error-based, timing, XSS reflection,
+    SSTI, path traversal...) KHÔNG cần tool chuyên dụng hay binary ngoài.
+    Bounded: timeout ≤30s, body snippet ≤2000 ký tự, headers đầy đủ."""
+    import requests
+    url = kw["url"]
+    method = str(kw.get("method") or "get").lower().strip()
+    if method not in ("get", "post", "head", "put", "options"):
+        return (f"[!] http_request: method phải là get|post|head|put|options "
+                f"(nhận '{method}').")
+    headers = dict(kw.get("headers") or {})
+    headers.setdefault("User-Agent",
+                       "Mozilla/5.0 (X11; Linux x86_64) Firefox/120.0")
+    body = str(kw.get("body") or kw.get("data") or "")
+    follow = bool(kw.get("follow_redirects", True))
+    timeout = min(max(5, int(kw.get("_timeout") or 30)), 30)
+    try:
+        t0 = time.time()
+        if method == "get":
+            r = requests.get(url, headers=headers, timeout=timeout,
+                             allow_redirects=follow)
+        elif method == "head":
+            r = requests.head(url, headers=headers, timeout=timeout,
+                              allow_redirects=follow)
+        elif method == "options":
+            r = requests.options(url, headers=headers, timeout=timeout,
+                                  allow_redirects=follow)
+        elif method == "put":
+            r = requests.put(url, data=body, headers=headers, timeout=timeout,
+                             allow_redirects=follow)
+        else:  # post
+            r = requests.post(url, data=body, headers=headers, timeout=timeout,
+                              allow_redirects=follow)
+        dt = round(time.time() - t0, 2)
+        hdrs = {k: v for k, v in r.headers.items()}
+        body_snip = re.sub(r"\s+", " ", (r.text or ""))[:2000]
+        return (f"{method.upper()} {url} → {r.status_code} "
+                f"({len(r.content)} bytes, {dt}s)\n"
+                f"headers:\n" + "\n".join(f"  {k}: {v}" for k, v in hdrs.items())
+                + f"\nbody_snippet:\n{body_snip}")
+    except requests.exceptions.ConnectionError as e:
+        return f"[!] http_request: không kết nối được: {e}"
+    except requests.exceptions.Timeout:
+        return "[!] http_request: timeout HTTP"
+    except requests.exceptions.RequestException as e:
+        return f"[!] http_request: lỗi request: {e}"
 
 
 def _dns_lookup(**kw):
@@ -1779,6 +1830,28 @@ TOOL_REGISTRY: list[ToolSpec] = [
     ToolSpec("http_probe", "GET một URL: trả status code, headers chọn lọc, snippet body.",
              {"type": "object", "properties": {"url": {"type": "string", "pattern": "^https?://"}},
               "required": ["url"]}, _http_probe, risk="safe"),
+    # v1.5.6: AI-native primitive — model TỰ gửi payload và TỰ phân tích response
+    ToolSpec("http_request",
+             "Gửi request HTTP tùy ý (method/headers/body) và trả response THẬT: "
+             "status, headers, body snippet, thời gian. Dùng để TỰ phân tích lỗ hổng "
+             "(quote-differential, error-based, timing, XSS reflection, SSTI, path "
+             "traversal...) — không cần tool chuyên dụng hay binary ngoài. "
+             "method=get|post|head|put|options (mặc định get); body cho post/put; "
+             "headers dict tùy chọn; follow_redirects mặc định true. "
+             "MỌI finding phải dựa trên ít nhất 1 response http_request thật.",
+             {"type": "object",
+              "properties": {
+                  "url": {"type": "string", "pattern": "^https?://"},
+                  "method": {"type": "string", "enum": ["get", "post", "head", "put", "options"],
+                              "description": "get (mặc định), post, head, put, options"},
+                  "headers": {"type": "object",
+                               "description": "Headers tùy chọn (dict, vd {'X-Custom': '1'})"},
+                  "body": {"type": "string",
+                            "description": "Body cho post/put (form-encoded hoặc raw)"},
+                  "follow_redirects": {"type": "boolean",
+                                        "description": "Theo redirect (mặc định true)"}},
+              "required": ["url"]},
+             _http_request, risk="active"),
     ToolSpec("dns_lookup", "Tra cứu DNS A records của domain.",
              {"type": "object", "properties": {"host": {"type": "string"}},
               "required": ["host"]}, _dns_lookup, risk="safe"),
