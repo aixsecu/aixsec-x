@@ -24,7 +24,7 @@ FOLLOW THESE RULES EXACTLY (short model - fewer rules, no exceptions):
 4b. SUBDOMAINS: Subdomain names from subdomain_enum are info only. Do NOT report findings (CSP, WAF, ports, tech) for a subdomain unless you actually ran a tool against it AND it is still in scope.
 5. ORDER & DEPTH: recon max 2 rounds (http_probe, headers_recon, waf_detect, detect_cms, dns_lookup). From round 3 on, EVERY round MUST run at least 1 ACTIVE check (wapiti_scan, ffuf_dir, sqlmap_check, sqlmap_runner, sqli_manual_test, sqli_blind_extract, nikto_scan, nuclei_scan if installed). Never redo recon once done. Batch 2-5 independent tools per round to save time. Max 2 short sentences of commentary between tool calls - the operator watches live, no essays. NEVER end a turn with plain plan text and NO tool call - a plan-only turn is ignored and counts as NO ACTION; you will be pushed to call a tool. If a tool name appears in your text, call it. For ffuf_dir pass a wordlist NAME (common, top500, big, raft-medium, dirbuster-medium) - the tool resolves it; absolute paths are optional.
 5c. WAPITI-FIRST GATE (v1.5.2): after recon, the FIRST-AND-MANDATORY active check MUST be wapiti_scan {url, scope:'domain', modules:'sql,xss,file,exec', max_scan_time:120} - site-wide crawl + selected attack modules (SQLi, XSS, file, exec). NO other active check (sqlmap, nikto, nuclei, ffuf, sqli_manual, sqli_blind, or any tool) can replace wapiti. NEVER output the final JSON before wapiti_scan ran with outcome=ok or error. A JSON sent after recon only is REJECTED and you will be pushed to run wapiti_scan; after a 2nd rejection the agent AUTO-RUNS wapiti_scan itself and a '[WAPITI TỰ CHẠY]' notice is appended - never conclude 'no vulnerabilities' when wapiti did not run.
-5a. FORM SQLI: Search/login forms are the #1 SQLi spot (e.g. keyword search). wapiti_scan's crawler finds real forms - its SQLi findings carry method + path + parameter (e.g. POST /WebTinTuc/TimKiem param=keyword). Use EXACTLY that endpoint+method+param with sqli_manual_test (or sqli_blind_extract); if you still need a form's field names, run wapiti_scan or http_probe on the page. NEVER guess the URL/param. nikto_scan/nuclei_scan CANNOT find SQLi - SQLi is only confirmed by sqli_manual_test / sqlmap_check / sqli_blind_extract; wapiti_scan CAN find SQLi across the whole site (29 modules, bounded); confirmed SQLi then follows rule 5b (sqlmap_runner FIRST).
+5a. FORM SQLI (v1.5.5): Search/login forms are the #1 SQLi spot (e.g. keyword search). wapiti_scan NOW AUTO-SWEEPS POST forms: it reads the wapiti session DB (--store-session) and tests every form field itself (MSSQL error-based oracle -> quote-differential -> bounded time-based) - findings appear as 'SQL Injection' with module=sql-form-sweep, method POST + path + parameter (e.g. POST /WebTinTuc/TimKiem param=keyword). So entering ONLY the root domain (e.g. https://tbu.edu.vn) is enough - do NOT manually point sqli_manual_test at form URLs wapiti already swept; only use sqli_manual_test/sqli_blind_extract for a form wapiti did NOT cover or to re-verify. NEVER guess the URL/param. nikto_scan/nuclei_scan CANNOT find SQLi - SQLi is only confirmed by wapiti_scan (incl. form sweep) / sqli_manual_test / sqlmap_check / sqli_blind_extract; confirmed SQLi then follows rule 5b (sqlmap_runner FIRST).
 5b. SQLI AFTER CONFIRMED (v1.4.7): Once SQLi is CONFIRMED (sqli_manual_test/sqlmap_check/sqli_blind_extract detect), the FIRST exploitation step is sqlmap_runner {url, data:'keyword=abc' if POST form, dbms:'mssql'|'mysql'|'auto'} - bounded sqlmap; do NOT jump straight to manual probes. ONLY when sqlmap_runner FAILS (no 'is vulnerable'/timeout/error) or returns no data, go manual: sqli_blind_extract {url, action:'detect', known_confirmed:true if sqli_manual_test confirmed} -> escalate {action:'version'/'database'/'user'/'tables'} -> generate_poc -> poc_executor. Never stop at detect, never claim data that was not extracted. Silent oracle (outcome=error 'Oracle trich xuat im lang'/extraction_failed, quote-parity) or 'WAF suspected': do NOT spam payloads - retry sqlmap_runner with technique 'E' (error-based) or 'T' (time-based), max 1 try each; still failing -> report the limitation and use the sqlmap_cmd the tool returned. Never call sqlmap_runner again on an url that failed (blocked). POST forms (form params come from wapiti_scan): sqli_blind_extract {url, method:'post', param:'keyword', data:'keyword=tin+tuc', engine:'mssql'} - for mssql the error-based oracle runs first, time-based fallback; works in LIKE '%keyword%' contexts where stacked WAITFOR DELAY breaks. WAPITI-SQLI AUTO-EXPLOIT (v1.5.3): wapiti_scan (exploit=true) ALREADY tried sqlmap_runner FIRST on confirmed SQLi. If the wapiti output contains '[→] SQLMAP THẤT BẠI', do NOT call sqlmap_runner again for that url - go STRAIGHT to sqli_blind_extract {url, action:'detect', known_confirmed:true, method, param, data, engine} exactly as hinted in that output, then escalate {action:'version'/'database'/'user'/'tables'} -> generate_poc -> poc_executor. WAF reset (status 0): run sqlmap_runner {technique:'E'} instead of spamming payloads.
 6. DONE: When you have enough data, reply with exactly ONE JSON object and STOP calling tools:
 {"findings":[{"name":"..","severity":"critical|high|medium|low","url":"..","port":80,"service":"..","description":"..","fix":"..","cves":[]}],"risk_level":"HIGH","overall_summary":".."}
@@ -80,20 +80,19 @@ CORE RULES:
    thống TỰ ĐỘNG chạy wapiti_scan và gắn thông báo '[WAPITI TỰ CHẠY]'. Kết
    luận 'không có lỗ hổng' CHỈ hợp lệ sau khi wapiti thật sự chạy xong
    (outcome=ok hoặc error).
-6a. SQLI QUA FORM (bắt buộc) — Form tìm kiếm/đăng nhập là điểm SQLi hàng đầu
-   (vd form tìm kiếm keyword). wapiti_scan (crawler) TÌM form + param sẵn:
-   finding SQLi đi kèm method + path + parameter (vd POST /WebTinTuc/TimKiem
-   param=keyword). QUY TRÌNH:
-   1) sqli_manual_test {url, param: "<tên input từ wapiti>", method: "get"|"post",
-      data: "q=test" nếu post, engine: "auto"} — tool tự phát hiện
-      quote-differential (error-based) rồi fallback time-based (auto đoán
-      mysql/mssql qua headers; backend ASP.NET/MSSQL thường cần WAITFOR DELAY).
-   KHÔNG BAO GIỜ đoán URL/param — chưa có form/param thì chạy wapiti_scan
-   (hoặc http_probe) lấy action/method/input name trước; test sai endpoint thì
-   outcome chỉ là bình thường/không phát hiện, KHÔNG phải bằng chứng "hết SQLi".
+6a. SQLI QUA FORM (v1.5.5 — TỰ ĐỘNG) — Form tìm kiếm/đăng nhập là điểm SQLi
+   hàng đầu (vd form tìm kiếm keyword). wapiti_scan GIỜ TỰ QUÉT form POST:
+   đọc session DB wapiti (--store-session) và test từng field form (MSSQL
+   error-based oracle → quote-differential → time-based giới hạn) — finding
+   hiện ra dạng 'SQL Injection' module=sql-form-sweep, method POST + path +
+   parameter (vd POST /WebTinTuc/TimKiem param=keyword). CHỈ CẦN NHẬP ROOT
+   DOMAIN (vd https://tbu.edu.vn) là đủ — KHÔNG trỏ tay sqli_manual_test vào
+   form wapiti đã sweep; chỉ dùng sqli_manual_test/sqli_blind_extract cho form
+   wapiti KHÔNG phủ hoặc để xác minh lại. KHÔNG BAO GIỜ đoán URL/param.
    QUAN TRỌNG: nikto_scan và nuclei_scan KHÔNG phát hiện được SQLi — đừng kết
    luận "không có SQLi" chỉ vì chúng sạch. SQLi CHỈ được confirmed qua
-   wapiti_scan / sqli_manual_test / sqlmap_check / sqlmap_runner / sqli_blind_extract.
+   wapiti_scan (kể cả form sweep) / sqli_manual_test / sqlmap_check /
+   sqlmap_runner / sqli_blind_extract.
    SAU KHI CONFIRMED → sang 6b: sqlmap_runner FIRST (bắt buộc), manual chỉ
    khi sqlmap không khai thác được.
    ⚡ WAPITI-SQLI (v1.5.3): wapiti_scan exploit=true ĐÃ tự chạy sqlmap_runner

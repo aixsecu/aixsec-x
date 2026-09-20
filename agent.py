@@ -33,7 +33,7 @@ from tools import (TOOL_REGISTRY, TOOL_INDEX, TOOL_BINS, TOOL_TIMEOUTS,
                    LONG_RUN_TOOLS, available_tools)
 
 # ── terminal colors (AIXSEC-X style) ──
-VERSION = "1.5.4"
+VERSION = "1.5.5"
 
 # v1.5.2: wapiti-first gate — web scope active mà wapiti_scan CHƯA chạy
 # (chưa có outcome=ok/error) thì final JSON bị từ chối và model bị ép gọi

