@@ -2335,5 +2335,57 @@ class TestOracleSilentOutcome(unittest.TestCase):
         self.assertIn("sqlmap", res["output"])
 
 
+class TestBannerUpdate(unittest.TestCase):
+    """v1.4.8: màn hình khởi động kiểu hacker — skull đỏ + logo xanh + status
+    block đóng khung. plain (color=False) KHÔNG chứa ANSI; color=True có ANSI
+    + nền đen; model/scope/auto_exec/missing tools vẫn hiện đủ như bản cũ"""
+
+    _CFG = cfg({"targets": ["https://tbu.edu.vn"], "model": "m-test",
+                "auto_exec": "ask"})
+
+    def _banner(self, **kw):
+        from agent import _banner
+        d = dict(cfg=self._CFG, scope="https://tbu.edu.vn", color=False)
+        d.update(kw)
+        return _banner(**d)
+
+    def test_plain_contains_core_info(self):
+        b = self._banner()
+        self.assertIn("AIXSEC-X", b)
+        self.assertIn("1.4.8", b)
+        self.assertIn("m-test", b)
+        self.assertIn("https://tbu.edu.vn", b)
+        self.assertIn("ask", b)
+        self.assertIn("q quit", b)
+
+    def test_plain_has_no_ansi(self):
+        self.assertNotIn("\x1b[", self._banner())
+
+    def test_color_has_ansi_and_black_bg(self):
+        b = self._banner(color=True)
+        self.assertIn("\x1b[", b)
+        self.assertIn("\x1b[40m", b)  # nền đen hacker-style
+
+    def test_skull_and_logo_present(self):
+        b = self._banner()
+        self.assertIn('.--""--.', b)  # skull ASCII
+        self.assertIn("█████╗", b)    # logo AIXSEC-X
+
+    def test_missing_tools_listed(self):
+        b = self._banner(missing={"nuclei_scan": "nuclei"})
+        self.assertIn("missing", b)
+        self.assertIn("nuclei", b)
+
+    def test_batch_mode_label(self):
+        self.assertIn("batch", self._banner(mode="batch"))
+
+    def test_print_banner_runs(self):
+        from agent import _print_banner
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            _print_banner(self._CFG, scope="https://tbu.edu.vn")
+        self.assertIn("AIXSEC-X", out.getvalue())
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

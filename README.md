@@ -268,12 +268,12 @@ broken tools. If you see repeated `error`/`blocked` for `nuclei_scan` or
 ### Interactive commands
 
 ```
-aixsec-x> Analyze https://example.com               → agent calls tools and concludes
-aixsec-x> Run nuclei severity high                  → attack the target
-aixsec-x> /findings                                 → view ledger (candidate/confirmed/ruled_out)
-aixsec-x> /report                                   → export markdown report
-aixsec-x> !! nmap -p- 10.0.0.5                      → run a shell command directly (at your own risk)
-aixsec-x> q                                         → quit
+root@aixsec-x:~# Analyze https://example.com                   → agent calls tools and concludes
+root@aixsec-x:~# Run nuclei severity high                      → attack the target
+root@aixsec-x:~# /findings                                     → view ledger (candidate/confirmed/ruled_out)
+root@aixsec-x:~# /report                                       → export markdown report
+root@aixsec-x:~# !! nmap -p- 10.0.0.5                          → run a shell command directly (at your own risk)
+root@aixsec-x:~# q                                             → quit
 ```
 
 ## Safety mechanisms (what makes it different from METATRON)
@@ -432,6 +432,17 @@ better than long prompts. `prompts.py` ships 2 variants with auto-selection:
   `break_long_words=True`, splitting `**ffuf_dir**` across a wrap boundary as
   `**ff` / `uf_dir**`. Now `break_long_words=False, break_on_hyphens=False` —
   long words jump to the next line whole.
+- **v1.4.8 hacker-style startup banner:** boot screen restyled — red ASCII
+  skull + green AIXSEC logo inside a full `┌─┐` frame, status rows
+  `[>] model / scope / auto-exec / host / session / modules` fed by real
+  runtime facts (platform node/release, Python version, timestamp, PID,
+  `available_tools()` count), `⚠ missing: tool(binary)` row when a
+  binary-backed tool is absent, and hint row `q quit | !! <cmd> shell |
+  /findings ledger | /report export`. ANSI color auto-detected: enabled only
+  on a TTY with NO_COLOR unset — batch/pipe/redirect output stays plain;
+  padding is computed on visible width so the right border stays aligned in
+  both modes. Interactive prompt restyled to `root@aixsec-x:~#` (green bold).
+  Test suite v1.4.8: **156 OK**.
 - **v1.4.7 `sqlmap_runner` — bounded sqlmap, FIRST sau CONFIRMED:** new
   `ToolSpec` (tools.py `_sqlmap_runner` ~349-392 + registry): disciplined argv
   (`--batch`, `--technique` deduped+uppercased — B/E/U/S/T/Q allowlist,
@@ -630,7 +641,7 @@ do not use it for automated pentesting no matter its other benchmark scores.
 export WEBX_TARGETS="https://target.test"
 python3 agent.py --recon
 # [*] Quick recon done → agent already has probe + headers
-# aixsec-x> "Analyze and find vulnerabilities"
+# root@aixsec-x:~# "Analyze and find vulnerabilities"
 # → agent: http_probe → detect_cms → waf_detect → nuclei (severity high) ...
 # → approval prompt: "[APPROVAL] 'nuclei_scan' risk [active] — run? [y/N] y"
 # → agent returns JSON findings → /findings → /report
