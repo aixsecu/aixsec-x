@@ -296,7 +296,9 @@ class TestPlanOnlyGuard(unittest.TestCase):
         return WebXAgent(config=cfg(), chat=FakeChat(script=script))
 
     def test_plan_only_does_not_terminate(self):
-        # round1: tool thật; round2: văn bản kế hoạch (0 tool call); round3: final JSON
+        # v1.5.1: round1 tool thật; round2 văn bản kế hoạch (0 tool call → push
+        # ép function call); round3 final JSON recon-only → GATE chặn (chưa có
+        # active check); round4 JSON lại → forced; round5 ép trả JSON json_mode.
         script = [
             {"content": "", "tool_calls": [
                 {"name": "http_probe", "arguments": {"url": "https://abc.vn/"}}]},
@@ -310,11 +312,17 @@ class TestPlanOnlyGuard(unittest.TestCase):
         self.assertEqual(res["risk_level"], "HIGH")
         self.assertEqual(len(a.ledger.all()), 2)
         self.assertEqual(res["calls"], 1)
-        self.assertEqual(len(a.chat.calls), 3)          # 3 lượt chat, không forced
-        self.assertFalse(a.chat.calls[2]["json_mode"])  # final JSON qua lượt thường
-        # lượt round-3 (sau push) phải chứa message bắt buộc gọi function call
+        self.assertEqual(len(a.chat.calls), 5)              # 5 lượt chat
+        self.assertTrue(a.chat.calls[4]["json_mode"])       # forced json_mode cuối
+        # lượt round-3 (sau push plan-only) phải chứa message bắt buộc function call
         push = [m for m in a.chat.calls[2]["messages"] if m.get("role") == "user"]
         self.assertTrue(any("function call" in str(m.get("content", "")) for m in push))
+        # lượt round-4 (sau GATE chặn JSON recon-only lần 1) phải nhắc wapiti_scan
+        gate = [m for m in a.chat.calls[3]["messages"] if m.get("role") == "user"]
+        self.assertTrue(any("wapiti_scan" in str(m.get("content", "")) for m in gate))
+        # gate đã từ chối 2 lần, không active check nào hoàn tất (chỉ recon)
+        self.assertEqual(a._no_active_json, 2)
+        self.assertEqual(a._active_done, set())
 
     def test_plan_only_push_mentions_tool(self):
         # văn bản nhắc sqli_manual_test → push message phải nêu đúng tên tool
@@ -349,6 +357,77 @@ class TestPlanOnlyGuard(unittest.TestCase):
         self.assertIn("sqli_manual_test", a._mentioned_tools(
             "dùng sqli_manual_test trước"))
         self.assertEqual(a._mentioned_tools("không nhắc tool nào"), [])
+
+
+class TestActiveCheckGate(unittest.TestCase):
+    """v1.5.1 (Bug 1): final JSON recon-only bị TỪ CHỐI khi web scope active mà
+    chưa có ACTIVE_CHECKS nào hoàn tất (outcome=ok) — model bị ép gọi wapiti_scan;
+    2 lần từ chối liên tiếp → forced trả JSON json_mode=True."""
+
+    def _agent(self, script=None, extra=None):
+        return WebXAgent(config=cfg(extra), chat=FakeChat(script=script))
+
+    def test_json_after_recon_only_rejected_then_wapiti_ok_accepted(self):
+        from tools import TOOL_INDEX, TOOL_TIMEOUTS
+        caught = {}
+        script = [
+            {"content": "", "tool_calls": [
+                {"name": "http_probe", "arguments": {"url": "https://abc.vn/"}}]},
+            {"content": FINAL_JSON, "tool_calls": []},
+            {"content": "", "tool_calls": [
+                {"name": "wapiti_scan", "arguments": {
+                    "url": "https://abc.vn/", "scope": "domain",
+                    "modules": "sql,xss,file,exec", "max_scan_time": 120}}]},
+        ]
+
+        def fake_wapiti(**kw):
+            caught["t"] = kw.get("_timeout")
+            return "scan done"
+
+        with patch.object(TOOL_INDEX["wapiti_scan"], "exec_fn", fake_wapiti), \
+             patch("tools.shutil.which", return_value="/usr/bin/wapiti"):
+            a = self._agent(script=script)
+            res = a.run("test")
+        # gate chặn đúng 1 lần; sau khi wapiti hoàn tất JSON được chấp nhận
+        self.assertEqual(a._no_active_json, 1)
+        self.assertIn("wapiti_scan", a._active_done)
+        self.assertEqual(caught["t"], TOOL_TIMEOUTS["wapiti_scan"])  # sàn 600s
+        self.assertEqual(len(a.chat.calls), 4)
+        self.assertFalse(a.chat.calls[3]["json_mode"])   # không forced
+        gate = [m for m in a.chat.calls[1]["messages"] if m.get("role") == "user"]
+        self.assertTrue(any("wapiti_scan" in str(m.get("content", "")) for m in gate))
+        self.assertEqual(res["calls"], 2)
+        self.assertEqual(res["risk_level"], "HIGH")
+        self.assertEqual(len(a.ledger.all()), 2)
+
+    def test_two_rejected_jsons_force_final(self):
+        # 2 lần JSON recon-only liên tiếp → forced: ép trả JSON json_mode=True
+        a = self._agent(script=[{"content": FINAL_JSON, "tool_calls": []}])
+        res = a.run("test")
+        self.assertEqual(len(a.chat.calls), 3)
+        self.assertTrue(a.chat.calls[2]["json_mode"])      # forced json_mode
+        self.assertEqual(a._no_active_json, 2)
+        self.assertEqual(a._active_done, set())
+        forced = [m for m in a.chat.calls[2]["messages"] if m.get("role") == "user"]
+        self.assertTrue(any("CHƯA CÓ ACTIVE CHECK" in str(m.get("content", ""))
+                            for m in forced))
+        self.assertEqual(res["calls"], 0)
+        self.assertEqual(res["risk_level"], "HIGH")        # FINAL_JSON ép trả
+        self.assertEqual(len(a.ledger.all()), 2)
+
+    def test_gate_skipped_for_src_only_scope(self):
+        # không khai báo WEBX_TARGETS (src-only) → gate KHÔNG kích hoạt
+        a = self._agent(script=[{"content": FINAL_JSON, "tool_calls": []}],
+                        extra={"targets": []})
+        res = a.run("test")
+        self.assertEqual(len(a.chat.calls), 1)
+        self.assertFalse(a.chat.calls[0]["json_mode"])
+        self.assertEqual(a._no_active_json, 0)
+        user_msgs = [str(m.get("content", "")) for m in a.chat.calls[0]["messages"]
+                     if m.get("role") == "user"]
+        self.assertNotIn("wapiti_scan", " ".join(user_msgs))
+        self.assertEqual(res["calls"], 0)
+        self.assertEqual(res["risk_level"], "HIGH")
 
 
 class TestSQLiManualTest(unittest.TestCase):
@@ -716,6 +795,26 @@ class TestToolTimeoutCap(unittest.TestCase):
             r = a._dispatch("http_probe", {"url": "https://abc.vn/"})
         self.assertEqual(r["outcome"], "ok")
         self.assertEqual(caught["t"], 300)  # không nằm trong cap → giữ nguyên
+
+    def test_wapiti_long_run_gets_cap_floor(self):
+        # v1.5.1 (Bug 2): LONG_RUN_TOOLS dùng SÀN max(tool_timeout, cap) —
+        # wapiti_scan tool_timeout=90s vẫn được 600s, không bị giết giữa scan
+        from tools import TOOL_INDEX, TOOL_TIMEOUTS
+        caught = {}
+
+        def fake_wapiti(**kw):
+            caught["t"] = kw.get("_timeout")
+            return "scan done"
+
+        with patch.object(TOOL_INDEX["wapiti_scan"], "exec_fn", fake_wapiti), \
+             patch("tools.shutil.which", return_value="/usr/bin/wapiti"):
+            a = WebXAgent(config=cfg({"tool_timeout": 90}),
+                          chat=FakeChat(script=[]))
+            r = a._dispatch("wapiti_scan", {"url": "https://abc.vn/"})
+        self.assertEqual(r["outcome"], "ok")
+        # cấu hình 90s nhưng sàn wapiti 600s phải thắng (không còn min())
+        self.assertEqual(caught["t"], TOOL_TIMEOUTS["wapiti_scan"])
+        self.assertGreater(TOOL_TIMEOUTS["wapiti_scan"], 90)
 
 
 class TestScopePrompt(unittest.TestCase):
@@ -2591,13 +2690,14 @@ class TestWapitiScan(unittest.TestCase):
         self.assertEqual(c["argv"][c["argv"].index("-t") + 1], "30")
 
     def test_scan_time_budget_clamps(self):
-        # tool_timeout=90 → budget 90: scan=max(30,min(70,70))=70, attack=min(90,35)=35,
-        # run_cmd timeout = min(90, 70+60=130) = 90 → wapiti TỰ kết thúc trước khi bị giết
+        # v1.5.1 (Bug 2): tool_timeout=90 → LONG_RUN_TOOLS SÀN 600s — wapiti
+        # KHÔNG còn bị giết giữa scan; budget=600 → scan=300, attack=90,
+        # run_cmd timeout=600 (lưới an toàn, wapiti tự kết thúc theo -max-scan-time)
         r, c, sm, rp = self._dispatch({"url": "https://abc.vn/"}, tool_timeout=90)
         self.assertEqual(r["outcome"], "ok")
-        self.assertEqual(c["argv"][c["argv"].index("--max-scan-time") + 1], "70")
-        self.assertEqual(c["argv"][c["argv"].index("--max-attack-time") + 1], "35")
-        self.assertEqual(c["timeout"], 90)
+        self.assertEqual(c["argv"][c["argv"].index("--max-scan-time") + 1], "300")
+        self.assertEqual(c["argv"][c["argv"].index("--max-attack-time") + 1], "90")
+        self.assertEqual(c["timeout"], 600)
         # max_scan_time=5000 bị clamp theo budget 600 → 580, run_cmd 600
         r2, c2, sm2, _ = self._dispatch({"url": "https://abc.vn/",
                                          "max_scan_time": 5000})

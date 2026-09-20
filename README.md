@@ -433,6 +433,29 @@ better than long prompts. `prompts.py` ships 2 variants with auto-selection:
   `break_long_words=True`, splitting `**ffuf_dir**` across a wrap boundary as
   `**ff` / `uf_dir**`. Now `break_long_words=False, break_on_hyphens=False` —
   long words jump to the next line whole.
+- **v1.5.1 — active-check gate + LONG_RUN_TOOLS timeout floor (2 bug fixes):**
+  **Bug 1 (gate):** the run loop no longer accepts a final JSON from a
+  web-scope session that completed ZERO active checks (nmap/nikto/curl-only
+  recon). In the JSON branch, when `_web_scope_active()` and no active tool
+  (`wapiti_scan` / `ffuf_dir` / `sqlmap_check` / `sqlmap_runner`) has
+  finished with outcome=ok, the agent appends a gate message telling the
+  model to run an active check first; a 2nd JSON still lacking any active
+  check → forced final with gate note `PHIÊN NÀY CHƯA CÓ ACTIVE CHECK` and
+  `forced=true`. The budget-end warning path (not forced) also reminds that
+  the session ended without an active check. src-only scope (`targets=[]`)
+  skips the gate entirely — recon-only planning stays legal there.
+  **Bug 2 (floor):** `_dispatch` for LONG_RUN_TOOLS used
+  `min(tool_timeout, TOOL_TIMEOUTS[name])` — a low global `WEBX_TOOL_TIMEOUT`
+  (e.g. 90 s) shrank `wapiti_scan`'s run_cmd timeout to 90 s and the scanner
+  was killed mid-run (live v1.5.0: "wapiti không chạy gì cả"). Now
+  `max(...)`: the tool's own constant acts as a FLOOR, so low global
+  timeouts can't kill long runners; wapiti_scan floor = 600 s, and
+  `_wapiti_scan` passes the FULL budget to run_cmd (drops
+  `min(budget, scan_time+60)`), so wapiti finishes before the killer.
+  Test suite v1.5.1: **179 OK** (4 new: TestActiveCheckGate ×3 +
+  test_wapiti_long_run_gets_cap_floor; test_plan_only_does_not_terminate
+  rewritten for the gate; TestWapitiScan.test_scan_time_budget_clamps
+  updated to floor semantics).
 - **v1.5.0 `wapiti_scan` — full-site scanner, ALL 29 wapiti modules, sqlmap-FIRST handoff:** new ToolSpec + `_wapiti_scan` (tools.py ~505–815) wrapping **wapiti 3.2.10**: runs the crawler + EVERY attack module by passing `-m backup,brute_login_form,buster,cms,crlf,csrf,exec,file,htaccess,htp,ldap,log4shell,methods,network_device,nikto,permanentxss,redirect,shellshock,spring4shell,sql,ssl,ssrf,takeover,timesql,upload,wapp,wp_enum,xss,xxe` — wapiti's DEFAULT runs only 9 modules, the user explicitly asked for "toàn bộ loại tấn công wapiti hỗ trợ". Bounded: scope `url/page/folder/subdomain/domain/punk` (default domain = whole site), depth 1–10, max-scan-time ≤ min(budget−20, 1800), max-attack-time ≤ scan_time/2, tasks 1–8, per-request timeout 5–30 s, `--flush-session --no-bugreport`; `run_cmd` timeout = min(budget, scan+60) so wapiti finishes BEFORE the killer. Report parsed from `-f json`: severity mapping 0–4→info..critical, sorted (rank, category, path) DESC, per-finding wstg + `curl_command`, body via `.split("\n\n"|"\r\n\r\n")` against wapiti's literal CRLF http_request (round-trip json.load keeps real CRLF), `_strip_wapiti_probe` removes the `¿'"(` probe suffix added by wapiti to recover the original form value (`keyword=tin%C2%BF%27%22%28 → keyword=tin`). **sqlmap-FIRST kept**: `exploit=true` (default) auto-runs `sqlmap_runner` on up to `_WAPITI_MAX_EXPLOIT=3` SQLi findings ONLY after wapiti CONFIRMED (category "SQL Injection"/"Blind SQL Injection" → technique E/T, dbms from `DBMS:` info), sql_budget = max(30, min(180, budget−elapsed−5)); every non-SQLi finding returns payload + per-category guidance (CSP/headers/cookie-flag/HSTS are report CATEGORIES, never invented module names). Risk `noisy` → approval flow. Test suite v1.5.0: **175 OK** (15 new TestWapitiScan: argv/allowlist/timing/parse/probe-strip/sqli-target/exploit cap 3/exploit=false/errors; + test_all_present learned wapiti). E2E verified live on mock MSSQL (`mock_mssql_sqli.py`, localhost:8098): wapiti CONFIRMED `[CRITICAL] SQL Injection (param=keyword) POST /WebTinTuc/TimKiem [module=sql]` (DBMS: Microsoft SQL Server, WSTG-INPV-05), exploit run handed off to real sqlmap (1.10.8) with `--dbms mssql --technique E --data keyword=default`.
 - **v1.4.9 `sqlmap_runner` — timeout/lỗi thực thi ≠ "chạy xong":**
   `run_cmd` returns `[!] Timeout sau Ns.` when the process is killed on
