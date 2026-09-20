@@ -405,6 +405,10 @@ Model 7B/9B (vd: `huihui_ai/qwen3.5-abliterated:9b`) tuân theo **ít quy tắc*
   với `break_long_words=True` làm tách `**ffuf_dir**` thành `**ff` + `uf_dir**`.
   Giờ dùng `break_long_words=False, break_on_hyphens=False` — từ dài nhảy
   trọn sang dòng tiếp theo.
+- **v1.5.6 — Dọn banner: bỏ khối ASCII mặt nạ Anonymous** (hình `.888.` đọc
+  thành chữ "AAO") theo yêu cầu user. Banner giờ mở thẳng bằng logo AIXSEC-X
+  xanh. Test suite v1.5.6: **193 OK** (sửa test banner: mặt nạ đã bỏ + logo
+  đứng đầu).
 - **v1.5.5 — wapiti_scan TỰ QUÉT form POST: chỉ cần nhập ROOT DOMAIN, tool tự
   tìm SQLi trên form (bài học tbu.edu.vn):** wapiti crawl
   `https://tbu.edu.vn/WebTinTuc/TimKiem?page=1..52` và module `sql` đốt hết

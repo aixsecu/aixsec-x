@@ -432,6 +432,10 @@ better than long prompts. `prompts.py` ships 2 variants with auto-selection:
   `break_long_words=True`, splitting `**ffuf_dir**` across a wrap boundary as
   `**ff` / `uf_dir**`. Now `break_long_words=False, break_on_hyphens=False` —
   long words jump to the next line whole.
+- **v1.5.6 — Banner cleanup: removed the Anonymous mask ASCII block** (the
+  `.888.` figure that visually read as "AAO" text) per user request. The
+  banner now opens directly with the green AIXSEC-X logo. Test suite v1.5.6:
+  **193 OK** (banner tests updated: mask-absent + logo-first assertions).
 - **v1.5.5 — wapiti_scan auto form sweep: type ONLY the root domain, the tool
   finds POST-form SQLi itself (the tbu.edu.vn lesson):** wapiti crawled
   `https://tbu.edu.vn/WebTinTuc/TimKiem?page=1..52` and the `sql` module burned
