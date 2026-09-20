@@ -405,6 +405,21 @@ Model 7B/9B (vd: `huihui_ai/qwen3.5-abliterated:9b`) tuân theo **ít quy tắc*
   với `break_long_words=True` làm tách `**ffuf_dir**` thành `**ff` + `uf_dir**`.
   Giờ dùng `break_long_words=False, break_on_hyphens=False` — từ dài nhảy
   trọn sang dòng tiếp theo.
+- **v1.5.4 — Banner thoáng hơn: bỏ khung box, bỏ nền đen, icon mặt nạ Anonymous:**
+  khung `│…│` + nền đen từng dòng (`_BLACK`) + icon skull đã bị XÓA HẾT.
+  `_SKULL_ART`/`_BLACK` bị loại → `_ANON_ART` (mặt nạ Anonymous kiểu Guy
+  Fawkes V-mask ASCII, dạng `.o. / .888. / .8"888. / 88bodP'`, vẽ đỏ đậm).
+  Viết lại `_banner()`: **không khung, không nền đen**; art mặt nạ + logo
+  AIXSEC-X + tiêu đề căn giữa trong khối nội dung W=66 (helper `vis()`/
+  `center()` loại bỏ mã ANSI để width luôn chuẩn); dòng phân tách `─` (không
+  phải khung); dòng trạng thái key-value căn trái, cột khóa rộng 9 (`[>]
+  model/scope/auto-exec/host/session/modules`); cả khối được thụt vào giữa
+  terminal qua `shutil.get_terminal_size()` (chỉ khi `tw > W+6`); `color=None`
+  → tự nhận TTY + tôn trọng `NO_COLOR`. Test suite v1.5.4: **189 OK** (+2 —
+  viết lại `TestBannerUpdate` với 9 bài test: mask+logo hiển thị / không viền
+  box / art căn giữa / bản màu có ANSI đỏ nhưng không `ESC[40m` nền đen /
+  bản plain không ANSI / liệt kê tool thiếu / nhãn batch-mode / plain chứa
+  thông tin core / chạy `_banner()` không lỗi).
 - **v1.5.3 — GỠ `find_forms`, wapiti làm tất cả (đủ 3 yêu cầu):**
   **(1) Xóa HOÀN TOÀN tool `find_forms`** (registry, source `_find_forms`,
   cả 2 prompt, probe-set ledger, test) — crawler của `wapiti_scan` giờ tìm

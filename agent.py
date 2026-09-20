@@ -33,7 +33,7 @@ from tools import (TOOL_REGISTRY, TOOL_INDEX, TOOL_BINS, TOOL_TIMEOUTS,
                    LONG_RUN_TOOLS, available_tools)
 
 # ── terminal colors (AIXSEC-X style) ──
-VERSION = "1.5.3"
+VERSION = "1.5.4"
 
 # v1.5.2: wapiti-first gate — web scope active mà wapiti_scan CHƯA chạy
 # (chưa có outcome=ok/error) thì final JSON bị từ chối và model bị ép gọi
@@ -59,19 +59,16 @@ _AIXSEC_ART = r'''
 ██║  ██║██║██╔╝ ██╗███████║███████╗╚██████╗██╔╝ ██╗
 ╚═╝  ╚═╝╚═╝╚═╝  ╚═╝╚══════╝╚══════╝ ╚═════╝╚═╝  ╚═╝'''
 
-_BLACK = "\033[40m"
-
-# v1.4.8 — skull ASCII cho màn hình "hacker-style" (thuần trang trí)
-_SKULL_ART = r'''
-      _.--""--._
-    .'          '.
-   /   _      _    \
-  :    o      o     :
-  |     .  ~  .     |
-  :   '\_____/'     :
-   \                 /
-    '.             .'
-      '-.._____..-'
+# v1.5.4 — mặt nạ Anonymous (Guy Fawkes V-mask) ASCII thay skull v1.4.8 cho
+# màn hình "hacker-style" (theo yêu cầu user; thuần trang trí)
+_ANON_ART = r'''
+        .o.        .o.            ...
+       .888.      .888.        .d8888b.
+      .8"888.    .8"888.      d88P  Y88b
+     .8' '888.  .8' '888.     888    888
+    .88ooo8888..88ooo8888.    888    888
+   .8'    888..8'    888.     888    888
+  o88o    8888o88o    8888o   "88bodP'
 '''
 
 SEVERITY_RISK = {"destructive": 4, "active": 3, "noisy": 2, "safe": 1}
@@ -739,18 +736,20 @@ def _sysinfo() -> dict:
 
 def _banner(cfg: dict, scope: str = "", missing=None, mode: str = "interactive",
             color: bool | None = None) -> str:
-    """Màn hình khởi động kiểu hacker (v1.4.8): skull đỏ + logo xanh trên nền
-    đen + status block thật (model/scope/auto-exec/host/kernel/session/modules)
-    đóng khung ASCII. color=None → tự bật/tắt theo TTY (NO_COLOR cũng tắt màu)."""
+    """Màn hình khởi động kiểu hacker (v1.5.4): mặt nạ Anonymous đỏ + logo
+    xanh + tiêu đề căn giữa, KHÔNG khung box (bỏ viền │…│ và nền đen v1.4.8)
+    cho thoáng hơn; status block key-value căn trái theo cột key cố định; cả
+    khối tự căn giữa theo bề rộng terminal khi đang là TTY. color=None → tự
+    bật/tắt theo TTY (NO_COLOR cũng tắt màu)."""
     if color is None:
         color = bool(getattr(sys.stdout, "isatty", lambda: False)())
         if os.environ.get("NO_COLOR"):
             color = False
     if color:
-        G, R, Y, C, M, B, D, A, RS, BK = (GREEN, RED, YELLOW, CYAN, MAGENTA,
-                                            BOLD, DIM, "\033[38;5;214m", RESET, _BLACK)
+        G, R, Y, C, M, B, D, A, RS = (GREEN, RED, YELLOW, CYAN, MAGENTA,
+                                      BOLD, DIM, "\033[38;5;214m", RESET)
     else:
-        G = R = Y = C = M = B = D = A = RS = BK = ""
+        G = R = Y = C = M = B = D = A = RS = ""
 
     info = _sysinfo()
     scope = scope or (",".join(cfg.get("targets") or []) or "(none)")
@@ -758,45 +757,51 @@ def _banner(cfg: dict, scope: str = "", missing=None, mode: str = "interactive",
     n_tools = len(TOOL_REGISTRY)
     miss_str = ("  " + Y + "⚠ missing: "
                 + ", ".join(f"{B}{t}{RS}{Y}({TOOL_BINS[t]}){RS}"
-                             for t in sorted(missing)) + RS) if missing else ""
+                            for t in sorted(missing)) + RS) if missing else ""
 
-    W = 62  # chiều rộng nội dung khung (tính theo ký tự HIỂN THỊ — ANSI là 0-rộng)
+    W = 66   # bề rộng khối banner (tính theo ký tự HIỂN THỊ — ANSI là 0-rộng)
     _ansi = re.compile(r"\x1b\[[0-9;]*m")
-    def row(t=""):
-        vis = _ansi.sub("", t or "")
-        if len(vis) > W:
-            # dòng quá dài: bỏ màu, cắt trần W (không vỡ khung)
-            return "│ " + vis[:W].ljust(W) + " │"
-        pad = " " * (W - len(vis))
-        if color:
-            # phần đệm cũng nền đen cho đồng nhất toàn khung
-            return "│ " + t + BK + pad + RS + " │"
-        return "│ " + t + pad + " │"
-    top = "┌" + "─" * (W + 2) + "┐"
-    sep = "├" + "─" * (W + 2) + "┤"
-    bot = "└" + "─" * (W + 2) + "┘"
 
-    lines = [top]
-    for s in _SKULL_ART.splitlines():
-        s = s.rstrip()
-        lines.append(row(f"{BK}{R}{B}{s}{RS}"))
-    for s in _AIXSEC_ART.splitlines():
-        s = s.rstrip()
-        lines.append(row(f"{BK}{G}{B}{s}{RS}"))
-    lines.append(row(f"{BK}{G}{B}AIXSEC-X v{R}{VERSION}{G}{RS}{BK} — AI Web Exploitation Assistant{RS}"))
-    lines.append(row(f"   {D}local LLM • Kali Linux    brand: aixsecu.com{RS}"))
-    lines.append(sep)
-    lines.append(row(f"{C}{B}[>]{RS} {D}model    {RS} {B}{info['python']} | {cfg.get('model', '?')}{RS}"))
-    lines.append(row(f"{C}{B}[>]{RS} {D}scope    {RS} {G}{scope}{RS}"))
-    lines.append(row(f"{C}{B}[>]{RS} {D}auto-exec{RS} {Y}{cfg.get('auto_exec', 'ask')}{RS}   {D}mode: {A}{mode}{RS}"))
-    lines.append(row(f"{C}{B}[>]{RS} {D}host     {RS} {B}{info['host']}{RS}  {D}kernel {info['kernel']}{RS}"))
-    lines.append(row(f"{C}{B}[>]{RS} {D}session  {RS} {info['ts']}  {D}pid {info['pid']}{RS}"))
-    lines.append(row(f"{C}{B}[>]{RS} {D}modules  {RS} {B}{n_tools}{RS} {D}tools loaded{RS}{miss_str}"))
-    lines.append(sep)
-    lines.append(row(f"{D}   q quit | !! <cmd> shell | /findings ledger | /report export{RS}"))
-    lines.append(bot)
+    def vis(t: str) -> str:
+        return _ansi.sub("", t or "")
+
+    def center(t: str) -> str:
+        pad = max(0, (W - len(vis(t))) // 2)
+        return " " * pad + t
+
+    lines = [""]
+    for s in _ANON_ART.strip("\n").splitlines():
+        lines.append(center(f"{R}{B}{s.rstrip()}{RS}"))
+    lines.append("")
+    for s in _AIXSEC_ART.strip("\n").splitlines():
+        lines.append(center(f"{G}{B}{s.rstrip()}{RS}"))
+    lines.append("")
+    lines.append(center(f"{G}{B}AIXSEC-X v{R}{VERSION}{G}{RS}{B} — AI Web Exploitation Assistant{RS}"))
+    lines.append(center(f"   {D}local LLM • Kali Linux    brand: aixsecu.com{RS}"))
+    lines.append("")
+    lines.append(center(f"{D}{'─' * W}{RS}"))
+    lines.append("")
+    lines.append(f"{C}{B}[>]{RS} {D}{'model':<9}{RS} {B}{info['python']} | {cfg.get('model', '?')}{RS}")
+    lines.append(f"{C}{B}[>]{RS} {D}{'scope':<9}{RS} {G}{scope}{RS}")
+    lines.append(f"{C}{B}[>]{RS} {D}{'auto-exec':<9}{RS} {Y}{cfg.get('auto_exec', 'ask')}{RS}{D}   mode: {A}{mode}{RS}")
+    lines.append(f"{C}{B}[>]{RS} {D}{'host':<9}{RS} {B}{info['host']}{RS}{D}  kernel {info['kernel']}{RS}")
+    lines.append(f"{C}{B}[>]{RS} {D}{'session':<9}{RS} {info['ts']}{D}  pid {info['pid']}{RS}")
+    lines.append(f"{C}{B}[>]{RS} {D}{'modules':<9}{RS} {B}{n_tools}{RS}{D} tools loaded{RS}{miss_str}")
+    lines.append("")
+    lines.append(center(f"{D}q quit | !! <cmd> shell | /findings ledger | /report export{RS}"))
+    lines.append("")
+
+    # căn giữa cả khối theo bề rộng terminal thật (nếu rộng hơn khối + 6);
+    # terminal hẹp/pipe → bỏ indent để tránh gãy dòng
+    try:
+        import shutil
+        tw = shutil.get_terminal_size().columns
+        if tw > W + 6:
+            ind = " " * ((tw - W) // 2)
+            lines = [ind + ln if ln else "" for ln in lines]
+    except Exception:  # noqa: BLE001
+        pass
     return "\n".join(lines) + "\n"
-
 
 def _print_banner(cfg: dict, scope: str = "", missing=None, mode: str = "interactive"):
     print(_banner(cfg, scope=scope, missing=missing, mode=mode), flush=True)

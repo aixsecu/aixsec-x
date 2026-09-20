@@ -2598,9 +2598,11 @@ class TestOracleSilentOutcome(unittest.TestCase):
 
 
 class TestBannerUpdate(unittest.TestCase):
-    """v1.4.8: màn hình khởi động kiểu hacker — skull đỏ + logo xanh + status
-    block đóng khung. plain (color=False) KHÔNG chứa ANSI; color=True có ANSI
-    + nền đen; model/scope/auto_exec/missing tools vẫn hiện đủ như bản cũ"""
+    """v1.5.4: màn hình khởi động kiểu hacker — mặt nạ Anonymous đỏ + logo xanh
+    + tiêu đề căn giữa, KHÔNG còn khung box (bỏ viền │…│ và nền đen v1.4.8)
+    cho thoáng hơn; status block key-value căn trái theo cột key cố định.
+    plain (color=False) KHÔNG chứa ANSI; color=True có ANSI nhưng KHÔNG có nền
+    đen; model/scope/auto_exec/missing tools vẫn hiện đủ như bản cũ"""
 
     _CFG = cfg({"targets": ["https://tbu.edu.vn"], "model": "m-test",
                 "auto_exec": "ask"})
@@ -2624,15 +2626,31 @@ class TestBannerUpdate(unittest.TestCase):
     def test_plain_has_no_ansi(self):
         self.assertNotIn("\x1b[", self._banner())
 
-    def test_color_has_ansi_and_black_bg(self):
+    def test_color_has_ansi_but_no_black_bg(self):
         b = self._banner(color=True)
         self.assertIn("\x1b[", b)
-        self.assertIn("\x1b[40m", b)  # nền đen hacker-style
+        self.assertIn("\x1b[91m", b)    # đỏ — mặt nạ Anonymous
+        self.assertIn("\x1b[92m", b)    # xanh — logo AIXSEC-X
+        self.assertNotIn("\x1b[40m", b)  # v1.5.4 bỏ nền đen theo dòng
 
-    def test_skull_and_logo_present(self):
+    def test_mask_and_logo_present(self):
         b = self._banner()
-        self.assertIn('.--""--.', b)  # skull ASCII
-        self.assertIn("█████╗", b)    # logo AIXSEC-X
+        self.assertIn(".o.", b)        # mắt trái mặt nạ Anonymous
+        self.assertIn("88bodP", b)     # nụ cười V của mặt nạ
+        self.assertIn("█████╗", b)     # logo AIXSEC-X
+
+    def test_no_box_borders(self):
+        b = self._banner()
+        self.assertNotIn("│", b)  # bỏ khung │…│ v1.4.8
+        self.assertNotIn("┌", b)
+        self.assertNotIn("└", b)
+
+    def test_art_centered_in_block(self):
+        b = self._banner()
+        for ln in b.splitlines():
+            if ln.strip().startswith(".888."):   # dòng art (bỏ qua indent khối)
+                self.assertTrue(ln.startswith(" "), repr(ln))
+                self.assertTrue(len(ln) - len(ln.lstrip()) >= 2, repr(ln))
 
     def test_missing_tools_listed(self):
         b = self._banner(missing={"nuclei_scan": "nuclei"})
@@ -2648,8 +2666,6 @@ class TestBannerUpdate(unittest.TestCase):
         with contextlib.redirect_stdout(out):
             _print_banner(self._CFG, scope="https://tbu.edu.vn")
         self.assertIn("AIXSEC-X", out.getvalue())
-
-
 class TestWapitiScan(unittest.TestCase):
     """v1.5.0: tool wapiti_scan — toàn bộ 29 module wapiti (mặc định), scope mặc
     định domain (cả website), bounded scan/attack time theo _timeout; parse JSON
