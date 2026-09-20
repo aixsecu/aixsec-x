@@ -405,6 +405,21 @@ Model 7B/9B (vd: `huihui_ai/qwen3.5-abliterated:9b`) tuân theo **ít quy tắc*
   với `break_long_words=True` làm tách `**ffuf_dir**` thành `**ff` + `uf_dir**`.
   Giờ dùng `break_long_words=False, break_on_hyphens=False` — từ dài nhảy
   trọn sang dòng tiếp theo.
+- **v1.4.9 — `sqlmap_runner`: timeout/lỗi thực thi ≠ "chạy xong":**
+  `run_cmd` trả `[!] Timeout sau Ns.` khi tiến trình bị giết vì quá giờ
+  (và `[!] ...` cho lỗi thực thi khác). Trước đây `_sqlmap_runner` xếp mọi
+  lần chạy không có marker vào `[-] sqlmap chạy xong KHÔNG thấy dấu hiệu
+  khai thác` với outcome=ok — nên một sqlmap bị timeout lặng lẽ trở thành
+  "not injectable" sạch sẽ (đã thấy LIVE: run #1 chạm đúng timeout run_cmd,
+  báo ok, model còn bịa chi tiết như "218 lần lỗi 500"). Giờ: output mở đầu
+  `[!]` (LOẠI TRỪ dòng `[!] legal disclaimer` — sqlmap in MỖI lần chạy) →
+  `[!] sqlmap không hoàn tất (lỗi thực thi)` + `outcome=error` + gợi ý (giảm
+  kỹ thuật vd `E`/`T` hoặc tăng timeout; KHÔNG gọi lại đúng url+tham số y
+  hệt). Kèm theo: kết luận "not injectable" THẬT giờ ra dòng chuẩn hóa
+  `[i]` ("đúng cho kênh này … KHÔNG phải bằng chứng 'không có SQLi'; giữ
+  candidate + NEEDS VALIDATION") để model 9B khỏi tự bịa số liệu từ log
+  trần. Test suite v1.4.9: **160 OK** (4 test mới: timeout→error, exec-lỗi
+  lan truyền, loại trừ legal disclaimer, chuẩn hóa not injectable).
 - **v1.4.8 — Banner khởi động kiểu hacker:** màn hình boot làm lại — đầu lâu
   ASCII màu đỏ + logo AIXSEC xanh lá trong khung `┌─┐` đầy đủ, hàng trạng thái
   `[>] model / scope / auto-exec / host / session / modules` lấy dữ liệu THẬT

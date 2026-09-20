@@ -432,6 +432,23 @@ better than long prompts. `prompts.py` ships 2 variants with auto-selection:
   `break_long_words=True`, splitting `**ffuf_dir**` across a wrap boundary as
   `**ff` / `uf_dir**`. Now `break_long_words=False, break_on_hyphens=False` —
   long words jump to the next line whole.
+- **v1.4.9 `sqlmap_runner` — timeout/lỗi thực thi ≠ "chạy xong":**
+  `run_cmd` returns `[!] Timeout sau Ns.` when the process is killed on
+  timeout (and `[!] ...` for other exec errors). Previously
+  `_sqlmap_runner` classified every marker-less run as `[-] sqlmap chạy xong
+  KHÔNG thấy dấu hiệu khai thác` with outcome=ok — so a killed-by-timeout
+  sqlmap silently became a clean "not injectable" verdict (observed live:
+  run #1 hit the run_cmd timeout exactly, was reported ok, and the model then
+  hallucinated details like "218 lần lỗi 500"). Now: output starting `[!]`
+  (except sqlmap's own `[!] legal disclaimer` banner line, printed on every
+  run) → `[!] sqlmap không hoàn tất (lỗi thực thi)` + `outcome=error` +
+  guidance (reduce technique e.g. `E`/`T` or raise timeout; never re-call the
+  exact same url+params). Additionally a real "not injectable" verdict now
+  emits a normalized `[i]` line ("đúng cho kênh này … KHÔNG phải bằng chứng
+  'không có SQLi'; giữ candidate + NEEDS VALIDATION") so the 9B model stops
+  inventing numbers from raw logs. Test suite v1.4.9: **160 OK** (4 new:
+  timeout→error, exec-error propagation, legal-disclaimer exclusion,
+  not-injectable normalization).
 - **v1.4.8 hacker-style startup banner:** boot screen restyled — red ASCII
   skull + green AIXSEC logo inside a full `┌─┐` frame, status rows
   `[>] model / scope / auto-exec / host / session / modules` fed by real
