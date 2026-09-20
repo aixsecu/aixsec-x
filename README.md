@@ -435,7 +435,22 @@ better than long prompts. `prompts.py` ships 2 variants with auto-selection:
 - **v1.5.6 — Banner cleanup: removed the Anonymous mask ASCII block** (the
   `.888.` figure that visually read as "AAO" text) per user request. The
   banner now opens directly with the green AIXSEC-X logo. Test suite v1.5.6:
-  **193 OK** (banner tests updated: mask-absent + logo-first assertions).
+  **211 OK** (banner tests updated: mask-absent + logo-first assertions).
+- **v1.5.6 — `http_request` tool + AI-NATIVE mode (`WEBX_AI_NATIVE=1`):** new
+  Python-native primitive `http_request` (get/post/head/put/options, custom
+  headers/body, follow_redirects, timeout floor 5 s / cap 30 s, body snippet
+  ≤2000 chars) returns the REAL response (status, headers, body, timing) so
+  the model analyzes vulnerabilities itself — quote-differential, error-based,
+  timing, XSS reflection, SSTI, path traversal — no dedicated tool or external
+  binary needed. In AI-NATIVE mode the v1.5.2 wapiti-first gate is REPLACED:
+  wapiti_scan/sqlmap_runner are no longer mandatory and `_auto_wapiti` is
+  disabled; instead the final JSON is rejected until at least one
+  `http_request` outcome=ok exists in the transcript (2 consecutive rejections
+  → forced JSON with gate note "HTTP_REQUEST THÀNH CÔNG"). `http_request`
+  also counts as probe evidence in the ledger (host + path evidence), and the
+  system prompt gains the AI-NATIVE rules block. Test suite v1.5.6: **211 OK**
+  (+18 new: `TestHttpRequestTool` 8, `TestAiNativeGate` 6,
+  `TestPromptAiNative` 2, `TestLedgerHttpRequestEvidence` 2).
 - **v1.5.5 — wapiti_scan auto form sweep: type ONLY the root domain, the tool
   finds POST-form SQLi itself (the tbu.edu.vn lesson):** wapiti crawled
   `https://tbu.edu.vn/WebTinTuc/TimKiem?page=1..52` and the `sql` module burned

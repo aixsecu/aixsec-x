@@ -407,8 +407,23 @@ Model 7B/9B (vd: `huihui_ai/qwen3.5-abliterated:9b`) tuân theo **ít quy tắc*
   trọn sang dòng tiếp theo.
 - **v1.5.6 — Dọn banner: bỏ khối ASCII mặt nạ Anonymous** (hình `.888.` đọc
   thành chữ "AAO") theo yêu cầu user. Banner giờ mở thẳng bằng logo AIXSEC-X
-  xanh. Test suite v1.5.6: **193 OK** (sửa test banner: mặt nạ đã bỏ + logo
+  xanh. Test suite v1.5.6: **211 OK** (sửa test banner: mặt nạ đã bỏ + logo
   đứng đầu).
+- **v1.5.6 — Tool `http_request` + chế độ AI-NATIVE (`WEBX_AI_NATIVE=1`):**
+  primitive Python-native mới `http_request` (get/post/head/put/options,
+  headers/body tùy chọn, follow_redirects, timeout sàn 5 s / trần 30 s, body
+  snippet ≤2000 ký tự) trả response THẬT (status, headers, body, thời gian)
+  để model TỰ phân tích lỗ hổng — quote-differential, error-based, timing,
+  XSS reflection, SSTI, path traversal — không cần tool chuyên dụng hay
+  binary ngoài. Ở chế độ AI-NATIVE, gate wapiti-first v1.5.2 bị THAY THẾ:
+  wapiti_scan/sqlmap_runner không còn bắt buộc và `_auto_wapiti` bị tắt;
+  thay vào đó final JSON bị từ chối cho tới khi có ít nhất 1 `http_request`
+  outcome=ok trong transcript (2 lần từ chối liên tiếp → forced JSON kèm
+  gate note "HTTP_REQUEST THÀNH CÔNG"). `http_request` cũng được tính là
+  probe evidence trong ledger (host + path evidence), và system prompt được
+  nối thêm khối luật AI-NATIVE. Test suite v1.5.6: **211 OK** (+18 mới:
+  `TestHttpRequestTool` 8, `TestAiNativeGate` 6, `TestPromptAiNative` 2,
+  `TestLedgerHttpRequestEvidence` 2).
 - **v1.5.5 — wapiti_scan TỰ QUÉT form POST: chỉ cần nhập ROOT DOMAIN, tool tự
   tìm SQLi trên form (bài học tbu.edu.vn):** wapiti crawl
   `https://tbu.edu.vn/WebTinTuc/TimKiem?page=1..52` và module `sql` đốt hết
