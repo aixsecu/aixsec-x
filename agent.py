@@ -33,15 +33,14 @@ from tools import (TOOL_REGISTRY, TOOL_INDEX, TOOL_BINS, TOOL_TIMEOUTS,
                    LONG_RUN_TOOLS, available_tools)
 
 # ── terminal colors (AIXSEC-X style) ──
-VERSION = "1.5.1"
+VERSION = "1.5.3"
 
-# v1.5.1: active-check gate — tool chủ động kiểm tra web (chạy lâu, "noisy").
-# Nếu web scope active mà chưa có tool nào trong set này HOÀN TẤT (outcome=ok),
-# final JSON recon-only bị từ chối và model bị ép gọi wapiti_scan trước.
-ACTIVE_CHECKS: frozenset = frozenset({
-    "wapiti_scan", "ffuf_dir", "sqlmap_check", "sqlmap_runner",
-    "sqli_manual_test", "sqli_blind_extract", "nikto_scan", "nuclei_scan",
-})
+# v1.5.2: wapiti-first gate — web scope active mà wapiti_scan CHƯA chạy
+# (chưa có outcome=ok/error) thì final JSON bị từ chối và model bị ép gọi
+# wapiti_scan; nếu model bỏ qua tới hết budget, agent TỰ gọi wapiti_scan
+# (_auto_wapiti) để MỌI phiên web-scope đều có dữ liệu wapiti thật.
+# KHÔNG còn set "bất kỳ active check nào" (v1.5.1 sai — model đáp ứng gate
+# bằng sqli_manual_test/sqlmap_runner rồi bỏ qua wapiti hoàn toàn: Bug 3).
 
 RED = "\033[91m"
 GREEN = "\033[92m"
@@ -215,11 +214,11 @@ class WebXAgent:
         # (plan-only). >=2 lượt liên tiếp → ép trả final JSON bằng dữ liệu đã có
         # thay vì để vòng lặp quay vòng vô ích. Reset mỗi lượt có tool call thật.
         self._plan_only = 0
-        # v1.5.1: active-check gate — ghi nhận tool active nào HOÀN TẤT
-        # (outcome=ok) trong phiên; _no_active_json đếm lượt model trả final
-        # JSON khi chưa có active check nào (recon-only).
-        self._active_done: set[str] = set()
-        self._no_active_json = 0
+        # v1.5.2: wapiti-first gate — _wapiti_done=True chỉ khi wapiti_scan đã
+        # chạy thật (outcome=ok HOẶC error) trong phiên;
+        # _no_wapiti_json đếm lượt model trả final JSON khi wapiti chưa chạy.
+        self._wapiti_done = False
+        self._no_wapiti_json = 0
 
     # ─────────────────────────────────────────
     # TOOL DISPATCH (+ scope check + risk approval)
@@ -296,8 +295,8 @@ class WebXAgent:
         result = {"risk_level": "UNKNOWN", "overall_summary": "", "final_text": "", "calls": 0}
         forced = False  # dừng sớm: round thoái hóa → ép trả JSON ngay
         self._plan_only = 0  # v1.4.3: reset bộ đếm plan-only mỗi run()
-        self._active_done = set()  # v1.5.1: reset active-check gate mỗi run()
-        self._no_active_json = 0  # v1.5.1: reset bộ đếm JSON-thiếu-active
+        self._wapiti_done = False  # v1.5.2: reset wapiti-first gate mỗi run()
+        self._no_wapiti_json = 0   # v1.5.2: reset bộ đếm JSON-thiếu-wapiti
         for rnd in range(1, max_rounds + 1):
             disp = _LiveDisplay(rnd, max_rounds)
             resp = self.chat(msgs, tools=[t.schema() for t in self.tools],
@@ -314,15 +313,17 @@ class WebXAgent:
                         result["overall_summary"] = d.get("overall_summary", "")
                     except json.JSONDecodeError:
                         pass
-                    # v1.5.1: active-check gate (Bug 1) — web scope active nhưng
-                    # CHƯA có active check nào hoàn tất → JSON này chỉ là recon-
-                    # only, không được chấp nhận; ép model gọi wapiti_scan.
-                    # >=2 lần liên tiếp → forced (trả JSON bằng dữ liệu thật).
-                    if self._web_scope_active() and not self._active_done:
-                        self._no_active_json += 1
+                    # v1.5.2: wapiti-first gate (Bug 3 — user: "wapiti vẫn chưa
+                    # được chạy") — web scope active nhưng wapiti_scan CHƯA
+                    # chạy (ok/error) → JSON bị từ chối dù các active check khác
+                    # (sqli_manual_test/sqlmap_runner...) đã ok.
+                    # >=2 lần liên tiếp → forced: _auto_wapiti tự chạy wapiti
+                    # trước khi ép trả JSON bằng dữ liệu thật.
+                    if self._web_scope_active() and not self._wapiti_done:
+                        self._no_wapiti_json += 1
                         msgs.append({"role": "assistant", "content": result["final_text"]})
-                        msgs.append({"role": "user", "content": self._active_gate_message()})
-                        if self._no_active_json >= 2:
+                        msgs.append({"role": "user", "content": self._wapiti_gate_message()})
+                        if self._no_wapiti_json >= 2:
                             forced = True
                             break
                         continue
@@ -411,10 +412,13 @@ class WebXAgent:
             disp.done()
             self.transcript.append({"round": rnd, "type": "tools", "calls": results})
             result["calls"] += len(results)
-            # v1.5.1: ghi nhận active check đã HOÀN TẤT (outcome=ok) trong phiên
+            # v1.5.2: wapiti-first gate — chỉ wapiti_scan tính là "đã chạy" khi
+            # outcome ok (thành công) HOẶC error (đã cố, fail rõ ràng). Các
+            # outcome khác (duplicate/blocked/denied/scope_rejected) KHÔNG tính.
             for r in results:
-                if r.get("outcome") == "ok" and r.get("name") in ACTIVE_CHECKS:
-                    self._active_done.add(r.get("name"))
+                if (r.get("name") == "wapiti_scan"
+                        and r.get("outcome") in ("ok", "error")):
+                    self._wapiti_done = True
 
             if all(r.get("outcome") in ("duplicate", "blocked") for r in results):
                 # cả round chỉ toàn duplicate/blocked — không tool nào sinh dữ liệu
@@ -440,12 +444,20 @@ class WebXAgent:
                         json.dumps(tool_msgs, ensure_ascii=False)[:12000] +
                         "\n[TOOL RESULTS END]\nTiếp tục. Khi đủ dữ liệu trả JSON cuối cùng."})
 
+        # v1.5.2 (tail-order 1): AUTO-WAPITI — hết vòng lặp mà web scope active
+        # và wapiti_scan chưa từng chạy (model bỏ qua dù prompt/gate bắt buộc)
+        # thì agent TỰ gọi wapiti_scan một lần (bounded) để mọi phiên web-scope
+        # đều có kết quả wapiti thật trước khi tổng hợp JSON cuối.
+        dispatched = self._auto_wapiti(msgs)
+        if dispatched:
+            result["calls"] += 1
         # hết budget (hoặc dừng sớm vì round thoái hóa: toàn duplicate/blocked
         # hoặc model chỉ trả văn bản kế hoạch 2 lượt liên tiếp) — ép trả JSON
         if forced:
-            gate_note = ("PHIÊN NÀY CHƯA CÓ ACTIVE CHECK NÀO HOÀN TẤT — mọi kết "
-                         "quả chỉ là recon/thông tin thụ động. "
-                         if self._no_active_json >= 2 else "")
+            gate_note = ("PHIÊN NÀY CHƯA CHẠY WAPITI_SCAN — nếu bước tự chạy ở "
+                         "trên trả lỗi (thiếu binary/network) hoặc bị operator "
+                         "từ chối, hãy phản ánh trung thực trong JSON. "
+                         if self._no_wapiti_json >= 2 and not self._wapiti_done else "")
             msgs.append({"role": "user", "content":
                         f"{gate_note}Vòng lặp không tiến triển: các tool gọi đều trả "
                         "duplicate/blocked, hoặc bạn chỉ trả văn bản kế hoạch "
@@ -456,15 +468,16 @@ class WebXAgent:
                         "của phiên này (ghi nguồn trong description). KHÔNG bịa thêm "
                         "404/error-page, cấu hình server, WAF/CMS hoặc chi tiết nào "
                         "khác nếu chưa có tool output hỗ trợ."})
-        # v1.5.1: hết budget mà web scope active chưa có active check hoàn tất —
-        # nhắc nhở tổng hợp trung thực (không bịa), tránh JSON rỗng/UNKNOWN
-        if (not forced and self._web_scope_active() and not self._active_done):
+        # v1.5.2: hết budget mà web scope active và wapiti CHƯA chạy được
+        # (auto không dispatch: deny/không URL/không spec) — cảnh báo tổng hợp
+        # trung thực (không bịa), tránh JSON rỗng/UNKNOWN
+        if (not forced and self._web_scope_active() and not self._wapiti_done):
             msgs.append({"role": "user", "content":
-                        "⚠ Lưu ý tổng hợp: phiên này CHƯA CÓ ACTIVE CHECK nào "
-                        f"hoàn tất và budget ({max_rounds} round) đã cạn. Không "
-                        "gọi tool nữa — trả final JSON trung thực với dữ liệu "
-                        "recon đã thu; nếu chưa đủ bằng chứng, risk_level=UNKNOWN "
-                        "là kết quả trung thực."})
+                        "⚠ Lưu ý tổng hợp: phiên này WAPITI_SCAN chưa chạy được "
+                        f"và budget ({max_rounds} round) đã cạn. Không gọi tool "
+                        "nữa — trả final JSON trung thực với dữ liệu đã thu; "
+                        "nếu chưa đủ bằng chứng, risk_level=UNKNOWN là kết quả "
+                        "trung thực (đừng bịa dữ liệu scan)."})
         disp = _LiveDisplay(0 if forced else max_rounds, max_rounds)
         resp = self.chat(msgs, tools=[t.schema() for t in self.tools], json_mode=True,
                          on_token=disp.on_token, on_reasoning=disp.on_reasoning)
@@ -528,25 +541,83 @@ class WebXAgent:
                 return f"http://{d}/"
         return None
 
-    def _active_gate_message(self) -> str:
-        """v1.5.1: thông báo từ chối final JSON recon-only — bắt buộc lượt
-        tiếp theo gọi active check đầu tiên (wapiti_scan) trước khi tổng hợp."""
+    def _wapiti_gate_message(self) -> str:
+        """v1.5.2: thông báo từ chối final JSON khi WAPITI_SCAN chưa chạy —
+        KHÔNG tool nào khác (sqli_manual_test/sqlmap_runner/nikto/ffuf...) thay
+        thế được wapiti; bắt buộc gọi wapiti_scan trước khi tổng hợp."""
         url = self._active_gate_url() or "<URL-trong-scope>"
         hint = ""
         if "wapiti_scan" in self.missing_tools:
-            hint = ("\n[GHI CHÚ] Binary 'wapiti' không thấy trên PATH phiên này — "
-                    "kết quả có thể là lỗi 'not found'. Vẫn gọi wapiti_scan để "
-                    "ghi nhận hành động active check, hoặc chọn active check "
-                    "khác khả dụng (nikto_scan, sqlmap_check...).")
+            hint = ("\n[GHI CHÚ] Binary 'wapiti' không thấy trên PATH phiên "
+                    "này — kết quả có thể là lỗi 'not found'. VẪN phải gọi "
+                    "wapiti_scan để ghi nhận kết quả thật; nếu tiếp tục bỏ qua, "
+                    "agent sẽ TỰ ĐỘNG chạy wapiti_scan ở bước kết thúc phiên.")
         return ("Bản tổng hợp JSON của bạn CHƯA HỢP LỆ: phiên này đang active "
-                "trên web scope nhưng CHƯA có active check nào hoàn tất (kết "
-                "quả chỉ là recon/thông tin thụ động). Bắt buộc lượt này gọi "
-                "function call wapiti_scan với {\"url\": "
+                "trên web scope nhưng WAPITI_SCAN CHƯA CHẠY. Các tool khác "
+                "(sqli_manual_test, sqlmap_runner, nikto_scan, ffuf_dir...) "
+                "KHÔNG thay thế được wapiti — wapiti là tool duy nhất crawl "
+                "toàn website. Bắt buộc lượt này gọi function call wapiti_scan "
+                "với {\"url\": "
                 f"{json.dumps(url, ensure_ascii=False)}, "
                 "\"scope\": \"domain\", \"modules\": \"sql,xss,file,exec\", "
                 "\"max_scan_time\": 120} — quét toàn bộ website tìm SQLi/XSS/"
                 "file/exec. Chỉ sau khi tool trả kết quả (kể cả lỗi) lượt sau "
                 "mới được trả final JSON." + hint)
+
+    def _auto_wapiti(self, msgs: list) -> bool:
+        """v1.5.2 (Bug 3): tự chạy wapiti_scan khi vòng lặp kết thúc mà web
+        scope active và wapiti_scan CHƯA chạy (outcome ok/error) trong phiên —
+        model bỏ qua dù prompt/gate bắt buộc. Chạy ĐÚNG MỘT lần ở tail, bounded:
+          {"url": <url đầu scope>, "scope": "domain",
+           "modules": "sql,xss,file,exec", "max_scan_time": 120}
+        Result ghi vào transcript (round=0, auto=True), _call_cache và được đẩy
+        vào [TOOL RESULTS] để final round tổng hợp bằng dữ liệu THẬT (kể cả lỗi).
+
+        Return True nếu đã dispatch (mọi outcome kể cả denied/error), False khi
+        không có điều kiện (scope không phải web, đã chạy, thiếu spec/URL)."""
+        if not self._web_scope_active() or self._wapiti_done:
+            return False
+        spec = TOOL_INDEX.get("wapiti_scan")
+        url = self._active_gate_url()
+        if not spec or not url:
+            return False
+        args = {"url": url, "scope": "domain", "modules": "sql,xss,file,exec",
+                "max_scan_time": 120}
+        t0 = time.time()
+        dt = 0.0
+        try:
+            print(f"{YELLOW}[→]{RESET} {BOLD}wapiti_scan{RESET}(AUTO — model "
+                  f"chưa chạy wapiti trong phiên)", flush=True)
+            r = self._dispatch("wapiti_scan", args)
+            dt = round(time.time() - t0, 1)
+        except Exception as e:  # noqa: BLE001 — trọn vẹn cả EOFError/deny-path
+            r = {"name": "wapiti_scan", "outcome": "error",
+                 "output": f"[!] auto wapiti_scan failed: {e}", "exec_time": 0.0}
+            dt = round(time.time() - t0, 1)
+        r.setdefault("args", dict(args))
+        key = "wapiti_scan|" + json.dumps(args, sort_keys=True,
+                                          default=str, ensure_ascii=False)
+        self._call_cache[key] = r
+        if r.get("outcome") in ("ok", "error"):
+            self._wapiti_done = True
+        tag = f"{GREEN}[✔]{RESET}" if r.get("outcome") == "ok" \
+            else f"{RED}[✗]{RESET}"
+        print(f"{tag} wapiti_scan → outcome={r.get('outcome', '?')} ({dt:.1f}s)",
+              flush=True)
+        self.transcript.append({"round": 0, "type": "tools", "calls": [r],
+                                "auto": True})
+        out = InjectionGuard.sanitize(r.get("output", ""),
+                                      self.config["output_cap"])
+        msg = {"role": "tool", "name": "wapiti_scan",
+               "content": f"outcome={r.get('outcome')}\n{out}"}
+        msgs.append({"role": "user", "content":
+                    "[TOOL RESULTS BEGIN]\n" +
+                    json.dumps([msg], ensure_ascii=False)[:12000] +
+                    "\n[TOOL RESULTS END]\n[WAPITI TỰ CHẠY] Model không gọi "
+                    "wapiti_scan trong phiên nên AGENT TỰ chạy — kết quả ở trên "
+                    "(kể cả lỗi) là dữ liệu THẬT; dùng nó khi tổng hợp JSON cuối. "
+                    "KHÔNG gọi tool nữa."})
+        return True
 
     def _history(self) -> list[dict]:
         """Toàn bộ tool calls của phiên (args + outcome + output) để đối chiếu bằng chứng."""
