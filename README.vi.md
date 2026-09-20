@@ -262,12 +262,12 @@ mấy tool đang hỏng. Nếu thấy `error`/`blocked` lặp lại ở `nuclei_
 ### Lệnh interactive
 
 ```
-aixsec-x> Phân tích https://example.com           → agent tự gọi tool + trả kết luận
-aixsec-x> Quét nuclei severity high               → tấn công mục tiêu
-aixsec-x> /findings                               → xem ledger (candidate/confirmed/ruled_out)
-aixsec-x> /report                                 → xuất report markdown
-aixsec-x> !! nmap -p- 10.0.0.5                    → chạy shell trực tiếp (tự chịu trách nhiệm)
-aixsec-x> q                                       → thoát
+root@aixsec-x:~# Phân tích https://example.com              → agent tự gọi tool + trả kết luận
+root@aixsec-x:~# Quét nuclei severity high                  → tấn công mục tiêu
+root@aixsec-x:~# /findings                                  → xem ledger (candidate/confirmed/ruled_out)
+root@aixsec-x:~# /report                                    → xuất report markdown
+root@aixsec-x:~# !! nmap -p- 10.0.0.5                       → chạy shell trực tiếp (tự chịu trách nhiệm)
+root@aixsec-x:~# q                                          → thoát
 ```
 
 ## Cơ chế an toàn (làm khác METATRON)
@@ -405,6 +405,17 @@ Model 7B/9B (vd: `huihui_ai/qwen3.5-abliterated:9b`) tuân theo **ít quy tắc*
   với `break_long_words=True` làm tách `**ffuf_dir**` thành `**ff` + `uf_dir**`.
   Giờ dùng `break_long_words=False, break_on_hyphens=False` — từ dài nhảy
   trọn sang dòng tiếp theo.
+- **v1.4.8 — Banner khởi động kiểu hacker:** màn hình boot làm lại — đầu lâu
+  ASCII màu đỏ + logo AIXSEC xanh lá trong khung `┌─┐` đầy đủ, hàng trạng thái
+  `[>] model / scope / auto-exec / host / session / modules` lấy dữ liệu THẬT
+  lúc chạy (platform node/release, phiên bản Python, thời điểm, PID, đếm
+  `available_tools()`), hàng `⚠ missing: tool(binary)` khi thiếu binary, và
+  hàng gợi ý `q quit | !! <cmd> shell | /findings ledger | /report export`.
+  Màu ANSI tự phát hiện: chỉ bật khi stdout là TTY và NO_COLOR chưa đặt — chạy
+  batch/pipe/redirect ra văn bản thuần; padding tính theo độ rộng HIỂN THỊ để
+  viền phải thẳng hàng cả 2 chế độ (không vỡ khung khi có mã màu). Prompt
+  interactive đổi thành `root@aixsec-x:~#` (xanh lá, đậm). Test suite v1.4.8:
+  **156 OK**.
 - **v1.4.7 — `sqlmap_runner` — sqlmap bounded, ĐẦU TIÊN sau CONFIRMED:**
   `ToolSpec` mới (tools.py `_sqlmap_runner` ~349-392 + registry): argv kỷ luật
   (`--batch`, `--technique` dedupe+uppercase — allowlist B/E/U/S/T/Q, `--dbms`
@@ -593,7 +604,7 @@ thì đừng dùng cho pentest tự động dù có benchmark điểm cao khác.
 export WEBX_TARGETS="https://target.test"
 python3 agent.py --recon
 # [*] Quick recon done → agent đã có probe + headers
-# aixsec-x> "Phân tích và tìm lỗ hổng"
+# root@aixsec-x:~# "Phân tích và tìm lỗ hổng"
 # → agent: http_probe → detect_cms → waf_detect → nuclei (severity high) ...
 # → approval prompt: "[APPROVAL] 'nuclei_scan' risk [active] — run? [y/N] y"
 # → agent trả JSON findings → xem /findings → /report

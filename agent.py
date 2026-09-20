@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 import time
 
@@ -32,7 +33,7 @@ from tools import (TOOL_REGISTRY, TOOL_INDEX, TOOL_BINS, TOOL_TIMEOUTS,
                    available_tools)
 
 # ── terminal colors (AIXSEC-X style) ──
-VERSION = "1.4.7"
+VERSION = "1.4.8"
 
 RED = "\033[91m"
 GREEN = "\033[92m"
@@ -50,6 +51,21 @@ _AIXSEC_ART = r'''
 ██╔══██║██║ ██╔██╗ ╚════██║██╔══╝  ██║╚════╝██╔██╗
 ██║  ██║██║██╔╝ ██╗███████║███████╗╚██████╗██╔╝ ██╗
 ╚═╝  ╚═╝╚═╝╚═╝  ╚═╝╚══════╝╚══════╝ ╚═════╝╚═╝  ╚═╝'''
+
+_BLACK = "\033[40m"
+
+# v1.4.8 — skull ASCII cho màn hình "hacker-style" (thuần trang trí)
+_SKULL_ART = r'''
+      _.--""--._
+    .'          '.
+   /   _      _    \
+  :    o      o     :
+  |     .  ~  .     |
+  :   '\_____/'     :
+   \                 /
+    '.             .'
+      '-.._____..-'
+'''
 
 SEVERITY_RISK = {"destructive": 4, "active": 3, "noisy": 2, "safe": 1}
 
@@ -535,15 +551,84 @@ def resolve_scope_interactive(cfg: dict) -> dict:
     return cfg
 
 
-def _print_banner(cfg: dict):
-    for line in _AIXSEC_ART.splitlines():
-        print(f"{CYAN}{line.rstrip()}{RESET}")
-    print(f"{MAGENTA}{'═' * 64}{RESET}")
-    print(f"{BOLD}{GREEN}AIXSEC-X v{VERSION}{RESET} — AI Web Exploitation Assistant  "
-          f"{DIM}(local LLM • Kali Linux){RESET}")
-    print(f"{DIM}Brand:{RESET} {CYAN}aixsecu.com{RESET}   {DIM}Mode:{RESET} "
-          f"{YELLOW}{cfg.get('auto_exec', 'ask')}{RESET}")
-    print(f"{MAGENTA}{'═' * 64}{RESET}")
+def _sysinfo() -> dict:
+    """Host/session facts cho status block — toàn bộ là giá trị THẬT từ máy
+    chạy, không bịa (v1.4.8)."""
+    info = {"host": "host-unknown", "kernel": "-", "python": "?",
+            "ts": time.strftime("%Y-%m-%d %H:%M:%S"), "pid": os.getpid()}
+    try:
+        import platform
+        info["host"] = platform.node() or info["host"]
+        info["kernel"] = platform.release() or "-"
+        info["python"] = platform.python_version()
+    except Exception:  # noqa: BLE001
+        pass
+    return info
+
+
+def _banner(cfg: dict, scope: str = "", missing=None, mode: str = "interactive",
+            color: bool | None = None) -> str:
+    """Màn hình khởi động kiểu hacker (v1.4.8): skull đỏ + logo xanh trên nền
+    đen + status block thật (model/scope/auto-exec/host/kernel/session/modules)
+    đóng khung ASCII. color=None → tự bật/tắt theo TTY (NO_COLOR cũng tắt màu)."""
+    if color is None:
+        color = bool(getattr(sys.stdout, "isatty", lambda: False)())
+        if os.environ.get("NO_COLOR"):
+            color = False
+    if color:
+        G, R, Y, C, M, B, D, A, RS, BK = (GREEN, RED, YELLOW, CYAN, MAGENTA,
+                                            BOLD, DIM, "\033[38;5;214m", RESET, _BLACK)
+    else:
+        G = R = Y = C = M = B = D = A = RS = BK = ""
+
+    info = _sysinfo()
+    scope = scope or (",".join(cfg.get("targets") or []) or "(none)")
+    missing = missing or {}
+    n_tools = len(TOOL_REGISTRY)
+    miss_str = ("  " + Y + "⚠ missing: "
+                + ", ".join(f"{B}{t}{RS}{Y}({TOOL_BINS[t]}){RS}"
+                             for t in sorted(missing)) + RS) if missing else ""
+
+    W = 62  # chiều rộng nội dung khung (tính theo ký tự HIỂN THỊ — ANSI là 0-rộng)
+    _ansi = re.compile(r"\x1b\[[0-9;]*m")
+    def row(t=""):
+        vis = _ansi.sub("", t or "")
+        if len(vis) > W:
+            # dòng quá dài: bỏ màu, cắt trần W (không vỡ khung)
+            return "│ " + vis[:W].ljust(W) + " │"
+        pad = " " * (W - len(vis))
+        if color:
+            # phần đệm cũng nền đen cho đồng nhất toàn khung
+            return "│ " + t + BK + pad + RS + " │"
+        return "│ " + t + pad + " │"
+    top = "┌" + "─" * (W + 2) + "┐"
+    sep = "├" + "─" * (W + 2) + "┤"
+    bot = "└" + "─" * (W + 2) + "┘"
+
+    lines = [top]
+    for s in _SKULL_ART.splitlines():
+        s = s.rstrip()
+        lines.append(row(f"{BK}{R}{B}{s}{RS}"))
+    for s in _AIXSEC_ART.splitlines():
+        s = s.rstrip()
+        lines.append(row(f"{BK}{G}{B}{s}{RS}"))
+    lines.append(row(f"{BK}{G}{B}AIXSEC-X v{R}{VERSION}{G}{RS}{BK} — AI Web Exploitation Assistant{RS}"))
+    lines.append(row(f"   {D}local LLM • Kali Linux    brand: aixsecu.com{RS}"))
+    lines.append(sep)
+    lines.append(row(f"{C}{B}[>]{RS} {D}model    {RS} {B}{info['python']} | {cfg.get('model', '?')}{RS}"))
+    lines.append(row(f"{C}{B}[>]{RS} {D}scope    {RS} {G}{scope}{RS}"))
+    lines.append(row(f"{C}{B}[>]{RS} {D}auto-exec{RS} {Y}{cfg.get('auto_exec', 'ask')}{RS}   {D}mode: {A}{mode}{RS}"))
+    lines.append(row(f"{C}{B}[>]{RS} {D}host     {RS} {B}{info['host']}{RS}  {D}kernel {info['kernel']}{RS}"))
+    lines.append(row(f"{C}{B}[>]{RS} {D}session  {RS} {info['ts']}  {D}pid {info['pid']}{RS}"))
+    lines.append(row(f"{C}{B}[>]{RS} {D}modules  {RS} {B}{n_tools}{RS} {D}tools loaded{RS}{miss_str}"))
+    lines.append(sep)
+    lines.append(row(f"{D}   q quit | !! <cmd> shell | /findings ledger | /report export{RS}"))
+    lines.append(bot)
+    return "\n".join(lines) + "\n"
+
+
+def _print_banner(cfg: dict, scope: str = "", missing=None, mode: str = "interactive"):
+    print(_banner(cfg, scope=scope, missing=missing, mode=mode), flush=True)
 
 
 def main():
@@ -572,13 +657,9 @@ def main():
         sys.exit(1)
 
     agent = WebXAgent(config=cfg)
-    _print_banner(cfg)
-    print(f"{GREEN}[*]{RESET} Model       : {BOLD}{cfg['model']}{RESET}")
-    print(f"{GREEN}[*]{RESET} Scope       : {agent.policy.describe()}")
-    print(f"{GREEN}[*]{RESET} Auto-exec   : {cfg['auto_exec']}")
-    if agent.missing_tools:
-        print(f"{YELLOW}[⚠]{RESET} Unavailable tools (binary missing): "
-              f"{BOLD}{', '.join(f'{s}({TOOL_BINS[s]})' for s in sorted(agent.missing_tools))}{RESET}")
+    _mode = "batch" if (non_interactive or one_shot) else "interactive"
+    _print_banner(cfg, scope=agent.policy.describe(),
+                  missing=agent.missing_tools, mode=_mode)
 
     if do_recon and cfg["targets"]:
         cyan = "\033[96m"
@@ -599,10 +680,11 @@ def main():
         return
 
     # ── interactive ──
-    print("\n[*] Interactive mode. Type 'q' to quit, '!! <cmd>' to run shell commands.")
+    print(f"{DIM}[>]{RESET} {DIM}Type{RESET} {GREEN}'q'{RESET} {DIM}quit |{RESET} {GREEN}'!! <cmd>'{RESET} {DIM}shell |{RESET} "
+          f"{GREEN}'/findings'{RESET} {DIM}ledger |{RESET} {GREEN}'/report'{RESET} {DIM}export.{RESET}", flush=True)
     while True:
         try:
-            line = input(f"\n{GREEN}{BOLD}aixsec-x>{RESET} ").strip()
+            line = input(f"\n{BOLD}{GREEN}root@aixsec-x{RESET}{DIM}:~#{RESET} ").strip()
         except (EOFError, KeyboardInterrupt):
             print("\n[!] Exiting.")
             break
