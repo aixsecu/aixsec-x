@@ -68,6 +68,8 @@ TOOL_BINS: dict[str, str] = {
     "sqlmap_check": "sqlmap",
     "sqlmap_runner": "sqlmap",
     "nikto_scan": "nikto",
+    "wapiti_scan": "wapiti",
+
     "ffuf_dir": "ffuf",
     "subdomain_enum": "subfinder",
     "detect_cms": "whatweb",
@@ -94,7 +96,14 @@ TOOL_TIMEOUTS: dict[str, int] = {
     "subdomain_enum": 90,    # subfinder brute từ từ
     "nikto_scan": 180,       # nikto vốn chậm — cap đủ cho scan trung bình
     "sqlmap_runner": 300,   # v1.4.7: sqlmap bounded — đủ cho 1 lần chạy technique set
+    "wapiti_scan": 600,      # v1.5.0: scan cả website (crawler+attack) — operator tăng WEBX_TOOL_TIMEOUT nếu cần
 }
+
+# v1.5.1: tool QUÉT DÀI — _dispatch dùng SÀN max(tool_timeout, cap) thay vì trần
+# min(). Lý do (Bug 2): min() chặn wapiti_scan ở tool_timeout mặc định 90s →
+# wapiti bị giết giữa chừng (chưa kịp ghi report JSON), vòng chạy mà như không
+# chạy. Cap 600s là mức TỐI THIỂU; operator muốn lâu hơn thì tăng WEBX_TOOL_TIMEOUT.
+LONG_RUN_TOOLS: frozenset = frozenset({"wapiti_scan"})
 
 
 def available_tools() -> tuple[set, dict]:
@@ -497,6 +506,327 @@ def _find_forms(**kw):
         lines.append(f"     inputs: {ins}")
     lines.append("[i] Ghi chú: gọi sqli_manual_test với url=action, method tương ứng, "
                  "param=tên input cần test.")
+    return "\n".join(lines)
+
+
+# ─────────────────────────────────────────────
+# TOOLS — WAPITI (v1.5.0): crawler + TOÀN BỘ attack modules
+# ─────────────────────────────────────────────
+# wapiti 3.2.10 (`wapiti --list-modules`): 29 module. Khi KHÔNG truyền -m,
+# wapiti chỉ chạy module "(used by default)" (9 module) — để support "toàn bộ
+# loại tấn công wapiti hỗ trợ" (yêu cầu user) phải truyền -m với TOÀN BỘ danh
+# sách dưới đây. Danh sách lấy từ `wapiti --list-modules` thật (không đoán).
+_WAPITI_MODULES: tuple[str, ...] = (
+    "backup", "brute_login_form", "buster", "cms", "crlf", "csrf", "exec",
+    "file", "htaccess", "htp", "ldap", "log4shell", "methods",
+    "network_device", "nikto", "permanentxss", "redirect", "shellshock",
+    "spring4shell", "sql", "ssl", "ssrf", "takeover", "timesql", "upload",
+    "wapp", "wp_enum", "xss", "xxe",
+)
+_WAPITI_SCOPE = ("url", "page", "folder", "subdomain", "domain", "punk")
+_WAPITI_SEV = {0: "info", 1: "low", 2: "medium", 3: "high", 4: "critical"}
+_WAPITI_SEV_RANK = {"info": 0, "low": 1, "medium": 2, "high": 3, "critical": 4}
+_WAPITI_MAX_EXPLOIT = 3  # số SQLi tối đa tự đẩy sang sqlmap_runner mỗi lượt
+
+# v1.5.0: hướng dẫn BƯỚC TIẾP THEO theo category trong report JSON wapiti
+# (category ổn định theo version — không phải tên module). Category chưa có
+# trong map → fallback dùng solution từ classifications trong report.
+_WAPITI_GUIDANCE: dict[str, str] = {
+    "SQL Injection": "Chạy sqlmap_runner (technique='E', dbms theo DBMS trong finding) — auto nếu exploit=true.",
+    "Blind SQL Injection": "Chạy sqlmap_runner (technique='T', dbms theo DBMS) hoặc sqli_blind_extract cho kênh boolean/time.",
+    "Command execution": "Xác minh bằng poc_executor (gọi endpoint với payload) — không chạy payload phá hoại; ghi nhận RCE nếu xác nhận.",
+    "Path Traversal": "poc_executor thử đọc /etc/passwd (Linux) / C:/Windows/win.ini (Windows) theo curl_command; đánh giá mức lộ file.",
+    "Server Side Request Forgery": "Gọi oob_listener trước, gửi payload SSRF trỏ interactsh domain trong log để bắt callback OOB.",
+    "XXE": "Gọi oob_listener trước, inject XXE với external entity trỏ interactsh domain; đợi callback trong log.",
+    "Reflected Cross Site Scripting": "Xác minh bằng trình duyệt (snapshot) với URL+payload trong curl_command; ghi nhận nếu script chạy.",
+    "Stored Cross Site Scripting": "Xác minh bằng trình duyệt trên trang lưu output; nếu chạy → ảnh hưởng mọi user xem trang.",
+    "HTML Injection": "Xem view-source trang: payload hiển thị thô — thấp hơn XSS nếu JS không chạy.",
+    "Open Redirect": "Kiểm tra nhanh bằng curl -I theo curl_command (vị trí Location header).",
+    "CRLF Injection": "headers_recon với payload trong curl_command — tìm header bị inject (vd Set-Cookie).",
+    "Htaccess Bypass": "Thử các HTTP method khác (module methods) lên tài nguyên bị chặn; 200 kèm nội dung nhạy cảm = confirmed.",
+    "Backup file": "Tải file backup (curl theo path) và soi nội dung — có thể chứa source/config rò rỉ.",
+    "Potentially dangerous file": "Tải file theo curl_command; chạy trivy/wpscan nếu là source PHP/WordPress.",
+    "Weak credentials": "Đăng nhập thủ công bằng credential vừa tìm; vào được → đổi mật khẩu ngay (khuyến nghị).",
+    "Cross Site Request Forgery": "view-source form: không có token CSRF trên thao tác nhạy cảm = CSRF thật.",
+    "Log4Shell": "Xác minh phiên bản Java/log4j (banner, headers, file jar lộ); payload OOB nếu dùng --dns-endpoint.",
+    "Spring4Shell": "Xác minh phiên bản Spring (5.3.x < 5.3.18 / 5.2.x < 5.2.20) trước khi kết luận.",
+    "Subdomain takeover": "Kiểm tra CNAME trỏ domain không tồn tại (dns_lookup/dig) và domain còn claim được không.",
+    "NS takeover": "Kiểm tra NS record trỏ nhà cung cấp DNS không hoạt động; đổi NS ngay.",
+    "TLS/SSL misconfigurations": "Re-check bằng detect_cms/sslscan; fix: bỏ TLS < 1.2 và weak cipher.",
+    "HTTP Strict Transport Security (HSTS)": "Bật Strict-Transport-Security (max-age >= 6 tháng) trên HTTPS.",
+    "Content Security Policy Configuration": "Thêm CSP header (script-src, object-src...) để giảm XSS.",
+    "Clickjacking Protection": "Thêm X-Frame-Options: DENY/SAMEORIGIN hoặc CSP frame-ancestors.",
+    "Secure Flag cookie": "Thêm thuộc tính Secure cho cookie.",
+    "HttpOnly Flag cookie": "Thêm thuộc tính HttpOnly cho cookie.",
+    "Unencrypted Channels": "Chuyển toàn bộ traffic sang HTTPS + redirect 301 từ HTTP.",
+    "Inconsistent Redirection": "Đồng bộ redirect HTTP→HTTPS cho mọi path (tránh redirect loop/leak).",
+}
+
+
+def _wapiti_parse_report(report_path: str) -> dict:
+    """Parse report JSON của wapiti → dict chuẩn + dedupe finding."""
+    with open(report_path, encoding="utf-8") as f:
+        rep = json.load(f)
+    infos = rep.get("infos") or {}
+    vulns: dict = rep.get("vulnerabilities") or {}
+    findings = []
+    for cat, items in vulns.items():
+        for it in items or []:
+            if not isinstance(it, dict):
+                continue
+            findings.append({
+                "category": cat,
+                "module": str(it.get("module") or ""),
+                "method": str(it.get("method") or "GET").upper(),
+                "path": str(it.get("path") or ""),
+                "parameter": str(it.get("parameter") or ""),
+                "level": int(it.get("level") or 0),
+                "info": str(it.get("info") or "").strip(),
+                "wstg": it.get("wstg") or [],
+                "http_request": str(it.get("http_request") or "").strip(),
+                "curl_command": str(it.get("curl_command") or "").strip(),
+                "referer": str(it.get("referer") or "").strip(),
+            })
+    # dedupe (category, method, path, parameter|curl) — giữ bản level cao nhất
+    best: dict[tuple, dict] = {}
+    for f in findings:
+        k = (f["category"], f["method"], f["path"],
+             f["parameter"] or f["curl_command"])
+        if k not in best or f["level"] > best[k]["level"]:
+            best[k] = f
+    findings = sorted(best.values(),
+                      key=lambda x: (_WAPITI_SEV_RANK.get(_WAPITI_SEV.get(x["level"], "info"), 0),
+                                     x["category"], x["path"]),
+                      reverse=True)
+    return {
+        "target": infos.get("target") or "",
+        "date": infos.get("date") or "",
+        "version": infos.get("version") or "",
+        "scope": infos.get("scope") or "",
+        "crawled": infos.get("crawled_pages_nbr") or 0,
+        "findings": findings,
+        "classifications": rep.get("classifications") or {},
+    }
+
+
+def _strip_wapiti_probe(value: str) -> str:
+    """Bỏ hậu tố probe của wapiti (`¿'"(` = %C2%BF%27%22%28) khỏi giá trị
+    tham số trong http_request để lấy lại form data GỐC cho sqlmap."""
+    import urllib.parse as up
+    d = up.unquote(value)
+    for suf in ("%C2%BF%27%22%28", "%BF%27%22%28", "¿'\"("):
+        if value.endswith(suf):
+            return value[:-len(suf)]
+        if d.endswith(suf):
+            return up.quote(d[:-len(suf)], safe="")
+    return value
+
+
+def _wapiti_sqli_target(base_url: str, f: dict) -> tuple[str, str | None]:
+    """(url tuyệt đối cho sqlmap, data POST hoặc None) từ finding wapiti."""
+    b = base_url.rstrip("/")
+    p = f["path"].lstrip("/")
+    t = b + "/" + p if p else b
+    if f["method"] == "POST":
+        data = None
+        if f["http_request"] and f["parameter"]:
+            body = f["http_request"].split("\n\n", 1)[-1].split("\r\n\r\n", 1)[-1].strip()
+            if body and "=" in body:
+                parts: dict[str, str] = {}
+                for kv in body.split("&"):
+                    if "=" in kv:
+                        k, v = kv.split("=", 1)
+                        parts[k] = v
+                raw = parts.get(f["parameter"], "")
+                data = f"{f['parameter']}={_strip_wapiti_probe(raw)}"
+        return t, data or (f"{f['parameter']}=" if f["parameter"] else None)
+    if f["parameter"]:
+        return t + "?" + f["parameter"] + "=1", None
+    return t, None
+
+
+def _wapiti_scan(**kw):
+    """v1.5.0: wapiti 3.2.10 — crawler + TOÀN BỘ attack modules (29 module).
+
+    Bounded: scope mặc định domain (cả website), depth/scan-time/attack-time có
+    trần cứng, chạy `-f json` để parse chính xác. exploit=true (mặc định): tự
+    chạy sqlmap_runner trên tối đa _WAPITI_MAX_EXPLOIT SQLi findings (giữ luật
+    sqlmap-FIRST sau khi wapiti CONFIRMED). Mọi finding khác trả payload
+    (curl_command/http_request) + guidance để model xác minh/khai thác tiếp.
+    """
+    import tempfile
+    import time
+    from urllib.parse import urlparse
+
+    _need("wapiti")
+    url = kw["url"].rstrip("/")
+    if not urlparse(url).scheme in ("http", "https"):
+        return f"[!] wapiti_scan: url phải là http(s):// — nhận: {kw['url']!r}"
+    scope = str(kw.get("scope") or "domain").strip().lower()
+    if scope not in _WAPITI_SCOPE:
+        return ("[!] wapiti_scan: scope không hợp lệ — " + "/".join(_WAPITI_SCOPE)
+                + f"; nhận: {scope!r}")
+    mods_raw = str(kw.get("modules") or "").strip()
+    if not mods_raw:
+        mods = list(_WAPITI_MODULES)
+    else:
+        mods = [m.strip().lower() for m in re.split(r"[,; ]+", mods_raw) if m.strip()]
+        bad = [m for m in mods if m not in _WAPITI_MODULES]
+        if bad:
+            return ("[!] wapiti_scan: module không hợp lệ: " + ", ".join(bad)
+                    + "\n[i] Module hợp lệ: " + ", ".join(_WAPITI_MODULES))
+        mods = list(dict.fromkeys(mods))
+
+    depth = max(1, min(int(kw.get("depth") or 3), 10))
+    tasks = max(1, min(int(kw.get("tasks") or 3), 8))
+    req_timeout = max(5, min(int(kw.get("timeout") or 10), 30))
+    # run budget: tôn trọng _timeout (dispatch cap) — scan để wapiti TỰ kết thúc
+    # trước khi run_cmd giết (bài học nikto v1.4.4: -maxtime = _timeout-10).
+    budget = int(kw.get("_timeout") or 300)
+    scan_time = max(30, min(int(kw.get("max_scan_time") or min(budget - 20, 300)),
+                            min(budget - 20, 1800)))
+    attack_time = max(15, min(int(kw.get("max_attack_time") or 90),
+                              max(15, scan_time // 2)))
+    exploit = bool(kw.get("exploit", True))
+
+    report_dir = tempfile.mkdtemp(prefix="aixsec-x_wapiti_")
+    report_path = os.path.join(report_dir, "report.json")
+    args = ["wapiti", "-u", url, "--scope", scope, "-m", ",".join(mods),
+            "-d", str(depth), "--tasks", str(tasks),
+            "--max-scan-time", str(scan_time), "--max-attack-time", str(attack_time),
+            "-t", str(req_timeout), "-f", "json", "-o", report_path,
+            "--flush-session", "--no-bugreport", "-v", "1"]
+    if kw.get("cookie"):
+        args += ["-C", str(kw["cookie"])]
+    t0 = time.monotonic()
+    # v1.5.1 (Bug 2): truyền NGUYÊN budget thay vì min(budget, scan_time+60) —
+    # trước đây run_cmd giết wapiti khi scan_time+60 trôi qua dù budget còn dư,
+    # wapiti chưa kịp ghi report JSON nên outcome=error 'thiếu report' mọi lần.
+    # Budget giờ = max(tool_timeout, 600) nhờ LONG_RUN_TOOLS trong _dispatch, còn
+    # wapiti tự kết thúc khi hết --max-scan-time (nhỏ hơn budget) nên run_cmd chỉ
+    # là lưới an toàn cuối, không cắt ngang scan giữa chừng.
+    out = run_cmd(args, budget, max_chars=6000)
+    # 1) lỗi thực thi (timeout / thiếu binary /...) — KHÔNG kết luận gì từ lần chạy này
+    if out.startswith("[!]"):
+        err_line = out.splitlines()[0].lstrip("[!] ").strip()
+        return (f"[!] wapiti không hoàn tất (lỗi thực thi): {err_line}"
+                f"\n[i] lệnh: {' '.join(args)}"
+                f"\n[i] Gợi ý: giảm scope (page/folder), giảm modules (vd 'sql,xss'), "
+                f"tăng WEBX_TOOL_TIMEOUT cho scan dài.")
+    # 2) report JSON không tồn tại / hỏng → lỗi (không bịa kết quả)
+    if not os.path.exists(report_path):
+        return (f"[!] wapiti không tạo được report JSON ({report_path}).\n"
+                f"[i] lệnh: {' '.join(args)}\n{out[-1000:]}")
+    try:
+        rep = _wapiti_parse_report(report_path)
+    except Exception as e:  # noqa: BLE001 — JSON hỏng = lỗi thực thi
+        return (f"[!] wapiti report JSON không đọc được: {e}"
+                f"\n[i] lệnh: {' '.join(args)}\n{out[-1000:]}")
+
+    findings = rep["findings"]
+    craw = rep["crawled"] or 0
+    ver = rep["version"].replace("Wapiti ", "")
+    lines = [f"[✓] wapiti QUÉT XONG (v{ver}) — {rep['target']} "
+             f"[scope={rep['scope']}, {craw} URL/form, {len(findings)} mục]"]
+    if not findings:
+        lines.append("[i] KHÔNG phát hiện lỗ hổng nào trong phạm vi này.")
+        lines.append("[→] BƯỚC TIẾP THEO: hẹp phạm vi (scope=page/folder, -d sâu hơn), "
+                     "bật nhóm module (vd 'sql,xss,exec'), hoặc dùng find_forms + "
+                     "sqli_manual_test cho từng endpoint thủ công.")
+        return "\n".join(lines) + f"\n[i] report JSON (bằng chứng): {report_path}"
+
+    sev_sort = ["critical", "high", "medium", "low", "info"]
+    by_sev: dict[str, list[dict]] = {s: [] for s in sev_sort}
+    for f in findings:
+        s = _WAPITI_SEV.get(f["level"], "info")
+        by_sev.setdefault(s, []).append(f)
+    n_noninfo = sum(len(v) for k, v in by_sev.items() if k != "info")
+    if n_noninfo:
+        lines.append(f"[✓] Phát hiện {n_noninfo} lỗ hổng (không tính mục info):")
+    else:
+        lines.append("[i] Chỉ có mục mức info (fingerprint/headers/cookie flags) — "
+                     "chưa có lỗ hổng mức khai thác.")
+    detail_budget = 8  # in chi tiết đầy đủ cho 8 mục nặng nhất (tránh tràn context)
+    shown = 0
+    for s in sev_sort:
+        for f in by_sev.get(s, []):
+            loc = f["method"] + " " + (f["path"] or "?")
+            p = f" (param={f['parameter']})" if f["parameter"] else ""
+            m = f" [module={f['module']}]" if f["module"] else ""
+            line = f"[{s.upper()}] {f['category']}{p} — {loc}{m}"
+            if s != "info":
+                line += f"\n    → {f['info'] or 'xem report'}"
+                if f.get("wstg"):
+                    line += f"\n    → wstg: {', '.join(f['wstg'])}"
+                if f.get("curl_command"):
+                    c = f["curl_command"]
+                    if len(c) > 220:
+                        c = c[:220] + "..."
+                    line += f"\n    → curl: {c}"
+            lines.append(line)
+            shown += 1
+            if shown >= detail_budget:
+                rem = len(findings) - shown
+                if rem > 0:
+                    lines.append(f"[i] ... còn {rem} mục khác — xem đầy đủ trong report JSON: {report_path}")
+                break
+        if shown >= detail_budget:
+            break
+
+    lines.append("[→] BƯỚC TIẾP THEO (xác minh/khai thác theo category):")
+    g_seen: set[str] = set()
+    g_count = 0
+    for s in sev_sort:
+        for f in by_sev.get(s, []):
+            if f["category"] in g_seen:
+                continue
+            g_seen.add(f["category"])
+            g = _WAPITI_GUIDANCE.get(f["category"])
+            if not g:
+                cls = (rep["classifications"] or {}).get(f["category"]) or {}
+                sol = (cls.get("sol") or "").strip()
+                g = "Xác minh thủ công theo curl_command" + (
+                    f" — fix: {sol}" if sol else "")
+            lines.append(f"  • {f['category']}: {g}")
+            g_count += 1
+            if g_count >= 10:  # giữ context gọn; phần còn lại nằm trong report JSON
+                break
+        if g_count >= 10:
+            break
+
+    # ── AUTO-EXPLOIT: sqlmap FIRST sau khi wapiti CONFIRMED (luật v1.4.7 giữ nguyên)
+    if exploit:
+        sql_cats = ("SQL Injection", "Blind SQL Injection")
+        sqli = [f for f in findings if f["category"] in sql_cats]
+        if sqli:
+            lines.append(f"[→] TỰ ĐỘNG KHAI THÁC (exploit=true): sqlmap_runner trên "
+                         f"{min(len(sqli), _WAPITI_MAX_EXPLOIT)}/{len(sqli)} SQLi "
+                         f"— sqlmap-FIRST sau wapiti CONFIRMED.")
+            elapsed = time.monotonic() - t0
+            sql_budget = max(30, min(180, int(budget - elapsed - 5)))
+            for i, f in enumerate(sqli[:_WAPITI_MAX_EXPLOIT], 1):
+                target, data = _wapiti_sqli_target(url, f)
+                dbms = "auto"
+                m = re.search(r"DBMS:\s*([^)\]}]+)", f["info"])
+                if m:
+                    d = m.group(1).strip().lower()
+                    if "microsoft sql" in d or "mssql" in d:
+                        dbms = "mssql"
+                    elif "mysql" in d:
+                        dbms = "mysql"
+                tech = "T" if f["category"] == "Blind SQL Injection" else "E"
+                sql_out = _sqlmap_runner(url=target, data=data, dbms=dbms,
+                                         technique=tech, timeout=sql_budget,
+                                         _timeout=sql_budget)
+                lines.append(f"\n[r] KHAI THÁC #{i}: {f['category']} — "
+                             f"{f['method']} {f['path']} "
+                             f"(param={f['parameter'] or '?'}, dbms={dbms}, "
+                             f"technique={tech}, target={target})")
+                lines.append(sql_out)
+        else:
+            lines.append("[i] Không có SQLi để auto-exploit; các finding khác đã kèm "
+                         "payload + hướng dẫn bên trên.")
+    lines.append(f"[i] report JSON (bằng chứng đầy đủ): {report_path}")
     return "\n".join(lines)
 
 
@@ -1344,6 +1674,44 @@ TOOL_REGISTRY: list[ToolSpec] = [
     ToolSpec("nikto_scan", "Quét nikto (web server scanner, ồn).",
              {"type": "object", "properties": {"url": {"type": "string", "pattern": "^https?://"}},
               "required": ["url"]}, _nikto_scan, risk="noisy"),
+
+    # ── WAPITI (v1.5.0) ──
+    ToolSpec("wapiti_scan",
+             "v1.5.0: Quét TOÀN BỘ website bằng wapiti (crawler + 29 attack module: "
+             "sql/timesql, xss/permanentxss, exec, file, xxe, ssrf, ldap, crlf, redirect, "
+             "backup, htaccess, buster, csrf, methods, cms, wp_enum, network_device, "
+             "log4shell, spring4shell, shellshock, takeover, upload, htp, nikto, wapp, "
+             "ssl, brute_login_form...). Mặc định scope=domain (cả website), max_scan_time=300s, "
+             "có trần giới hạn, không chạy vô hạn. exploit=true (mặc định): SQLi CONFIRMED "
+             "tự đẩy sang sqlmap_runner (sqlmap-FIRST, max 3 mục). Report JSON lưu /tmp làm "
+             "bằng chứng. CSP/security headers/cookie flags/https-redirect là CATEGORY trong "
+             "report (không phải module chạy riêng) — nằm trong phần info của scan.",
+             {"type": "object",
+              "properties": {
+                  "url": {"type": "string", "pattern": "^https?://",
+                          "description": "URL gốc website cần quét (VD http://target/) — scope=domain để quét cả site"},
+                  "scope": {"type": "string",
+                            "enum": ["url", "page", "folder", "subdomain", "domain", "punk"],
+                            "description": "Phạm vi crawl; mặc định domain (toàn bộ website)"},
+                  "modules": {"type": "string",
+                              "description": "Module wapiti phân tách dấu phẩy/space (vd 'sql,xss'); bỏ trống = cả 29 module"},
+                  "depth": {"type": "integer", "minimum": 1, "maximum": 10,
+                            "description": "Độ sâu crawl (mặc định 3)"},
+                  "max_scan_time": {"type": "integer", "minimum": 30, "maximum": 1800,
+                                    "description": "Giây tối đa pha scan (mặc định 300)"},
+                  "max_attack_time": {"type": "integer", "minimum": 15,
+                                      "description": "Giây tối đa mỗi module attack (mặc định 90; tự giới hạn ≤ scan_time/2)"},
+                  "tasks": {"type": "integer", "minimum": 1, "maximum": 8,
+                            "description": "Số task song song (mặc định 3)"},
+                  "timeout": {"type": "integer", "minimum": 5, "maximum": 30,
+                              "description": "Request timeout giây (mặc định 10)"},
+                  "exploit": {"type": "boolean",
+                              "description": "true (mặc định): SQLi CONFIRMED tự chạy sqlmap_runner"},
+                  "cookie": {"type": "string",
+                             "description": "Cookie phiên cho vùng cần đăng nhập (VD 'PHPSESSID=x;...')"},
+              },
+              "required": ["url"]},
+             _wapiti_scan, risk="noisy"),
 
     # ── SAST ──
     ToolSpec("sast_scan",
