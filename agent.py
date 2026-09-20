@@ -33,7 +33,7 @@ from tools import (TOOL_REGISTRY, TOOL_INDEX, TOOL_BINS, TOOL_TIMEOUTS,
                    available_tools)
 
 # ── terminal colors (AIXSEC-X style) ──
-VERSION = "1.4.8"
+VERSION = "1.4.9"
 
 RED = "\033[91m"
 GREEN = "\033[92m"

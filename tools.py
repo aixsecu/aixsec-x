@@ -376,6 +376,18 @@ def _sqlmap_runner(**kw):
     if kw.get("cookie"):
         args += ["--cookie", kw["cookie"]]
     out = run_cmd(args, min(secs, int(kw.get("_timeout") or secs)), max_chars=4000)
+    # v1.4.9: run_cmd trả "[!] ..." = LỖI THỰC THI (timeout, thiếu binary, lỗi
+    # khác) — KHÔNG phải "sqlmap chạy xong". Trước v1.4.9 timeout rơi vào nhánh
+    # "KHÔNG thấy dấu hiệu" với outcome=ok → model tưởng "not injectable" và bịa
+    # chi tiết (vd "lỗi 500") — SAI thiết kế. Lưu ý: sqlmap in "[!] legal
+    # disclaimer" MỖI lần chạy → loại trừ dòng đó. Timeout/exec-lỗi → outcome=error.
+    if out.startswith("[!]") and not out.startswith("[!] legal disclaimer"):
+        err_line = out.splitlines()[0].lstrip("[!] ").strip()
+        return ("[!] sqlmap không hoàn tất (lỗi thực thi): " + err_line
+                + "\n[i] lệnh: " + " ".join(args)
+                + "\n[i] KHÔNG kết luận injectable/not-injectable từ lần chạy này."
+                  " Nếu timeout: giảm kỹ thuật (vd technique='E' hoặc 'T') hoặc"
+                  " tăng timeout — KHÔNG gọi lại đúng url+tham số y hệt (bị block)")
     markers = ["is vulnerable", "Parameter:", "back-end DBMS:",
                "current database:", "current user:", "Table:"]
     low = out.lower()
@@ -388,6 +400,13 @@ def _sqlmap_runner(**kw):
             head = "[-] sqlmap chạy xong KHÔNG thấy dấu hiệu khai thác."
     else:
         head = "[-] sqlmap không thấy tham số để test (xem log)."
+    # v1.4.9: chuẩn hóa dòng "not injectable" — model đọc dòng này thay vì tự
+    # diễn giải log trần (chống bịa số liệu như "218 lần lỗi 500").
+    if "not injectable" in low or "not appear to be injectable" in low:
+        head += (f"\n[i] sqlmap 'not injectable' với kỹ thuật {tech_s} — đúng cho kênh"
+                 " này (template hấp thụ payload / WAF / không có kênh dữ liệu)."
+                 " KHÔNG phải bằng chứng 'không có SQLi'; nếu đã CONFIRMED bằng"
+                 " chứng cứ khác thì giữ candidate + NEEDS VALIDATION.")
     return f"{head}\n[i] lệnh: {pretty}\n" + out
 
 

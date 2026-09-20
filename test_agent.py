@@ -2104,7 +2104,11 @@ class TestSqlmapRunner(unittest.TestCase):
     dedupe + uppercase, --dbms chỉ khi != auto, --data/--cookie khi có), timeout
     clamp 30..600, input invalid → outcome=error KHÔNG chạy sqlmap, run_cmd
     timeout = min(secs clamp, _timeout cap TOOL_TIMEOUTS=300), markers → đầu
-    '[✓]', "no parameter(s) found" → đầu '[-]'."""
+    '[✓]', "no parameter(s) found" → đầu '[-]'.
+    v1.4.9: run_cmd trả '[!]' (timeout/exec-lỗi) → outcome=error + KHÔNG kết
+    luận injectable/not-injectable (trước đây timeout bị coi là "chạy xong");
+    'not injectable' trong log → dòng chuẩn hóa '[i]' cho model (chống bịa
+    số liệu). 'legal disclaimer' của sqlmap KHÔNG bị coi là lỗi."""
 
     def _dispatch(self, args, tool_timeout=600,
                   run_out=("back-end DBMS: Microsoft SQL Server 2019\n"
@@ -2220,6 +2224,57 @@ class TestSqlmapRunner(unittest.TestCase):
         self.assertEqual(r["outcome"], "ok")
         self.assertIn("[-] sqlmap chạy xong KHÔNG thấy dấu hiệu khai thác",
                       r["output"])
+
+    # ── v1.4.9: timeout/exec-lỗi phải là outcome=error, KHÔNG phải "ok" ──
+    def test_timeout_exec_error_outcome_error(self):
+        """run_cmd trả '[!] Timeout sau 90s.' (bắt TimeoutExpired) — trước v1.4.9
+        rơi vào nhánh 'KHÔNG thấy dấu hiệu' với outcome=ok → model tưởng
+        'not injectable' và bịa chi tiết. Giờ phải error + cấm kết luận."""
+        r, c = self._dispatch({"url": "https://abc.vn/web.php?id=1",
+                               "technique": "BEUSTQ"},
+                              run_out="[!] Timeout sau 90s.")
+        self.assertEqual(r["outcome"], "error")
+        self.assertIn("[!] sqlmap không hoàn tất (lỗi thực thi): Timeout sau 90s.",
+                      r["output"])
+        self.assertIn("KHÔNG kết luận injectable/not-injectable", r["output"])
+        # hướng dẫn hành động thay thế — KHÔNG spam lại url y hệt
+        self.assertIn("giảm kỹ thuật (vd technique='E' hoặc 'T')", r["output"])
+        self.assertIn("[i] lệnh: sqlmap", r["output"])
+        # không được lẫn với nhánh "chạy xong"
+        self.assertNotIn("KHÔNG thấy dấu hiệu khai thác", r["output"])
+
+    def test_run_cmd_generic_error_propagates(self):
+        r, c = self._dispatch({"url": "https://abc.vn/"},
+                              run_out="[!] Lỗi: connection reset")
+        self.assertEqual(r["outcome"], "error")
+        self.assertIn("sqlmap không hoàn tất (lỗi thực thi): Lỗi: connection reset",
+                      r["output"])
+
+    def test_legal_disclaimer_not_treated_as_error(self):
+        """sqlmap in '[!] legal disclaimer: ...' MỖI lần chạy — không được coi
+        là lỗi thực thi (chạy thật: banner + disclaimer in trước log)."""
+        r, c = self._dispatch(
+            {"url": "https://abc.vn/"},
+            run_out="[!] legal disclaimer: usage of sqlmap for attacking "
+                    "targets without prior mutual consent is illegal\n"
+                    "[INFO] testing connection to the target URL")
+        self.assertEqual(r["outcome"], "ok")  # disclaimer ≠ exec error
+        self.assertNotIn("không hoàn tất", r["output"])
+
+    def test_not_injectable_normalized_line(self):
+        """sqlmap kết luận 'not injectable' → dòng '[i]' chuẩn hóa cho model
+        (trước đây model tự diễn giải log trần → bịa '218 lần lỗi 500')."""
+        r, c = self._dispatch(
+            {"url": "https://abc.vn/", "technique": "E"},
+            run_out="[INFO] heuristics detected web page\n"
+                    "[INFO] all tested parameters do not appear to be "
+                    "injectable\n[INFO] finished")
+        self.assertEqual(r["outcome"], "ok")  # chạy xong thật
+        self.assertIn("[-] sqlmap chạy xong KHÔNG thấy dấu hiệu khai thác",
+                      r["output"])
+        self.assertIn("[i] sqlmap 'not injectable' với kỹ thuật E", r["output"])
+        self.assertIn("KHÔNG phải bằng chứng 'không có SQLi'", r["output"])
+        self.assertNotIn("không hoàn tất", r["output"])
 
 
 class TestMockParityTable(unittest.TestCase):
@@ -2350,9 +2405,10 @@ class TestBannerUpdate(unittest.TestCase):
         return _banner(**d)
 
     def test_plain_contains_core_info(self):
+        from agent import VERSION
         b = self._banner()
         self.assertIn("AIXSEC-X", b)
-        self.assertIn("1.4.8", b)
+        self.assertIn(VERSION, b)  # theo dõi VERSION động, không hardcode
         self.assertIn("m-test", b)
         self.assertIn("https://tbu.edu.vn", b)
         self.assertIn("ask", b)
