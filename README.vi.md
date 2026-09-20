@@ -405,6 +405,34 @@ Model 7B/9B (vd: `huihui_ai/qwen3.5-abliterated:9b`) tuân theo **ít quy tắc*
   với `break_long_words=True` làm tách `**ffuf_dir**` thành `**ff` + `uf_dir**`.
   Giờ dùng `break_long_words=False, break_on_hyphens=False` — từ dài nhảy
   trọn sang dòng tiếp theo.
+- **v1.5.5 — wapiti_scan TỰ QUÉT form POST: chỉ cần nhập ROOT DOMAIN, tool tự
+  tìm SQLi trên form (bài học tbu.edu.vn):** wapiti crawl
+  `https://tbu.edu.vn/WebTinTuc/TimKiem?page=1..52` và module `sql` đốt hết
+  `--max-attack-time` vào 52 URL `?page=N` trước khi chạm tới form POST
+  thực sự dính lỗi (`keyword`) — nên tool báo SQLi GIẢ ở `page` và BỎ SÓT
+  lỗi thật. v1.5.5 sửa cả 2 đầu:
+  **(1) `skipped_parameters` (arg mới, mặc định BẬT):** các param phân trang
+  (`page, p, pageindex, page_id, pageid, offset, limit, start, per_page,
+  perpage, pageno, page_number, pagenumber, pg`) được truyền cho wapiti
+  dạng `--skip <param>` để pha GET không đốt attack time vào `?page=N`;
+  ghi đè bằng chuỗi phân tách phẩy (`skipped_parameters: "foo,bar"`) hoặc
+  tắt bằng `""`. **(2) `attack_time` mặc định 90 → 150** (vẫn clamp theo
+  `scan_time/2`). **(3) `--store-session` + `_form_sweep` tự động:** wapiti
+  giờ lưu session/crawl DB (`--store-session <report_dir>/session`) và sau
+  scan tool đọc form POST thẳng từ DB (bảng `params`/`paths` — wapiti lưu
+  URL ĐẦY ĐỦ, được chuẩn hoá về path tương đối) rồi tự test từng field:
+  MSSQL error-based oracle (`MsSqlErrorOracle.detect`, engine ước lượng từ
+  headers qua `_guess_engine`) → quote-differential (3 request, không phụ
+  thuộc engine) → time-based giới hạn (2 request 1 payload, chỉ khi ≤5
+  field); finding được merge vào report TRƯỚC early-return "không có lỗ
+  hổng", dedupe với finding wapiti, severity CRITICAL,
+  `module=sql-form-sweep`, URL đầy đủ trong `info` + path tương đối trong
+  `path` (để sqlmap handoff dựng đúng target). Prompt 5a/6a cập nhật: chỉ
+  cần nhập ROOT DOMAIN là đủ. Test suite v1.5.5: **193 OK** (+4 mới
+  `TestWapitiFormSweep`: argv mặc định `--skip`/attack-time-150/
+  `--store-session`, ghi đè `skipped_parameters`, form sweep tìm ra POST
+  SQLi end-to-end với mock MSSQL oracle server + session DB đúng schema
+  wapiti, không-DB → no-op; test spec/prompt marker cập nhật sang v1.5.5).
 - **v1.5.4 — Banner thoáng hơn: bỏ khung box, bỏ nền đen, icon mặt nạ Anonymous:**
   khung `│…│` + nền đen từng dòng (`_BLACK`) + icon skull đã bị XÓA HẾT.
   `_SKULL_ART`/`_BLACK` bị loại → `_ANON_ART` (mặt nạ Anonymous kiểu Guy
