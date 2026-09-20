@@ -6,6 +6,7 @@ import json
 import os
 import re
 import shutil
+import sqlite3
 import sys
 import tempfile
 import threading
@@ -801,12 +802,12 @@ class TestPromptRules(unittest.TestCase):
 
     def test_compact_no_find_forms_wapiti_forms(self):
         self.assertNotIn("find_forms", SYSTEM_PROMPT_COMPACT)
-        self.assertIn("crawler finds real forms", SYSTEM_PROMPT_COMPACT)
+        self.assertIn("AUTO-SWEEPS POST forms", SYSTEM_PROMPT_COMPACT)
         self.assertIn("WAPITI-SQLI AUTO-EXPLOIT (v1.5.3)", SYSTEM_PROMPT_COMPACT)
 
     def test_full_no_find_forms_wapiti_mapping(self):
         self.assertNotIn("find_forms", SYSTEM_PROMPT_FULL)
-        self.assertIn("TÌM form + param sẵn", SYSTEM_PROMPT_FULL)
+        self.assertIn("TỰ QUÉT form POST", SYSTEM_PROMPT_FULL)
         self.assertIn("WAPITI-SQLI (v1.5.3)", SYSTEM_PROMPT_FULL)
         self.assertIn("MAPPING WAPITI (v1.5.3)", SYSTEM_PROMPT_FULL)
         self.assertIn("→ khai thác", SYSTEM_PROMPT_FULL)
@@ -835,9 +836,9 @@ class TestFindFormsRemoved(unittest.TestCase):
     def test_wapiti_spec_v153_replaces_it(self):
         from tools import TOOL_INDEX
         desc = TOOL_INDEX["wapiti_scan"].description
-        self.assertIn("v1.5.3", desc)
+        self.assertIn("v1.5.5", desc)
         self.assertIn("TỔNG HỢP LỖ HỔNG", desc)
-        self.assertIn("công cụ tìm form cũ", desc)
+        self.assertIn("TỰ TÌM SQLi TRÊN FORM POST", desc)
 
 
 class TestBlindPocMssql(unittest.TestCase):
@@ -2814,12 +2815,13 @@ class TestWapitiScan(unittest.TestCase):
 
     def test_scan_time_budget_clamps(self):
         # v1.5.1 (Bug 2): tool_timeout=90 → LONG_RUN_TOOLS SÀN 600s — wapiti
-        # KHÔNG còn bị giết giữa scan; budget=600 → scan=300, attack=90,
-        # run_cmd timeout=600 (lưới an toàn, wapiti tự kết thúc theo -max-scan-time)
+        # KHÔNG còn bị giết giữa scan; budget=600 → scan=300, attack=150
+        # (mặc định v1.5.5, clamp ≤ scan/2), run_cmd timeout=600 (lưới an toàn,
+        # wapiti tự kết thúc theo -max-scan-time)
         r, c, sm, rp = self._dispatch({"url": "https://abc.vn/"}, tool_timeout=90)
         self.assertEqual(r["outcome"], "ok")
         self.assertEqual(c["argv"][c["argv"].index("--max-scan-time") + 1], "300")
-        self.assertEqual(c["argv"][c["argv"].index("--max-attack-time") + 1], "90")
+        self.assertEqual(c["argv"][c["argv"].index("--max-attack-time") + 1], "150")
         self.assertEqual(c["timeout"], 600)
         # max_scan_time=5000 bị clamp theo budget 600 → 580, run_cmd 600
         r2, c2, sm2, _ = self._dispatch({"url": "https://abc.vn/",
@@ -2981,13 +2983,15 @@ class TestWapitiScan(unittest.TestCase):
             self.assertTrue(
                 _WAPITI_FIX.get(cat, _WAPITI_FIX["_default"]).strip(), cat)
 
-    def test_wapiti_scan_spec_v153(self):
-        """v1.5.3: spec wapiti_scan ghi rõ — thay cho find_forms, TỔNG HỢP LỖ
-        HỔNG, sqlmap THẤT BẠI → AI tự khai thác (known_confirmed=true)."""
+    def test_wapiti_scan_spec_v155(self):
+        """v1.5.5: spec wapiti_scan ghi rõ — TỰ TÌM SQLi TRÊN FORM POST (form
+        sweep từ session DB), --skip param phân trang, TỔNG HỢP LỖ HỔNG, sqlmap
+        THẤT BẠI → AI tự khai thác (known_confirmed=true)."""
         from tools import TOOL_INDEX
         desc = TOOL_INDEX["wapiti_scan"].description
-        for marker in ("v1.5.3", "29 attack module", "TỔNG HỢP LỖ HỔNG",
-                       "công cụ tìm form cũ", "sqli_blind_extract (known_confirmed=true)"):
+        for marker in ("v1.5.5", "29 attack module", "TỔNG HỢP LỖ HỔNG",
+                       "TỰ TÌM SQLi TRÊN FORM POST", "--store-session",
+                       "sqli_blind_extract (known_confirmed=true)"):
             self.assertIn(marker, desc)
 
     def test_no_findings_suggests_next(self):
@@ -2998,6 +3002,162 @@ class TestWapitiScan(unittest.TestCase):
         self.assertIn("KHÔNG phát hiện lỗ hổng nào", r["output"])
         self.assertIn("BƯỚC TIẾP THEO", r["output"])
         self.assertIn("http_probe", r["output"])
+        sm.assert_not_called()
+
+
+class FormSweepOracleHandler(ErrorOracleHandler):
+    """ErrorOracleHandler + X-Powered-By: ASP.NET → _guess_engine = mssql
+    (form sweep chỉ chạy oracle khi engine ước lượng = mssql)."""
+
+    def _respond(self, code: int, text: str):
+        body = text.encode("utf-8", "replace")
+        self.send_response(code)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("X-Powered-By", "ASP.NET")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+
+class TestWapitiFormSweep(unittest.TestCase):
+    """v1.5.5: wapiti_scan — skipped_parameters (--skip param phân trang),
+    attack_time mặc định 150, --store-session + form sweep TỰ TÌM SQLi trên
+    form POST từ session DB wapiti (MSSQL error-based oracle → quote-differential
+    → time-based giới hạn). Session DB giả lập đúng schema wapiti: paths
+    (path_id, method, path=URL ĐẦY ĐỦ, headers) + params (path_id, type, name,
+    value1) — path phải chuẩn hoá về RELATIVE trước khi test."""
+    server = None
+
+    @classmethod
+    def setUpClass(cls):
+        cls.server = HTTPServer(("127.0.0.1", 0), FormSweepOracleHandler)
+        cls.port = cls.server.server_address[1]
+        cls.thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
+        cls.thread.start()
+
+    @classmethod
+    def tearDownClass(cls):
+        if cls.server:
+            cls.server.shutdown()
+            cls.server.server_close()
+
+    def setUp(self):
+        from tools import _engine_cache
+        _engine_cache.clear()  # tránh nhiễm cache engine giữa các test
+
+    def tearDown(self):
+        from tools import _engine_cache
+        _engine_cache.clear()
+
+    def _dispatch(self, args, session_db=False, report=None,
+                  run_out="[✓] wapiti scan ok"):
+        """Dispatch wapiti_scan; session_db=True → tạo sẵn session DB wapiti
+        (paths + params) trong fixed_dir/session TRƯỚC khi dispatch."""
+        fixed_dir = tempfile.mkdtemp(prefix="test_wapiti_sweep_")
+        if session_db:
+            sdir = os.path.join(fixed_dir, "session")
+            os.makedirs(sdir, exist_ok=True)
+            con = sqlite3.connect(os.path.join(sdir, "session.db"))
+            con.execute("CREATE TABLE paths (path_id INTEGER PRIMARY KEY, "
+                        "method TEXT, path TEXT, headers BLOB)")
+            con.execute("CREATE TABLE params (path_id INTEGER, type TEXT, "
+                        "name TEXT, value1 TEXT)")
+            con.execute("INSERT INTO paths (path_id, method, path, headers) "
+                        "VALUES (1, 'POST', ?, NULL)",
+                        (f"http://127.0.0.1:{self.port}/WebTinTuc/TimKiem",))
+            con.execute("INSERT INTO params (path_id, type, name, value1) "
+                        "VALUES (1, 'POST', 'keyword', 'tin tuc')")
+            con.commit()
+            con.close()
+        report_path = os.path.join(fixed_dir, "report.json")
+        if report is not None:
+            with open(report_path, "w", encoding="utf-8") as f:
+                json.dump(report, f)
+        caught = {}
+
+        def fake_run_cmd(argv, timeout=90, max_chars=5000):
+            caught["argv"] = argv
+            caught["timeout"] = timeout
+            return run_out
+
+        with patch("tempfile.mkdtemp", return_value=fixed_dir), \
+             patch("tools._need", return_value=None), \
+             patch("tools.run_cmd", side_effect=fake_run_cmd), \
+             patch("tools._sqlmap_runner",
+                   return_value="[✓] sqlmap XÁC NHẬN khai thác — back-end DBMS") as sm:
+            a = WebXAgent(config=cfg({"tool_timeout": 600,
+                                       "targets": ["http://127.0.0.1",
+                                                    "https://abc.vn",
+                                                    "10.0.0.0/8"]}),
+                          chat=FakeChat(script=[]))
+            r = a._dispatch("wapiti_scan", args)
+        return r, caught, sm, report_path
+
+    def _empty_report(self):
+        return {"infos": {"target": f"http://127.0.0.1:{self.port}/",
+                           "version": "Wapiti 3.2.10", "scope": "domain",
+                           "crawled_pages_nbr": 1},
+                "vulnerabilities": {}, "classifications": {}}
+
+    def test_default_skip_params_and_attack_time(self):
+        """Mặc định: --skip từng param phân trang + --max-attack-time 150 +
+        --store-session <report_dir>/session."""
+        r, c, sm, rp = self._dispatch({"url": f"http://127.0.0.1:{self.port}/"},
+                                      report=self._empty_report())
+        self.assertEqual(r["outcome"], "ok")
+        from tools import _WAPITI_SKIP_PARAMS
+        for sp in _WAPITI_SKIP_PARAMS:
+            self.assertIn("--skip", c["argv"])
+            self.assertIn(sp, c["argv"])
+        i = c["argv"].index("--max-attack-time")
+        self.assertEqual(c["argv"][i + 1], "150")
+        i = c["argv"].index("--store-session")
+        self.assertEqual(c["argv"][i + 1],
+                         os.path.join(os.path.dirname(rp), "session"))
+
+    def test_skipped_parameters_override(self):
+        """skipped_parameters='foo,bar' → --skip foo --skip bar, KHÔNG còn
+        --skip page (override thay thế mặc định)."""
+        r, c, sm, rp = self._dispatch(
+            {"url": f"http://127.0.0.1:{self.port}/",
+             "skipped_parameters": "foo,bar"}, report=self._empty_report())
+        self.assertEqual(r["outcome"], "ok")
+        self.assertIn("--skip", c["argv"])
+        self.assertIn("foo", c["argv"])
+        self.assertIn("bar", c["argv"])
+        self.assertNotIn("page", c["argv"])
+
+    def test_form_sweep_finds_post_sqli(self):
+        """Session DB có form POST /WebTinTuc/TimKiem (param=keyword) → form
+        sweep chạy oracle MSSQL (engine từ X-Powered-By: ASP.NET) → finding
+        CRITICAL SQL Injection module=sql-form-sweep, path RELATIVE, URL đầy đủ
+        trong info; merge TRƯỚC early-return → auto-exploit thấy SQLi."""
+        r, c, sm, rp = self._dispatch({"url": f"http://127.0.0.1:{self.port}/"},
+                                      session_db=True,
+                                      report=self._empty_report())
+        self.assertEqual(r["outcome"], "ok")
+        self.assertIn("FORM SWEEP", r["output"])
+        self.assertIn("engine ước lượng từ headers = mssql", r["output"])
+        self.assertIn("[+] form sweep: SQLi CONFIRMED POST /WebTinTuc/TimKiem "
+                      "param=keyword", r["output"])
+        self.assertIn("[CRITICAL] SQL Injection (param=keyword) — "
+                      "POST /WebTinTuc/TimKiem [module=sql-form-sweep]",
+                      r["output"])
+        # URL đầy đủ nằm trong info (path trong finding là RELATIVE)
+        self.assertIn(f"http://127.0.0.1:{self.port}/WebTinTuc/TimKiem — "
+                      "form sweep (POST keyword)", r["output"])
+        # finding sweep merge TRƯỚC no-findings early-return → auto-exploit chạy
+        self.assertIn("TỰ ĐỘNG KHAI THÁC (exploit=true)", r["output"])
+        sm.assert_called_once()
+
+    def test_form_sweep_no_db_noop(self):
+        """Không có session DB → sweep bỏ qua (log rõ), không crash, không
+        finding giả, không auto-exploit."""
+        r, c, sm, rp = self._dispatch({"url": f"http://127.0.0.1:{self.port}/"},
+                                      report=self._empty_report())
+        self.assertEqual(r["outcome"], "ok")
+        self.assertIn("không có session DB wapiti — bỏ qua", r["output"])
+        self.assertNotIn("sql-form-sweep", r["output"])
         sm.assert_not_called()
 
 

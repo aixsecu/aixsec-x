@@ -432,6 +432,35 @@ better than long prompts. `prompts.py` ships 2 variants with auto-selection:
   `break_long_words=True`, splitting `**ffuf_dir**` across a wrap boundary as
   `**ff` / `uf_dir**`. Now `break_long_words=False, break_on_hyphens=False` —
   long words jump to the next line whole.
+- **v1.5.5 — wapiti_scan auto form sweep: type ONLY the root domain, the tool
+  finds POST-form SQLi itself (the tbu.edu.vn lesson):** wapiti crawled
+  `https://tbu.edu.vn/WebTinTuc/TimKiem?page=1..52` and the `sql` module burned
+  its whole `--max-attack-time` on the 52 `?page=N` URLs before ever reaching
+  the real vulnerable POST form (`keyword`) — so the tool reported a false
+  `page` SQLi and MISSED the real one. v1.5.5 fixes both ends:
+  **(1) `skipped_parameters` (new arg, default ON):** pagination params
+  (`page, p, pageindex, page_id, pageid, offset, limit, start, per_page,
+  perpage, pageno, page_number, pagenumber, pg`) are passed to wapiti as
+  `--skip <param>` so the GET phase no longer burns attack time on `?page=N`;
+  override with a comma string (`skipped_parameters: "foo,bar"`) or disable
+  with `""`. **(2) `attack_time` default 90 → 150** (still clamped to
+  `scan_time/2`). **(3) `--store-session` + automatic `_form_sweep`:** wapiti
+  now stores its session/crawl DB (`--store-session <report_dir>/session`)
+  and after the scan the tool reads POST forms straight from the DB
+  (`params`/`paths` tables — wapiti stores the FULL URL, normalized to a
+  relative path) and tests each field itself: MSSQL error-based oracle
+  (`MsSqlErrorOracle.detect`, engine guessed from headers via
+  `_guess_engine`) → quote-differential (3 requests, engine-agnostic) →
+  bounded time-based (2-request single payload, only when ≤5 fields);
+  findings merge into the report BEFORE the no-findings early return, deduped
+  against wapiti findings, severity CRITICAL, `module=sql-form-sweep`, full
+  URL in `info` + relative path in `path` (so sqlmap handoff builds the right
+  target). Prompts 5a/6a updated: entering ONLY the root domain is enough.
+  Test suite v1.5.5: **193 OK** (+4 new `TestWapitiFormSweep`: default
+  `--skip`/attack-time-150/`--store-session` argv, `skipped_parameters`
+  override, form sweep finds POST SQLi end-to-end against a mock MSSQL
+  oracle server with a real wapiti-style session DB, no-DB no-op; spec/prompt
+  marker tests updated to v1.5.5).
 - **v1.5.4 — Cleaner banner: no box frame, no black bg, Anonymous mask icon:**
   the old `│…│` box frame + per-line black background (`_BLACK`) + skull icon
   are GONE. `_SKULL_ART`/`_BLACK` removed → `_ANON_ART` (Anonymous Guy Fawkes
