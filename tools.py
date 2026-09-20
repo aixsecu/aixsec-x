@@ -66,6 +66,7 @@ TOOL_BINS: dict[str, str] = {
     "nuclei_scan": "nuclei",
     "param_discovery": "arjun",
     "sqlmap_check": "sqlmap",
+    "sqlmap_runner": "sqlmap",
     "nikto_scan": "nikto",
     "ffuf_dir": "ffuf",
     "subdomain_enum": "subfinder",
@@ -77,7 +78,7 @@ TOOL_BINS: dict[str, str] = {
 _MISSING_HINT: dict[str, str] = {
     "nuclei": "Thay thế bằng ffuf_dir, nikto_scan, sqlmap_check/sqli_manual_test.",
     "arjun": "Thay thế bằng ffuf_dir hoặc kiểm tra tham số thủ công.",
-    "sqlmap": "Dùng sqli_manual_test / sqli_blind_extract (không cần sqlmap).",
+    "sqlmap": "Sử dụng sqlmap_runner (bounded) để khai thác tự động; nếu không cài sqlmap thì dùng sqli_blind_extract (chậm hơn nhiều).",
 }
 
 # v1.4.3: trần timeout (giây) theo từng tool — chặn tool chạy quá lâu không tôn
@@ -92,6 +93,7 @@ TOOL_TIMEOUTS: dict[str, int] = {
     "detect_cms": 90,        # whatweb -a 3 chậm trên site lớn
     "subdomain_enum": 90,    # subfinder brute từ từ
     "nikto_scan": 180,       # nikto vốn chậm — cap đủ cho scan trung bình
+    "sqlmap_runner": 300,   # v1.4.7: sqlmap bounded — đủ cho 1 lần chạy technique set
 }
 
 
@@ -336,6 +338,60 @@ def _sqlmap_check(**kw):
     return run_cmd(args, kw["_timeout"])
 
 
+# v1.4.7: sqlmap BOUNDED — pipeline khai thác gọi tool này FIRST sau CONFIRMED
+# (thay vì sqli_blind_extract chậm). Khác sqlmap_check ở chỗ có kỷ luật tham số:
+# không --smart (nó bỏ qua nhiều payload), không --current-user/--banner chạy
+# trước confirm; ép --technique / --level 1 / --risk 1 / --threads 1 / timeout
+# ngắn / retries 1 — chặn sqlmap lang thang hàng trăm request.
+_SQLMAP_TECH = set("BEUSTQ")  # B=Boolean E=Error U=Union S=Stacked T=Time Q=inline
+
+
+def _sqlmap_runner(**kw):
+    """Chạy sqlmap bị chặn kỷ luật (bounded) — GỌI SAU KHI SQLi CONFIRMED.
+
+    Output là log sqlmap đã cắt; marker "is vulnerable"/"Parameter:"/"back-end
+    DBMS:"/"current database:" là dấu hiệu khai thác thành công. Nếu sqlmap
+    không ra dấu hiệu (vd template CONTAINS hấp thụ payload) → model ghi nhận
+    và hạ cấp kỳ vọng / chuyển manual, KHÔNG spam lại cùng url (bị blocked).
+    """
+    _need("sqlmap")
+    url = kw["url"]
+    # technique: allowlist B/E/U/S/T/Q, dedupe, giữ thứ tự (dict.fromkeys)
+    tech_s = "".join(dict.fromkeys(c.upper() for c in str(kw.get("technique") or "BEUSTQ") if c.isalpha()))
+    if not tech_s or not set(tech_s) <= _SQLMAP_TECH:
+        return ("[!] sqlmap_runner: technique không hợp lệ — chỉ tổ hợp của "
+                "B/E/U/S/T/Q (vd 'BE', 'T', 'E'); nhận: " + repr(kw.get("technique")))
+    dbms = str(kw.get("dbms") or "auto").strip().lower()
+    if dbms not in ("mssql", "mysql", "auto"):
+        return f"[!] sqlmap_runner: dbms không hợp lệ — mssql|mysql|auto; nhận: {dbms!r}"
+    secs = int(kw.get("timeout") or 240)
+    secs = max(30, min(secs, 600))  # clamp 30..600 (mặc định 240)
+    args = ["sqlmap", "-u", url, "--batch", "--technique", tech_s,
+            "--level", "1", "--risk", "1", "--threads", "1",
+            "--timeout", "15", "--retries", "1", "--flush-session"]
+    if dbms != "auto":
+        args += ["--dbms", dbms]
+    if kw.get("data"):
+        args += ["--data", kw["data"]]
+    if kw.get("cookie"):
+        args += ["--cookie", kw["cookie"]]
+    out = run_cmd(args, min(secs, int(kw.get("_timeout") or secs)), max_chars=4000)
+    markers = ["is vulnerable", "Parameter:", "back-end DBMS:",
+               "current database:", "current user:", "Table:"]
+    low = out.lower()
+    hits = [m for m in markers if m.lower() in low]
+    pretty = " ".join(args)
+    if hits or "no parameter(s) found for testing" not in out:
+        if hits:
+            head = f"[✓] sqlmap XÁC NHẬN khai thác — dấu hiệu: {', '.join(hits)}"
+        else:
+            head = "[-] sqlmap chạy xong KHÔNG thấy dấu hiệu khai thác."
+    else:
+        head = "[-] sqlmap không thấy tham số để test (xem log)."
+    return f"{head}\n[i] lệnh: {pretty}\n" + out
+
+
+
 def _find_forms(**kw):
     """v1.4.4: GET url → parse <form>: action (resolve tuyệt đối), method, inputs.
 
@@ -567,15 +623,18 @@ def _sqli_manual_test(**kw):
     if verdict == "CONFIRMED":
         lines.append(f"[✓] SQLI CONFIRMED — {method_used} tại param '{param}' "
                      f"({method.upper()} {url})")
-        # v1.4.5: next-step block — CONFIRMED chỉ mới bắt đầu, phải escalate
+        # v1.4.7: CONFIRMED → sqlmap_runner FIRST (bounded); manual chỉ FALLBACK
         lines.append(
-            "[→] BƯỚC TIẾP THEO: (1) sqli_blind_extract {url, action:'version' hoặc "
+            "[→] BƯỚC TIẾP THEO: (1) sqlmap_runner {url, "
+            + (f"data:'{param}={seed}', " if method == "post" else "")
+            + "dbms:'mssql', technique:'BEUSTQ'} — sqlmap BOUNDED để trích "
+              "xuất databases/tables; CHỈ khi sqlmap_runner không ra dữ liệu "
+              "mới (2) sqli_blind_extract {url, action:'version' hoặc "
             + (f"'database', engine:'mssql', method:'{method}', param:'{param}', "
                f"data:'{param}={seed}', known_confirmed:true" if method == "post"
                else "engine:'mssql', known_confirmed:true "
                "(bỏ qua lưới 9 probe — lỗi đã xác nhận)")
-            + "} để trích xuất @@VERSION/DB_NAME()/tables/dump; "
-              "(2) generate_poc → poc_executor với poc_path để chạy POC khai thác.")
+            + "} → (3) generate_poc → poc_executor với poc_path để chạy POC khai thác.")
     else:
         if len(rows) and all(st == 0 for _, _, st, _, _ in rows):
             # v1.4.6: mọi probe status-0 → nghi WAF chặn payload
@@ -661,6 +720,26 @@ def _sqli_blind_extract(**kw):
         lines.append("[i] known_confirmed: true — bỏ qua lưới 9 probe "
                      "(lỗi đã xác nhận từ trước)")
     data = res.get("data") or {}
+    has_data = any(v for v in data.values() if v)
+    # v1.4.7: oracle im lặng (0 byte — quote-parity mock / template CONTAINS thật)
+    # → KHÔNG giả vờ đã extract (v1.4.6 in ra '[+] version: ' trống với outcome=ok);
+    # trả outcome=error kèm hướng sqlmap → pipeline chuyển sqlmap_runner FIRST.
+    if res.get("extraction_failed") or (action != "detect" and not has_data):
+        form = " --form" if str(kw.get("method") or "get").lower() == "post" else ""
+        dbms = str(kw.get("engine") or "mssql")
+        if dbms not in ("mssql", "mysql"):
+            dbms = "mssql"
+        smc = res.get("sqlmap_cmd") or (
+            f"sqlmap{form} -u {kw['url']} --dbms={dbms} --technique=BEUSTQ "
+            f"--batch --level 1 --risk 1 --threads 1")
+        default_err = ("Oracle trích xuất IM LẶNG — 0 byte: payload bị hấp thụ trong "
+                       "string literal (quote-parity), KHÔNG có kênh dữ liệu nào để "
+                       "extract manual. Đây là hạn chế của kênh, không phải lỗi cấu hình.")
+        head = f"[!] {res.get('error') or default_err}"
+        tip = (f"[i] Chuyển sang sqlmap: gọi sqlmap_runner {{\"url\": \"{kw['url']}\""
+               + (f", \"data\": \"{kw['data']}\"" if kw.get("data") else "")
+               + f", \"dbms\": \"{dbms}\"}} — hoặc chạy: {smc}")
+        return head + "\n" + tip
     for k, v in data.items():
         if v is None:
             continue
@@ -1118,6 +1197,30 @@ TOOL_REGISTRY: list[ToolSpec] = [
               "properties": {"url": {"type": "string", "pattern": "^https?://"},
                              "data": {"type": "string"}},
               "required": ["url"]}, _sqlmap_check, risk="active"),
+    ToolSpec("sqlmap_runner",
+             "v1.4.7: chạy sqlmap BOUNDED (--technique, --level 1 --risk 1 --threads 1 "
+             "--timeout 15 --retries 1 --flush-session) — BƯỚC ĐẦU của pipeline khai "
+             "thác SQLi SAU KHI đã CONFIRMED (sqli_manual_test/sqli_blind_extract detect). "
+             "Trích xuất version/database/tables nhanh hơn sqli_blind_extract nhiều lần. "
+             "Nếu oracle trả 500 parse-error (vd template CONTAINS hấp thụ payload) thì "
+             "dùng technique='E' (error-based) hoặc 'T' (time-based). Nếu sqlmap không ra "
+             "dấu hiệu 'is vulnerable' → ghi nhận và sang bước thay thế, KHÔNG gọi lại "
+             "cùng url (sẽ bị blocked).",
+             {"type": "object",
+              "properties": {
+                  "url": {"type": "string", "pattern": "^https?://"},
+                  "technique": {"type": "string", "pattern": "^[BEUSTQ]+$",
+                                 "description": "Kỹ thuật sqlmap: B=boolean, E=error, U=union, S=stacked, T=time, Q=inline query (mặc định BEUSTQ)"},
+                  "dbms": {"type": "string", "enum": ["mssql", "mysql", "auto"],
+                            "description": "DB engine (mặc định auto → bỏ --dbms)"},
+                  "data": {"type": "string",
+                            "description": "POST body khi SQLi nằm ở form, vd 'keyword=abc'"},
+                  "cookie": {"type": "string",
+                              "description": "Session cookie khi cần xác thực"},
+                  "timeout": {"type": "integer", "minimum": 30, "maximum": 600,
+                               "description": "Giây tối đa cho lần chạy (mặc định 240)"}},
+              "required": ["url"]},
+             _sqlmap_runner, risk="active"),
     ToolSpec("sqli_manual_test", "Test SQLi thủ công: phát hiện quote-differential (error-based) qua test'/test'' "
              "rồi fallback time-based (SLEEP cho mysql, WAITFOR DELAY cho mssql). "
              "Hỗ trợ GET (?param=payload) VÀ POST (method='post' + data='q=test'). "

@@ -32,7 +32,7 @@ from tools import (TOOL_REGISTRY, TOOL_INDEX, TOOL_BINS, TOOL_TIMEOUTS,
                    available_tools)
 
 # ── terminal colors (AIXSEC-X style) ──
-VERSION = "1.4.6"
+VERSION = "1.4.7"
 
 RED = "\033[91m"
 GREEN = "\033[92m"
@@ -174,7 +174,7 @@ class WebXAgent:
                 + ", ".join(f"{s}({TOOL_BINS[s]})" for s in sorted(self.missing_tools))
                 + ".\nKHÔNG gọi các tool này — outcome sẽ là error. Thay bằng tool "
                   "khác trong registry (ffuf_dir, nikto_scan, sqlmap_check, "
-                  "sqli_manual_test, sqli_blind_extract, http_probe...).")
+                  "sqlmap_runner, sqli_manual_test, sqli_blind_extract, http_probe...).")
         # Bộ chống lặp lại tool-call (chỉ trong vòng lặp run):
         #  - _call_cache: kết quả theo khóa (name, args) — gọi lại y hệt thì trả
         #    outcome='duplicate' mà KHÔNG thực thi lại.
