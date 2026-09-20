@@ -290,7 +290,6 @@ root@aixsec-x:~# q                                          → thoát
 | sast_scan | sast | safe | Source-code scan: pattern heuristic (PHP/Python/JS/Java) + secret scan; tùy chọn semgrep/gitleaks; scope qua WEBX_SRC_DIRS |
 | waf_detect (wafw00f) / detect_cms (whatweb) | recon | safe | fingerprint |
 | subdomain_enum (subfinder) | recon | safe | |
-| find_forms | recon | safe | **v1.4.4:** GET trang + parse mọi `<form>` → `action` tuyệt đối, `method` thật (get/post), `name/type` input — con đường DUY NHẤT biết endpoint form tìm kiếm (nikto/nuclei không bao giờ thấy form) |
 | param_discovery (arjun) | recon | noisy | |
 | nuclei_scan | active | active | `-severity`, `-tags` |
 | ffuf_dir | active | active | SecLists common.txt |
@@ -301,7 +300,7 @@ root@aixsec-x:~# q                                          → thoát
 | generate_poc | sqli | safe | **Tự SINH POC Python** khai thác SQLi time-based blind (KHÔNG sqlmap): trả `poc_path` (/tmp/aixsec-x_poc_*.py) + snippet 25 dòng — code ~7KB vượt context cap nên không trả inline |
 | poc_executor | sqli | active | **Chạy POC** do generate_poc sinh (chỉ chấp nhận file `aixsec-x_poc_*.py` trong tempdir — chống arbitrary file exec); hoặc `poc_code` nếu code ngắn |
 | nikto_scan | active | noisy | **v1.4.4:** `-maxtime` = timeout−10 (sàn 30) tự kết thúc đúng hạn; cap 180 s |
-| wapiti_scan | active | noisy | **v1.5.0:** máy quét toàn bộ website (wapiti 3.2.10) — TRUYỀN ĐỦ 29 module tấn công qua `-m` (mặc định wapiti chỉ chạy 9 module); bounded: scope `url\|page\|folder\|subdomain\|domain\|punk`, `depth` 1–10, `max_scan_time`/`max_attack_time`, `tasks` 1–8, `timeout`; parse report `-f json` (sắp xếp severity+category, wstg, `curl_command`, loại probe-marker wapiti `%C2%BF%27%22%28`, tách body an toàn CRLF); `exploit=true` (mặc định) → sqlmap-FIRST: tự chạy `sqlmap_runner` trên ≤3 SQLi findings SAU KHI wapiti CONFIRMED (technique E/T, dbms lấy từ `DBMS:` trong info); bản đồ guidance theo category — CSP/headers/cookie-flag là CATEGORY của report, KHÔNG phải tên module |
+| wapiti_scan | active | noisy | **v1.5.3:** máy quét toàn bộ website (wapiti 3.2.10) — crawler + ĐỦ 29 module tấn công qua `-m` (mặc định wapiti chỉ chạy 9 module); **THAY CHO tool `find_forms` đã gỡ (v1.5.3)** — crawler wapiti tìm form/param thật cho `sqli_manual_test`; bounded: scope `url\|page\|folder\|subdomain\|domain\|punk`, `depth` 1–10, `max_scan_time`/`max_attack_time`, `tasks` 1–8, `timeout`; parse report `-f json` (sắp xếp severity+category, wstg, `curl_command`, loại probe-marker wapiti `%C2%BF%27%22%28`, tách body an toàn CRLF); `exploit=true` (mặc định) → sqlmap-FIRST: tự chạy `sqlmap_runner` trên ≤3 SQLi findings SAU KHI wapiti CONFIRMED (technique E/T, dbms lấy từ `DBMS:` trong info); sqlmap THẤT BẠI → `[→] SQLMAP THẤT BẠI #N` + hint AI TỰ KHAI THÁC `sqli_blind_extract (known_confirmed=true)` + cấm gọi lại `sqlmap_runner` cho url đó; cuối output có khối **`[✓] TỔNG HỢP LỖ HỔNG — HƯỚNG KHAI THÁC & KHẮC PHỤC`** — dedupe theo (category, method, path, parameter), mỗi mục kèm `→ khai thác:` (từ `_WAPITI_EXPLOIT`) + `→ khắc phục:` (từ `_WAPITI_FIX`, dùng làm `findings[].fix`) — in cả khi `exploit=false`; CSP/headers/cookie-flag là CATEGORY của report, KHÔNG phải tên module |
 
 **Khi nào dùng `sqli_blind_extract`:** sqlmap không bắt được đường inject kiểu path
 (`/search/123.html`) hoặc chữ ký tham số lạ — tool này tự detect quote/comment style
@@ -406,6 +405,50 @@ Model 7B/9B (vd: `huihui_ai/qwen3.5-abliterated:9b`) tuân theo **ít quy tắc*
   với `break_long_words=True` làm tách `**ffuf_dir**` thành `**ff` + `uf_dir**`.
   Giờ dùng `break_long_words=False, break_on_hyphens=False` — từ dài nhảy
   trọn sang dòng tiếp theo.
+- **v1.5.3 — GỠ `find_forms`, wapiti làm tất cả (đủ 3 yêu cầu):**
+  **(1) Xóa HOÀN TOÀN tool `find_forms`** (registry, source `_find_forms`,
+  cả 2 prompt, probe-set ledger, test) — crawler của `wapiti_scan` giờ tìm
+  form/param thật và `sqli_manual_test`/`sqli_blind_extract` dùng chúng;
+  `http_probe` vẫn nuôi probe-set. **(2) SQLi → sqlmap TRƯỚC, thất bại thì
+  AI tự khai thác:** tách `_WAPITI_GUIDANCE` → `_WAPITI_EXPLOIT` /
+  `_WAPITI_FIX` (mọi category trong report đều map được, kể cả qua
+  `_default`); sau wapiti CONFIRMED SQLi, `sqlmap_runner` chạy trước (≤3,
+  technique `E`, dbms lấy từ `DBMS:` trong info); nếu sqlmap THẤT BẠI
+  (marker không thấy dấu hiệu HOẶC output `[!]` timeout/lỗi) tool in
+  `[→] SQLMAP THẤT BẠI #N (path param=...)` + hint **AI TỰ KHAI THÁC
+  (v1.5.3)** kèm lệnh `sqli_blind_extract` cụ thể (`'action': 'detect',
+  'known_confirmed': true, 'method'/'param' lấy từ finding, 'engine':
+  'mssql'` với Microsoft SQL Server) và nói rõ `KHÔNG gọi lại
+  sqlmap_runner cho url này nữa`. **(3) Mục tổng hợp lỗ hổng** `[✓] TỔNG
+  HỢP LỖ HỔNG — HƯỚNG KHAI THÁC & KHẮC PHỤC:` — dedupe theo (category,
+  method, path, parameter), mỗi dòng có `→ khai thác:` (từ
+  `_WAPITI_EXPLOIT`) và `→ khắc phục:` (từ `_WAPITI_FIX`,
+  prepared statement/parameterized query → làm `findings[].fix`), vẫn in
+  khi `exploit=false`. Prompt: bỏ `find_forms` khỏi 5a/5b/6a/6b, thêm rule
+  WAPITI-FORM; mapping JSON dùng `description='→ khai thác'`, `fix='→ khắc
+  phục'`; severity level 2 → MEDIUM, level 1 → LOW. Test suite v1.5.3:
+  **187 OK** (−3 TestFindForms đã xóa, +3 TestFindFormsRemoved kiểm tra
+  registry/source/spec, +5 TestWapitiScan mới: đếm dedupe mục TỔNG HỢP,
+  hint fallback sqlmap-fail gồm `known_confirmed:true`/`engine:'mssql'`,
+  timeout `[!]` cũng = THẤT BẠI, map khai thác/khắc phục phủ `_default`,
+  nội dung spec; viết lại TestPromptRules/TestLedgerPathGuard/no-findings).
+- **v1.5.2 — Cổng wapiti (Bug 3: “wapiti vẫn chưa được chạy”):** cổng
+  active-check v1.5.1 chấp nhận MỌI active tool (`ffuf_dir` / `sqlmap_check`
+  / `sqlmap_runner`) — ngoài đời agent vẫn dừng lại sau các check kiểu
+  recon và wapiti KHÔNG bao giờ chạy. Giờ CHỈ `wapiti_scan` mở được cổng
+  cho web scope: JSON cuối bị TỪ CHỐI khi `wapiti_scan` chưa chạy (outcome
+  ok HOẶC error đều tính là “đã chạy” — thử mà thiếu binary vẫn tính). Sau
+  2 lần từ chối liên tiếp vòng lặp ÉP kết thúc (`forced=true`) và TRƯỚC đó
+  TAIL TỰ chạy `wapiti_scan` (`max_scan_time=120`, `scope=domain`,
+  `modules=sql,xss,file,exec`) — entry transcript `round=0/auto=True` kèm
+  user message `[WAPITI TỰ CHẠY]`, rồi mới trả JSON ép; gate note `PHIÊN
+  NÀY CHƯA CHẠY WAPITI_SCAN` chỉ xuất hiện khi wapiti vẫn chưa chạy. Ở chế
+  độ ask, lượt auto vẫn hỏi operator (từ chối → outcome=denied, vẫn tính là
+  đã dispatch). Test suite v1.5.2: **182 OK** (3 mới trong TestWapitiGate:
+  active tool khác ok vẫn bị chặn, wapiti error vẫn mở cổng, auto wapiti
+  chạy khi bị ép; TestAgentLoop/TestPlanOnlyGuard cập nhật lại số count cho
+  auto wapiti ở tail; TestActiveCheckGate cũ đổi tên TestWapitiGate với
+  state mới `_no_wapiti_json`/`_wapiti_done`).
 - **v1.5.1 — Cổng active-check + sàn timeout cho LONG_RUN_TOOLS (2 bug fix):**
   **Bug 1 (cổng):** run loop không còn chấp nhận JSON cuối của phiên web mà
   KHÔNG có active check nào hoàn tất (chỉ recon nmap/nikto/curl). Trong nhánh

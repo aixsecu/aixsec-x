@@ -41,6 +41,12 @@ FINAL_JSON = json.dumps({
 }, ensure_ascii=False)
 
 
+def _wapiti_test_stub(**kw):
+    """v1.5.2 (Bug 3): stub wapiti_scan — KHÔNG chạy scan thật trong test.
+    Trả output mở đầu '[!]' → outcome=error, vẫn được gate tính là 'đã chạy'."""
+    return "[!] wapiti not found (test stub — không chạy scan thật trong test)"
+
+
 class FakeChat:
     """Scripted: vòng 1 gọi 1 tool, vòng 2 trả JSON cuối."""
     def __init__(self, script=None, always_tools=False):
@@ -115,6 +121,17 @@ class TestLedger(unittest.TestCase):
 
 
 class TestAgentLoop(unittest.TestCase):
+    # v1.5.2: stub wapiti_scan cho mọi test trong class — auto wapiti ở tail
+    # không được chạy scan thật (sandbox có /usr/bin/wapiti)
+    def setUp(self):
+        from tools import TOOL_INDEX
+        self._orig_wapiti_exec = TOOL_INDEX["wapiti_scan"].exec_fn
+        TOOL_INDEX["wapiti_scan"].exec_fn = _wapiti_test_stub
+
+    def tearDown(self):
+        from tools import TOOL_INDEX
+        TOOL_INDEX["wapiti_scan"].exec_fn = self._orig_wapiti_exec
+
     def _agent(self, script=None, always_tools=False, extra=None):
         return WebXAgent(config=cfg(extra), chat=FakeChat(script=script, always_tools=always_tools))
 
@@ -128,7 +145,8 @@ class TestAgentLoop(unittest.TestCase):
         res = a.run("Phân tích abc.vn")
         self.assertEqual(len(a.ledger.all()), 2)
         self.assertEqual(res["risk_level"], "HIGH")
-        self.assertEqual(res["calls"], 1)
+        # v1.5.2: round tool + 1 auto wapiti ở tail (stub error → gate mở)
+        self.assertEqual(res["calls"], 2)
         self.assertEqual(a.transcript[0]["calls"][0]["outcome"], "ok")
 
     def test_scope_rejection(self):
@@ -166,7 +184,9 @@ class TestAgentLoop(unittest.TestCase):
     def test_budget_enforced(self):
         a = self._agent(always_tools=True)
         res = a.run("test")
-        rounds = [t for t in a.transcript if t["type"] == "tools"]
+        # v1.5.2: loại entry auto (round=0) do _auto_wapiti thêm ở tail
+        rounds = [t for t in a.transcript
+                  if t["type"] == "tools" and t.get("round", 0) > 0]
         self.assertEqual(len(rounds), 9)
 
     def test_duplicate_call_not_reexecuted(self):
@@ -194,12 +214,12 @@ class TestAgentLoop(unittest.TestCase):
         a._dispatch = spy
         with patch("tools.shutil.which", return_value=None):
             res = a.run("test")
-        self.assertEqual(n["v"], 1)  # chỉ thực thi 1 lần thật
+        self.assertEqual(n["v"], 2)  # nuclei 1 lần thật + auto wapiti ở tail (stub error)
         self.assertEqual(a.transcript[0]["calls"][0]["outcome"], "error")
         r2 = a.transcript[1]["calls"][0]
         self.assertEqual(r2["outcome"], "duplicate")
         self.assertIn("KHÔNG thực thi lại", r2["output"])
-        self.assertEqual(res["calls"], 2)
+        self.assertEqual(res["calls"], 3)  # 2 vòng tool + auto wapiti ở tail
 
     def test_blocked_after_3_failures(self):
         # nuclei thiếu binary (mock which=None) — mỗi vòng tham số KHÁC NHAU nên
@@ -224,12 +244,13 @@ class TestAgentLoop(unittest.TestCase):
         a._dispatch = spy
         with patch("tools.shutil.which", return_value=None):
             res = a.run("test")
-        self.assertEqual(n["v"], 3)  # 3 lần fail thật, lần 4 bị chặn trước dispatch
-        outcomes = [t["calls"][0]["outcome"] for t in a.transcript if t["type"] == "tools"]
+        self.assertEqual(n["v"], 4)  # 3 lần fail thật + auto wapiti ở tail (stub error)
+        outcomes = [t["calls"][0]["outcome"] for t in a.transcript
+                    if t["type"] == "tools" and t.get("round", 0) > 0]
         self.assertEqual(outcomes[:3], ["error", "error", "error"])
         self.assertEqual(outcomes[3], "blocked")
         self.assertIn("bị chặn tạm thời", a.transcript[3]["calls"][0]["output"])
-        self.assertEqual(res["calls"], 4)
+        self.assertEqual(res["calls"], 5)  # 4 vòng tool + auto wapiti ở tail
         self.assertEqual(a._fail_counts["nuclei_scan"], 3)
 
     def test_url_block_skips_approval(self):
@@ -256,15 +277,16 @@ class TestAgentLoop(unittest.TestCase):
 
         a._dispatch = spy
         with patch("tools.shutil.which", return_value=None), \
-             patch("builtins.input",
-                   side_effect=["y", AssertionError("approval re-prompted")]) as inp:
+             patch("builtins.input", side_effect=["y", "n"]) as inp:
             res = a.run("test")
-        self.assertEqual(n["v"], 1)  # chỉ round 1 được dispatch thật
-        outcomes = [t["calls"][0]["outcome"] for t in a.transcript if t["type"] == "tools"]
+        # v1.5.2: nuclei round1 dispatched; auto wapiti ở tail bị operator từ chối
+        self.assertEqual(n["v"], 2)
+        outcomes = [t["calls"][0]["outcome"] for t in a.transcript
+                    if t["type"] == "tools" and t.get("round", 0) > 0]
         self.assertEqual(outcomes, ["error", "blocked"])
         self.assertIn("không thử lại", a.transcript[1]["calls"][0]["output"])
-        self.assertEqual(inp.call_count, 1)  # round 2 không prompt operator
-        self.assertEqual(res["calls"], 2)
+        self.assertEqual(inp.call_count, 2)  # nuclei round1 + auto wapiti ở tail
+        self.assertEqual(res["calls"], 3)   # 2 vòng tool + auto wapiti (denied)
 
     def test_early_stop_all_duplicate(self):
         # vòng 2 gọi lại y hệt vòng 1 → duplicate; MỌI kết quả của round đều
@@ -278,10 +300,11 @@ class TestAgentLoop(unittest.TestCase):
         ]
         a = self._agent(script=script)
         res = a.run("test")
-        rounds = [t for t in a.transcript if t["type"] == "tools"]
+        rounds = [t for t in a.transcript
+                  if t["type"] == "tools" and t.get("round", 0) > 0]
         self.assertEqual(len(rounds), 2)                          # dừng sớm ở round 2
         self.assertEqual(rounds[1]["calls"][0]["outcome"], "duplicate")
-        self.assertEqual(res["calls"], 2)
+        self.assertEqual(res["calls"], 3)  # 2 vòng tool + auto wapiti ở tail
         self.assertEqual(len(a.ledger.all()), 2)                  # FINAL_JSON ép trả
         self.assertEqual(res["risk_level"], "HIGH")
 
@@ -292,13 +315,24 @@ class TestPlanOnlyGuard(unittest.TestCase):
     dù còn round, ledger trống). Hệ thống đẩy lại lượt mới ép gọi tool, nhắc tên
     tool model vừa nói tới, sau 2 lần liên tiếp thì ép trả final JSON (forced)."""
 
+    def setUp(self):
+        # v1.5.2: stub wapiti_scan (auto wapiti ở tail phải chạy an toàn)
+        from tools import TOOL_INDEX
+        self._orig_wapiti_exec = TOOL_INDEX["wapiti_scan"].exec_fn
+        TOOL_INDEX["wapiti_scan"].exec_fn = _wapiti_test_stub
+
+    def tearDown(self):
+        from tools import TOOL_INDEX
+        TOOL_INDEX["wapiti_scan"].exec_fn = self._orig_wapiti_exec
+
     def _agent(self, script=None):
         return WebXAgent(config=cfg(), chat=FakeChat(script=script))
 
     def test_plan_only_does_not_terminate(self):
-        # v1.5.1: round1 tool thật; round2 văn bản kế hoạch (0 tool call → push
-        # ép function call); round3 final JSON recon-only → GATE chặn (chưa có
-        # active check); round4 JSON lại → forced; round5 ép trả JSON json_mode.
+        # v1.5.2: round1 tool thật; round2 văn bản kế hoạch (0 tool call → push
+        # ép function call); round3 final JSON recon-only → GATE WAPITI chặn
+        # (wapiti chưa chạy); round4 JSON lại → forced; tail tự chạy wapiti
+        # (stub error); round5 ép trả JSON json_mode.
         script = [
             {"content": "", "tool_calls": [
                 {"name": "http_probe", "arguments": {"url": "https://abc.vn/"}}]},
@@ -311,7 +345,7 @@ class TestPlanOnlyGuard(unittest.TestCase):
         # KHÔNG dừng ở round 2: findings vẫn được commit, risk vẫn parse
         self.assertEqual(res["risk_level"], "HIGH")
         self.assertEqual(len(a.ledger.all()), 2)
-        self.assertEqual(res["calls"], 1)
+        self.assertEqual(res["calls"], 2)  # http_probe + auto wapiti ở tail
         self.assertEqual(len(a.chat.calls), 5)              # 5 lượt chat
         self.assertTrue(a.chat.calls[4]["json_mode"])       # forced json_mode cuối
         # lượt round-3 (sau push plan-only) phải chứa message bắt buộc function call
@@ -320,9 +354,9 @@ class TestPlanOnlyGuard(unittest.TestCase):
         # lượt round-4 (sau GATE chặn JSON recon-only lần 1) phải nhắc wapiti_scan
         gate = [m for m in a.chat.calls[3]["messages"] if m.get("role") == "user"]
         self.assertTrue(any("wapiti_scan" in str(m.get("content", "")) for m in gate))
-        # gate đã từ chối 2 lần, không active check nào hoàn tất (chỉ recon)
-        self.assertEqual(a._no_active_json, 2)
-        self.assertEqual(a._active_done, set())
+        # gate đã từ chối 2 lần; tail auto wapiti chạy (stub → error → done)
+        self.assertEqual(a._no_wapiti_json, 2)
+        self.assertTrue(a._wapiti_done)
 
     def test_plan_only_push_mentions_tool(self):
         # văn bản nhắc sqli_manual_test → push message phải nêu đúng tên tool
@@ -348,7 +382,7 @@ class TestPlanOnlyGuard(unittest.TestCase):
         res = a.run("test")
         self.assertTrue(a.chat.calls[2]["json_mode"])    # forced JSON round
         self.assertEqual(a._plan_only, 2)
-        self.assertEqual(res["calls"], 0)
+        self.assertEqual(res["calls"], 1)  # chỉ auto wapiti ở tail (stub error)
         self.assertEqual(res["risk_level"], "HIGH")     # FINAL_JSON ép trả
         self.assertEqual(len(a.ledger.all()), 2)
 
@@ -359,10 +393,22 @@ class TestPlanOnlyGuard(unittest.TestCase):
         self.assertEqual(a._mentioned_tools("không nhắc tool nào"), [])
 
 
-class TestActiveCheckGate(unittest.TestCase):
-    """v1.5.1 (Bug 1): final JSON recon-only bị TỪ CHỐI khi web scope active mà
-    chưa có ACTIVE_CHECKS nào hoàn tất (outcome=ok) — model bị ép gọi wapiti_scan;
-    2 lần từ chối liên tiếp → forced trả JSON json_mode=True."""
+class TestWapitiGate(unittest.TestCase):
+    """v1.5.2 (Bug 3): final JSON bị TỪ CHỐI khi web scope active mà
+    wapiti_scan CHƯA chạy (ok HOẶC error) — các tool khác
+    (sqli_manual_test/sqlmap_runner/nikto...) KHÔNG thay thế được wapiti.
+    2 lần từ chối liên tiếp → forced và tail TỰ chạy wapiti_scan (auto)
+    trước khi ép trả JSON json_mode=True."""
+
+    def setUp(self):
+        # v1.5.2: stub mặc định; test cần fake riêng sẽ patch.object đè lên
+        from tools import TOOL_INDEX
+        self._orig_wapiti_exec = TOOL_INDEX["wapiti_scan"].exec_fn
+        TOOL_INDEX["wapiti_scan"].exec_fn = _wapiti_test_stub
+
+    def tearDown(self):
+        from tools import TOOL_INDEX
+        TOOL_INDEX["wapiti_scan"].exec_fn = self._orig_wapiti_exec
 
     def _agent(self, script=None, extra=None):
         return WebXAgent(config=cfg(extra), chat=FakeChat(script=script))
@@ -388,9 +434,9 @@ class TestActiveCheckGate(unittest.TestCase):
              patch("tools.shutil.which", return_value="/usr/bin/wapiti"):
             a = self._agent(script=script)
             res = a.run("test")
-        # gate chặn đúng 1 lần; sau khi wapiti hoàn tất JSON được chấp nhận
-        self.assertEqual(a._no_active_json, 1)
-        self.assertIn("wapiti_scan", a._active_done)
+        # gate chặn đúng 1 lần; sau khi wapiti ok JSON được chấp nhận
+        self.assertEqual(a._no_wapiti_json, 1)
+        self.assertTrue(a._wapiti_done)
         self.assertEqual(caught["t"], TOOL_TIMEOUTS["wapiti_scan"])  # sàn 600s
         self.assertEqual(len(a.chat.calls), 4)
         self.assertFalse(a.chat.calls[3]["json_mode"])   # không forced
@@ -406,14 +452,25 @@ class TestActiveCheckGate(unittest.TestCase):
         res = a.run("test")
         self.assertEqual(len(a.chat.calls), 3)
         self.assertTrue(a.chat.calls[2]["json_mode"])      # forced json_mode
-        self.assertEqual(a._no_active_json, 2)
-        self.assertEqual(a._active_done, set())
+        self.assertEqual(a._no_wapiti_json, 2)              # cả 2 JSON đều bị chặn
+        self.assertTrue(a._wapiti_done)          # tail auto wapiti (stub error)
         forced = [m for m in a.chat.calls[2]["messages"] if m.get("role") == "user"]
-        self.assertTrue(any("CHƯA CÓ ACTIVE CHECK" in str(m.get("content", ""))
+        self.assertTrue(any("Vòng lặp không tiến triển" in str(m.get("content", ""))
                             for m in forced))
-        self.assertEqual(res["calls"], 0)
+        self.assertEqual(res["calls"], 1)  # chỉ auto wapiti chạy ở tail (error)
         self.assertEqual(res["risk_level"], "HIGH")        # FINAL_JSON ép trả
         self.assertEqual(len(a.ledger.all()), 2)
+        # transcript: entry auto (round=0) ghi kết quả wapiti stub thật
+        auto = [t for t in a.transcript if t.get("auto")]
+        self.assertEqual(len(auto), 1)
+        self.assertEqual(auto[0]["round"], 0)
+        self.assertEqual(auto[0]["calls"][0]["name"], "wapiti_scan")
+        self.assertEqual(auto[0]["calls"][0]["outcome"], "error")
+        # [WAPITI TỰ CHẠY] có trong lượt tổng hợp; gate_note KHÔNG (wapiti đã chạy)
+        user_msgs = [str(m.get("content", "")) for m in a.chat.calls[2]["messages"]
+                     if m.get("role") == "user"]
+        self.assertTrue(any("WAPITI TỰ CHẠY" in u for u in user_msgs))
+        self.assertNotIn("PHIÊN NÀY CHƯA CHẠY WAPITI_SCAN", " ".join(user_msgs))
 
     def test_gate_skipped_for_src_only_scope(self):
         # không khai báo WEBX_TARGETS (src-only) → gate KHÔNG kích hoạt
@@ -422,12 +479,100 @@ class TestActiveCheckGate(unittest.TestCase):
         res = a.run("test")
         self.assertEqual(len(a.chat.calls), 1)
         self.assertFalse(a.chat.calls[0]["json_mode"])
-        self.assertEqual(a._no_active_json, 0)
+        self.assertEqual(a._no_wapiti_json, 0)
+        self.assertFalse(a._wapiti_done)       # gate không kích hoạt → wapiti không chạy
         user_msgs = [str(m.get("content", "")) for m in a.chat.calls[0]["messages"]
                      if m.get("role") == "user"]
         self.assertNotIn("wapiti_scan", " ".join(user_msgs))
         self.assertEqual(res["calls"], 0)
         self.assertEqual(res["risk_level"], "HIGH")
+
+    def test_non_wapiti_active_ok_still_rejected(self):
+        # v1.5.2 (Bug 3): sqli_manual_test OK KHÔNG mở khóa gate — chỉ
+        # wapiti_scan (ok/error) mới tính. JSON sau đó vẫn bị chặn lần 1;
+        # lượt sau model gọi wapiti ok → JSON được chấp nhận, không forced.
+        from tools import TOOL_INDEX
+        script = [
+            {"content": "", "tool_calls": [
+                {"name": "sqli_manual_test", "arguments": {
+                    "url": "https://abc.vn/product.php", "param": "id",
+                    "method": "get", "data": "id=1"}}]},
+            {"content": FINAL_JSON, "tool_calls": []},
+            {"content": "", "tool_calls": [
+                {"name": "wapiti_scan", "arguments": {
+                    "url": "https://abc.vn/", "scope": "domain",
+                    "modules": "sql,xss,file,exec", "max_scan_time": 120}}]},
+        ]
+        # sqli_manual_test thật gọi network (https://abc.vn) → fake bằng tay
+        with patch.object(TOOL_INDEX["sqli_manual_test"], "exec_fn",
+                          lambda **kw: "confirmed: quote-differential (id)"), \
+             patch.object(TOOL_INDEX["wapiti_scan"], "exec_fn",
+                          lambda **kw: "scan done: no vuln"):
+            a = self._agent(script=script)
+            res = a.run("test")
+        self.assertEqual(a._no_wapiti_json, 1)   # JSON lần 1 (chưa có wapiti)
+        gate = [m for m in a.chat.calls[1]["messages"] if m.get("role") == "user"]
+        self.assertTrue(any("wapiti_scan" in str(m.get("content", "")) for m in gate))
+        self.assertFalse(a.chat.calls[1]["json_mode"])   # không forced ở giữa
+        self.assertTrue(a._wapiti_done)          # wapiti ok ở round 3 mở khóa
+        self.assertEqual(res["calls"], 2)
+        self.assertEqual(res["risk_level"], "HIGH")
+        self.assertEqual(len(a.ledger.all()), 2)
+
+    def test_wapiti_error_attempt_passes_gate(self):
+        # v1.5.2: wapiti_scan trả error (thiếu binary) VẪN tính là 'đã chạy'
+        # (agent đã cố) → JSON round sau được chấp nhận, không auto chạy lại.
+        script = [
+            {"content": "", "tool_calls": [
+                {"name": "http_probe", "arguments": {"url": "https://abc.vn/"}}]},
+            {"content": FINAL_JSON, "tool_calls": []},
+            {"content": "", "tool_calls": [
+                {"name": "wapiti_scan", "arguments": {
+                    "url": "https://abc.vn/", "scope": "domain",
+                    "modules": "sql,xss,file,exec", "max_scan_time": 120}}]},
+        ]
+        with patch("tools.shutil.which", return_value=None):
+            a = self._agent(script=script)
+            res = a.run("test")
+        self.assertEqual(a._no_wapiti_json, 1)   # chỉ chặn 1 lần trước khi wapiti chạy
+        self.assertTrue(a._wapiti_done)          # error VẪN tính là đã chạy
+        self.assertEqual(len(a.chat.calls), 4)
+        self.assertFalse(a.chat.calls[3]["json_mode"])   # JSON chấp nhận, không forced
+        self.assertEqual(res["calls"], 2)
+        self.assertEqual(res["risk_level"], "HIGH")
+
+    def test_auto_wapiti_dispatched_at_forced_end(self):
+        # v1.5.2 (Bug 3): model chỉ trả JSON recon-only 2 lần → forced; trước
+        # khi ép JSON cuối, agent TỰ chạy wapiti_scan (max_scan_time=120) và
+        # đẩy kết quả THẬT vào [TOOL RESULTS] cho lượt tổng hợp.
+        from tools import TOOL_INDEX
+        caught = {}
+
+        def fake_wapiti(**kw):
+            caught["max_scan_time"] = kw.get("max_scan_time")
+            caught["timeout"] = kw.get("_timeout")
+            return "scan done: no vuln"
+
+        script = [{"content": FINAL_JSON, "tool_calls": []}]
+        with patch.object(TOOL_INDEX["wapiti_scan"], "exec_fn", fake_wapiti):
+            a = self._agent(script=script)
+            res = a.run("test")
+        auto = [t for t in a.transcript if t.get("auto")]
+        self.assertEqual(len(auto), 1)
+        self.assertEqual(auto[0]["round"], 0)
+        self.assertEqual(auto[0]["calls"][0]["name"], "wapiti_scan")
+        self.assertEqual(auto[0]["calls"][0]["outcome"], "ok")
+        self.assertEqual(caught["max_scan_time"], 120)
+        self.assertTrue(a._wapiti_done)
+        self.assertEqual(a._no_wapiti_json, 2)   # 2 JSON bị chặn → forced
+        self.assertEqual(res["calls"], 1)       # chỉ auto wapiti chạy
+        self.assertEqual(len(a.chat.calls), 3)   # round1, round2, final
+        self.assertTrue(a.chat.calls[2]["json_mode"])
+        user_msgs = [str(m.get("content", "")) for m in a.chat.calls[2]["messages"]
+                     if m.get("role") == "user"]
+        self.assertTrue(any("WAPITI TỰ CHẠY" in u for u in user_msgs))
+        self.assertTrue(any("scan done: no vuln" in u for u in user_msgs))
+        self.assertNotIn("PHIÊN NÀY CHƯA CHẠY WAPITI_SCAN", " ".join(user_msgs))
 
 
 class TestSQLiManualTest(unittest.TestCase):
@@ -548,77 +693,6 @@ class TestQuoteDifferential(unittest.TestCase):
         self.assertNotIn("[*] time-based", out)
 
 
-class FormsPageHandler(BaseHTTPRequestHandler):
-    """Trang có 2 form (action relative + absolute), trang không form, trang 404."""
-
-    def do_GET(self):
-        path = self.path.split("?", 1)[0]
-        if path == "/":
-            body = (b"<html><body>"
-                    b"<form action='/search' method='POST'>"
-                    b"<input name='keyword' type='text'>"
-                    b"<input type='hidden' name='lang' value='vi'>"
-                    b"</form>"
-                    b"<form action='https://abc.vn/login' method='get'>"
-                    b"<input type='password' name='pass'>"
-                    b"</form>"
-                    b"</body></html>")
-            self.send_response(200)
-        elif path == "/nofo":
-            body = b"<html><body>khong co form</body></html>"
-            self.send_response(200)
-        else:
-            body = b"not found"
-            self.send_response(404)
-        self.send_header("Content-Type", "text/html")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
-
-    def log_message(self, *args):
-        pass
-
-
-class TestFindForms(unittest.TestCase):
-    """v1.4.4: find_forms đọc form THẬT (action/method/inputs) — agent không còn
-    đoán URL/param khi test SQLi qua form."""
-    server = None
-
-    @classmethod
-    def setUpClass(cls):
-        cls.server = HTTPServer(("127.0.0.1", 0), FormsPageHandler)
-        cls.port = cls.server.server_address[1]
-        cls.thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
-        cls.thread.start()
-
-    @classmethod
-    def tearDownClass(cls):
-        if cls.server:
-            cls.server.shutdown()
-            cls.server.server_close()
-
-    def test_parses_forms_absolute_actions(self):
-        from tools import _find_forms
-        out = _find_forms(url=f"http://127.0.0.1:{self.port}/")
-        self.assertIn("2 form(s)", out)
-        self.assertIn(f"POST http://127.0.0.1:{self.port}/search", out)
-        self.assertIn("GET https://abc.vn/login", out)
-        self.assertIn("keyword(text)", out)
-        self.assertIn("lang(hidden)", out)
-        self.assertIn("pass(password)", out)
-
-    def test_no_forms(self):
-        from tools import _find_forms
-        out = _find_forms(url=f"http://127.0.0.1:{self.port}/nofo")
-        self.assertIn("KHÔNG có <form>", out)
-
-    def test_error_status_404(self):
-        from tools import _find_forms
-        out = _find_forms(url=f"http://127.0.0.1:{self.port}/missing")
-        self.assertTrue(out.startswith("[!]"))
-        self.assertIn("trả 404", out)
-
-
 class TestSqlEngineGuess(unittest.TestCase):
     """v1.4.4: _guess_engine đoán DB backend từ headers cho engine=auto."""
 
@@ -722,16 +796,48 @@ class TestDispatchExecTime(unittest.TestCase):
 
 
 class TestPromptRules(unittest.TestCase):
-    """v1.4.4: prompt bắt buộc find_forms trước khi test SQLi qua form;
-    nikto/nuclei KHÔNG phát hiện được SQLi."""
+    """v1.5.3: find_forms đã GỠ khỏi prompt — form/param do crawler wapiti_scan
+    tìm sẵn; JSON mapping description='→ khai thác', fix='→ khắc phục'."""
 
-    def test_compact_find_forms_before_sqli(self):
-        self.assertIn("find_forms", SYSTEM_PROMPT_COMPACT)
-        self.assertIn("CANNOT find SQLi", SYSTEM_PROMPT_COMPACT)
+    def test_compact_no_find_forms_wapiti_forms(self):
+        self.assertNotIn("find_forms", SYSTEM_PROMPT_COMPACT)
+        self.assertIn("crawler finds real forms", SYSTEM_PROMPT_COMPACT)
+        self.assertIn("WAPITI-SQLI AUTO-EXPLOIT (v1.5.3)", SYSTEM_PROMPT_COMPACT)
 
-    def test_full_find_forms_before_sqli(self):
-        self.assertIn("find_forms", SYSTEM_PROMPT_FULL)
-        self.assertIn("KHÔNG phát hiện được SQLi", SYSTEM_PROMPT_FULL)
+    def test_full_no_find_forms_wapiti_mapping(self):
+        self.assertNotIn("find_forms", SYSTEM_PROMPT_FULL)
+        self.assertIn("TÌM form + param sẵn", SYSTEM_PROMPT_FULL)
+        self.assertIn("WAPITI-SQLI (v1.5.3)", SYSTEM_PROMPT_FULL)
+        self.assertIn("MAPPING WAPITI (v1.5.3)", SYSTEM_PROMPT_FULL)
+        self.assertIn("→ khai thác", SYSTEM_PROMPT_FULL)
+        self.assertIn("→ khắc phục", SYSTEM_PROMPT_FULL)
+
+
+class TestFindFormsRemoved(unittest.TestCase):
+    """v1.5.3 (nhiệm vụ 1): tool find_forms bị gỡ HOÀN TOÀN — registry,
+    source; wapiti_scan (crawler tìm form/param) thay thế."""
+
+    def test_not_in_tool_registry(self):
+        from tools import TOOL_REGISTRY
+        names = {ts.name for ts in TOOL_REGISTRY}
+        self.assertNotIn("find_forms", names)
+        self.assertIn("wapiti_scan", names)
+        self.assertIn("http_probe", names)
+
+    def test_source_clean(self):
+        base = os.path.dirname(__file__)
+        for mod in ("tools.py", "prompts.py", "agent.py", "ledger.py"):
+            with open(os.path.join(base, mod), encoding="utf-8") as fh:
+                src_mod = fh.read()
+            self.assertNotIn("find_forms", src_mod, mod)
+            self.assertNotIn("_find_forms", src_mod, mod)
+
+    def test_wapiti_spec_v153_replaces_it(self):
+        from tools import TOOL_INDEX
+        desc = TOOL_INDEX["wapiti_scan"].description
+        self.assertIn("v1.5.3", desc)
+        self.assertIn("TỔNG HỢP LỖ HỔNG", desc)
+        self.assertIn("công cụ tìm form cũ", desc)
 
 
 class TestBlindPocMssql(unittest.TestCase):
@@ -2169,13 +2275,14 @@ class TestLedgerPathGuard(TestEvidenceGuard):
         self.assertTrue(any("path" in g and "admincp" in g for g in f.evidence_gaps))
 
     def test_path_claim_backed_by_same_host_ok(self):
-        """Path /WebTinTuc/TimKiem xuất hiện trong output find_forms CỦA CÙNG
-        host tbu.edu.vn → không gap; find_forms giờ nằm trong nhóm probe-like
+        """Path /WebTinTuc/TimKiem xuất hiện trong output wapiti_scan CỦA CÙNG
+        host tbu.edu.vn → không gap; wapiti_scan nằm trong nhóm probe-like
         nên cũng không bị cờ 'chưa probe thật'."""
         history = [self._call(
-            "find_forms",
-            "[i] find_forms — https://tbu.edu.vn/ → 200, 18452 chars, 1 form(s): "
-            "action='/WebTinTuc/TimKiem' method='POST' inputs: keyword(text)",
+            "wapiti_scan",
+            "[✓] wapiti QUÉT XONG (v3.2.10) — https://tbu.edu.vn/ [scope=domain, "
+            "4 URL/form, 1 mục]\n[HIGH] SQL Injection (param=keyword) — "
+            "POST /WebTinTuc/TimKiem [module=sql]",
             url="https://tbu.edu.vn/")]
         f = self._f("MSSQL Error-Based SQLi",
                     url="https://tbu.edu.vn/WebTinTuc/TimKiem",
@@ -2764,8 +2871,10 @@ class TestWapitiScan(unittest.TestCase):
         self.assertEqual(r["outcome"], "ok")
         sm.assert_not_called()
         self.assertNotIn("TỰ ĐỘNG KHAI THÁC", r["output"])
-        # guidance vẫn có
-        self.assertIn("BƯỚC TIẾP THEO", r["output"])
+        # v1.5.3: mục TỔNG HỢP LỖ HỔNG vẫn in khi exploit=false (khai thác + khắc phục)
+        self.assertIn("[✓] TỔNG HỢP LỖ HỔNG", r["output"])
+        self.assertIn("→ khai thác:", r["output"])
+        self.assertIn("→ khắc phục:", r["output"])
 
     def test_run_cmd_error_passthrough(self):
         r, c, sm, rp = self._dispatch({"url": "https://abc.vn/"},
@@ -2797,6 +2906,74 @@ class TestWapitiScan(unittest.TestCase):
         self.assertIn("report JSON không đọc được", r["output"])
         sm.assert_not_called()
 
+    def test_summary_tonghop_lists_exploit_fix(self):
+        """v1.5.3 (nhiệm vụ 3): mục 'TỔNG HỢP LỖ HỔNG' — dedupe theo
+        (category, method, path, parameter); mỗi mục kèm hướng khai thác + khắc phục."""
+        r, c, sm, rp = self._dispatch({"url": "https://abc.vn/"})
+        self.assertEqual(r["outcome"], "ok")
+        self.assertIn("[✓] TỔNG HỢP LỖ HỔNG — HƯỚNG KHAI THÁC & KHẮC PHỤC:", r["output"])
+        # SQL Injection (bản level 1 trùng bị dedupe) + XSS = đúng 2 mục
+        self.assertEqual(r["output"].count("→ khai thác:"), 2)
+        self.assertEqual(r["output"].count("→ khắc phục:"), 2)
+        self.assertIn("[MEDIUM] SQL Injection — POST /WebTinTuc/TimKiem (param=keyword)",
+                      r["output"])
+        self.assertIn("sqlmap_runner TRƯỚC (technique='E'", r["output"])
+        self.assertIn("Prepared statement/parameterized query", r["output"])
+
+    def test_sqlmap_fail_fallback_hint_sqli_blind_extract(self):
+        """v1.5.3 (nhiệm vụ 2): sqlmap THẤT BẠI (không thấy dấu hiệu) → hint
+        AI TỰ KHAI THÁC bằng sqli_blind_extract (known_confirmed=true) và
+        cấm gọi lại sqlmap_runner cho url đó."""
+        r, c, sm, rp = self._dispatch(
+            {"url": "https://abc.vn/"},
+            sqlmap_out="[i] sqlmap: không thấy dấu hiệu injectable trên param keyword")
+        self.assertEqual(r["outcome"], "ok")
+        self.assertIn("[→] SQLMAP THẤT BẠI #1", r["output"])
+        self.assertIn("AI TỰ KHAI THÁC (v1.5.3)", r["output"])
+        self.assertIn("sqli_blind_extract", r["output"])
+        self.assertIn("'url': 'https://abc.vn/WebTinTuc/TimKiem'", r["output"])
+        self.assertIn("'action': 'detect'", r["output"])
+        self.assertIn("'known_confirmed': true", r["output"])
+        self.assertIn("'method': 'post'", r["output"])
+        self.assertIn("'param': 'keyword'", r["output"])
+        self.assertIn("'engine': 'mssql'", r["output"])  # DBMS Microsoft SQL Server
+        self.assertIn("KHÔNG gọi lại sqlmap_runner cho url này nữa", r["output"])
+        self.assertNotIn("sqlmap XÁC NHẬN", r["output"])
+
+    def test_sqlmap_fail_timeout_starts_bang(self):
+        """Output sqlmap mở đầu '[!]' (timeout/exec lỗi) cũng = THẤT BẠI → hint fallback."""
+        r, c, sm, rp = self._dispatch({"url": "https://abc.vn/"},
+                                      sqlmap_out="[!] Timeout sau 180s.")
+        self.assertEqual(r["outcome"], "ok")
+        self.assertIn("[→] SQLMAP THẤT BẠI #1", r["output"])
+        self.assertIn("sqli_blind_extract", r["output"])
+        self.assertIn("KHÔNG gọi lại sqlmap_runner", r["output"])
+
+    def test_wapiti_exploit_fix_maps_have_default(self):
+        """v1.5.3: _WAPITI_EXPLOIT/_WAPITI_FIX — mọi category trong report đều
+        map được hướng khai thác + khắc phục (kể cả qua _default)."""
+        from tools import _WAPITI_EXPLOIT, _WAPITI_FIX
+        self.assertIn("_default", _WAPITI_EXPLOIT)
+        self.assertIn("_default", _WAPITI_FIX)
+        self.assertIn("SQL Injection", _WAPITI_EXPLOIT)
+        self.assertIn("Blind SQL Injection", _WAPITI_EXPLOIT)
+        self.assertIn("SQL Injection", _WAPITI_FIX)
+        cats = self._REPORT["vulnerabilities"].keys()  # category = key nhóm report
+        for cat in cats:
+            self.assertTrue(
+                _WAPITI_EXPLOIT.get(cat, _WAPITI_EXPLOIT["_default"]).strip(), cat)
+            self.assertTrue(
+                _WAPITI_FIX.get(cat, _WAPITI_FIX["_default"]).strip(), cat)
+
+    def test_wapiti_scan_spec_v153(self):
+        """v1.5.3: spec wapiti_scan ghi rõ — thay cho find_forms, TỔNG HỢP LỖ
+        HỔNG, sqlmap THẤT BẠI → AI tự khai thác (known_confirmed=true)."""
+        from tools import TOOL_INDEX
+        desc = TOOL_INDEX["wapiti_scan"].description
+        for marker in ("v1.5.3", "29 attack module", "TỔNG HỢP LỖ HỔNG",
+                       "công cụ tìm form cũ", "sqli_blind_extract (known_confirmed=true)"):
+            self.assertIn(marker, desc)
+
     def test_no_findings_suggests_next(self):
         rep = json.loads(json.dumps(self._REPORT))
         rep["vulnerabilities"] = {}
@@ -2804,7 +2981,7 @@ class TestWapitiScan(unittest.TestCase):
         self.assertEqual(r["outcome"], "ok")
         self.assertIn("KHÔNG phát hiện lỗ hổng nào", r["output"])
         self.assertIn("BƯỚC TIẾP THEO", r["output"])
-        self.assertIn("find_forms", r["output"])
+        self.assertIn("http_probe", r["output"])
         sm.assert_not_called()
 
 
