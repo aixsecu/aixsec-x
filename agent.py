@@ -33,7 +33,7 @@ from tools import (TOOL_REGISTRY, TOOL_INDEX, TOOL_BINS, TOOL_TIMEOUTS,
                    LONG_RUN_TOOLS, available_tools)
 
 # ── terminal colors (AIXSEC-X style) ──
-VERSION = "1.5.5"
+VERSION = "1.5.6"
 
 # v1.5.2: wapiti-first gate — web scope active mà wapiti_scan CHƯA chạy
 # (chưa có outcome=ok/error) thì final JSON bị từ chối và model bị ép gọi
@@ -59,17 +59,8 @@ _AIXSEC_ART = r'''
 ██║  ██║██║██╔╝ ██╗███████║███████╗╚██████╗██╔╝ ██╗
 ╚═╝  ╚═╝╚═╝╚═╝  ╚═╝╚══════╝╚══════╝ ╚═════╝╚═╝  ╚═╝'''
 
-# v1.5.4 — mặt nạ Anonymous (Guy Fawkes V-mask) ASCII thay skull v1.4.8 cho
-# màn hình "hacker-style" (theo yêu cầu user; thuần trang trí)
-_ANON_ART = r'''
-        .o.        .o.            ...
-       .888.      .888.        .d8888b.
-      .8"888.    .8"888.      d88P  Y88b
-     .8' '888.  .8' '888.     888    888
-    .88ooo8888..88ooo8888.    888    888
-   .8'    888..8'    888.     888    888
-  o88o    8888o88o    8888o   "88bodP'
-'''
+# v1.5.6: ĐÃ BỎ _ANON_ART (mặt nạ Anonymous v1.5.4 — hình `.888.` đọc thành
+# chữ "AAO") theo yêu cầu user; banner chỉ còn logo _AIXSEC_ART.
 
 SEVERITY_RISK = {"destructive": 4, "active": 3, "noisy": 2, "safe": 1}
 
@@ -736,11 +727,12 @@ def _sysinfo() -> dict:
 
 def _banner(cfg: dict, scope: str = "", missing=None, mode: str = "interactive",
             color: bool | None = None) -> str:
-    """Màn hình khởi động kiểu hacker (v1.5.4): mặt nạ Anonymous đỏ + logo
-    xanh + tiêu đề căn giữa, KHÔNG khung box (bỏ viền │…│ và nền đen v1.4.8)
-    cho thoáng hơn; status block key-value căn trái theo cột key cố định; cả
-    khối tự căn giữa theo bề rộng terminal khi đang là TTY. color=None → tự
-    bật/tắt theo TTY (NO_COLOR cũng tắt màu)."""
+    """Màn hình khởi động kiểu hacker (v1.5.6): logo AIXSEC-X xanh + tiêu đề
+    căn giữa, KHÔNG khung box (bỏ viền │…│ và nền đen v1.4.8) cho thoáng hơn;
+    v1.5.6 BỎ mặt nạ Anonymous đỏ của v1.5.4 theo yêu cầu user; status block
+    key-value căn trái theo cột key cố định; cả khối tự căn giữa theo bề rộng
+    terminal khi đang là TTY. color=None → tự bật/tắt theo TTY (NO_COLOR cũng
+    tắt màu)."""
     if color is None:
         color = bool(getattr(sys.stdout, "isatty", lambda: False)())
         if os.environ.get("NO_COLOR"):
@@ -770,9 +762,6 @@ def _banner(cfg: dict, scope: str = "", missing=None, mode: str = "interactive",
         return " " * pad + t
 
     lines = [""]
-    for s in _ANON_ART.strip("\n").splitlines():
-        lines.append(center(f"{R}{B}{s.rstrip()}{RS}"))
-    lines.append("")
     for s in _AIXSEC_ART.strip("\n").splitlines():
         lines.append(center(f"{G}{B}{s.rstrip()}{RS}"))
     lines.append("")
