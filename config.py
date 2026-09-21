@@ -48,6 +48,12 @@ def load_config() -> dict:
         # ── Source scan roots cho sast_scan (comma separated) ──
         "src_dirs": [d.strip() for d in os.environ.get("WEBX_SRC_DIRS", "").split(",") if d.strip()],
 
+        # ── Attack Surface Inventory (v1.6.0) ──
+        #   WEBX_INVENTORY_FILE: nếu set → agent TỰ lưu inventory JSON
+        #   (host→port→service→URL→endpoint→method→param→auth→tech, tích lũy từ
+        #   tool output OK thật) sau mỗi vòng và khi thoát. Bỏ trống = không lưu.
+        "inventory_file": os.environ.get("WEBX_INVENTORY_FILE", ""),
+
         # ── DB (bỏ trống = không lưu) ──
         "db": {
             "enabled": os.environ.get("WEBX_DB_ENABLED", "0") == "1",

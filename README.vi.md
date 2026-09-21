@@ -267,6 +267,7 @@ root@aixsec-x:~# Phân tích https://example.com              → agent tự g�
 root@aixsec-x:~# Quét nuclei severity high                  → tấn công mục tiêu
 root@aixsec-x:~# /findings                                  → xem ledger (candidate/confirmed/ruled_out)
 root@aixsec-x:~# /report                                    → xuất report markdown
+root@aixsec-x:~# /capabilities                              → liệt kê tool/binary/version khả dụng (v1.6.0)
 root@aixsec-x:~# !! nmap -p- 10.0.0.5                       → chạy shell trực tiếp (tự chịu trách nhiệm)
 root@aixsec-x:~# q                                          → thoát
 ```
@@ -810,3 +811,29 @@ python3 agent.py --recon
 # → approval prompt: "[APPROVAL] 'nuclei_scan' risk [active] — run? [y/N] y"
 # → agent trả JSON findings → xem /findings → /report
 ```
+## Changelog
+
+### v1.6.0 — Attack Surface Inventory + Capability Discovery + finding đa-nguồn
+
+- **Attack Surface Inventory (`inventory.py`)** — bản đồ thống nhất `host → port →
+  service → URL → endpoint → method → parameter → auth → technology` tích lũy từ
+  **tool output thật** (http_probe, wapiti_scan, ffuf_dir, detect_cms, waf_detect…).
+  Sau mỗi vòng agent ingest kết quả OK và chèn block `[ATTACK SURFACE — đã biết,
+  KHÔNG rescan]` vào message user lượt sau, để model chọn tool kế tiếp dựa trên
+  điều ĐÃ BIẾT thay vì chạy lại recon. Lưu/đọc JSON qua `WEBX_INVENTORY_FILE`
+  (opt-in; bỏ trống = không lưu). Output tool thù địch được coi là dữ liệu không
+  tin cậy: chỉ dẫn bên trong không bao giờ được ingest.
+- **Capability Discovery (`tools.capability_report`)** — khi khởi động agent kiểm
+  tra binary Kali nào có mặt và version (`--version` / `-version` / `-V`, timeout
+  3 s, có cache). Banner hiện `capability: N/M external binaries present`;
+  `/capabilities` (interactive) và `--capabilities` (CLI) in bảng đầy đủ. Planner
+  chỉ chọn tool thực sự tồn tại.
+- **Finding đa-nguồn (`ledger.py`)** — finding giờ mang `source_tool` / `sources` /
+  `parameter`; `parse_findings_json` đọc cả `source` (cũ) lẫn `source_tool`/`sources`;
+  `Ledger.add` gộp cùng một finding từ nhiều scanner (vd Nuclei + Wapiti + AI) thành
+  MỘT finding với evidence gộp và KHÔNG bao giờ hạ cấp status; `render_markdown` hiện
+  `Nguồn: …` và `Parameter: …`. Cả 2 prompt (compact rule 5d / full rule 6d) giờ bắt
+  buộc chọn tool thích ứng và schema JSON cuối có `source`/`parameter`.
+- **Tests** — 21 test hermetic mới (ingest/dedupe/save-load inventory, capability
+  report + cache, finding sources/merge, an toàn với output thù địch, run-loop chèn
+  `[ATTACK SURFACE]`). Toàn bộ suite: 250 test pass.
