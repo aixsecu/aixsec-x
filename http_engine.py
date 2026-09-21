@@ -168,19 +168,30 @@ class EvidenceRedactor:
         """Bản COPY dict cookie đã che value (giữ name) — dùng cho evidence/log."""
         return {str(k): REDACT_MASK for k in (cookies or {})}
 
-    def redact_params(self, params, extra: tuple = ()) -> dict:
-        """Bản COPY query params (dict HOẶC list[(name, value)] — chuẩn hóa về
-        dict) với value của field nhạy cảm che <redacted> (giữ key + thứ tự).
-        extra: tên param bổ sung theo ngữ cảnh (vd apiquery auth name)."""
-        items = params.items() if isinstance(params, dict) else (params or [])
-        out: dict = {}
-        for k, v in items:
+    def redact_params(self, params, extra: tuple = ()) -> Any:
+        """Bản COPY query params đã che value field nhạy cảm.
+
+        Giữ nguyên *shape* của input để evidence không làm mất duplicate params:
+        dict -> dict; list/tuple[(name, value)] -> list[(name, value)]. Điều này
+        quan trọng với multi-value params / HTTP Parameter Pollution (vd
+        ``id=1&id=2``). None -> {} để giữ tương thích với hành vi cũ.
+        extra: tên param bổ sung theo ngữ cảnh (vd apiquery auth name).
+        """
+        if params is None:
+            return {}
+        if isinstance(params, dict):
+            return {str(k): (REDACT_MASK if self._is_sensitive(str(k), extra) else v)
+                    for k, v in params.items()}
+
+        out: list = []
+        for k, v in params:
             key = str(k)
-            out[key] = REDACT_MASK if self._is_sensitive(key, extra) else v
+            out.append((key, REDACT_MASK if self._is_sensitive(key, extra) else v))
         return out
 
-    def redact_form(self, form, extra: tuple = ()) -> dict:
-        """Bản COPY form-urlencoded (dict) đã che value field nhạy cảm."""
+    def redact_form(self, form, extra: tuple = ()) -> Any:
+        """Bản COPY form-urlencoded đã che field nhạy cảm và giữ duplicate
+        field khi input là list/tuple[(name, value)]."""
         return self.redact_params(form, extra)
 
     def redact_json(self, obj, extra: tuple = ()) -> Any:

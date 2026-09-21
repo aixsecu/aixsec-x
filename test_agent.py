@@ -3616,9 +3616,13 @@ class TestEvidenceRedactor(unittest.TestCase):
         # dict
         self.assertEqual(red.redact_params({"q": "1", "api_key": "k"}),
                          {"q": "1", "api_key": self.REDACT})
-        # list[(name, value)] chuẩn hóa về dict, giữ key
+        # list[(name, value)] giữ nguyên shape và duplicate keys
         self.assertEqual(red.redact_params([("q", "1"), ("token", "t")]),
-                         {"q": "1", "token": self.REDACT})
+                         [("q", "1"), ("token", self.REDACT)])
+        self.assertEqual(red.redact_params([("id", "1"), ("id", "2"),
+                                            ("token", "t1"), ("token", "t2")]),
+                         [("id", "1"), ("id", "2"),
+                          ("token", self.REDACT), ("token", self.REDACT)])
         # None → {} không crash
         self.assertEqual(red.redact_params(None), {})
         # extra: tên param bổ sung theo ngữ cảnh request
@@ -3631,6 +3635,10 @@ class TestEvidenceRedactor(unittest.TestCase):
         out = he._default_redactor().redact_form(
             {"user": "admin", "pass": "123"})
         self.assertEqual(out, {"user": "admin", "pass": self.REDACT})
+        out_multi = he._default_redactor().redact_form(
+            [("role", "user"), ("role", "admin"), ("pass", "123")])
+        self.assertEqual(out_multi, [("role", "user"), ("role", "admin"),
+                                     ("pass", self.REDACT)])
 
     def test_add_sensitive_field_instance_isolation(self):
         import http_engine as he
