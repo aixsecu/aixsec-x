@@ -15,8 +15,9 @@ import time
 import unittest
 from http.server import (BaseHTTPRequestHandler, HTTPServer,
                          ThreadingHTTPServer)
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
-from urllib.parse import unquote_plus
+from urllib.parse import unquote_plus, urlparse
 
 # cho phép import local module khi chạy từ thư mục khác
 sys.path.insert(0, __file__.rsplit("/", 1)[0])
@@ -29,6 +30,7 @@ from ledger import (Ledger, Finding, parse_findings_json, validation_plan,
                    render_markdown, check_findings_evidence)  # noqa: E402
 from scope import ScopePolicy  # noqa: E402
 from llm import InjectionGuard  # noqa: E402
+import crawler  # noqa: E402
 
 FINAL_JSON = json.dumps({
     "findings": [
@@ -3429,12 +3431,52 @@ class TestWapitiFormSweep(unittest.TestCase):
 # ─────────────────────────────────────────────
 
 class EchoHttpHandler(BaseHTTPRequestHandler):
-    """Echo server cho _http_request: GET trả path, POST phản ánh body,
-    /slow ngủ 2s (kiểm tra timeout floor)."""
+    """Echo server cho _http_request — v1.8.0 routes Session Engine:
+      GET/POST mặc định        → phản ánh path/body
+      /slow                    → ngủ 2s (kiểm tra timeout floor)
+      /redir                   → 302 → /product.php?id=9 (redirect history)
+      /setcookie               → Set-Cookie: sid=abc123; Path=/
+      /showcookie              → in Cookie header request nhận được
+      /showhdr                 → in TOÀN BỘ headers request (kiểm tra auth/CT)
+      PATCH/DELETE             → phản ánh body qua _echo_body
+      HEAD /setcookie          → Set-Cookie + Content-Length 0 (headers_recon)
+      HEAD khác                → X-Test-Header: yes, không body
+    """
+
+    def _send(self, status, body, ctype="text/plain", extra=None):
+        self.send_response(status)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(body)))
+        for k, v in (extra or {}).items():
+            self.send_header(k, v)
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _headers_body(self):
+        return "\n".join(f"{k}: {v}" for k, v in self.headers.items())
+
+    def _echo_body(self, prefix, status):
+        length = int(self.headers.get("Content-Length") or 0)
+        data = self.rfile.read(length)
+        self._send(status, f"{prefix}:{data.decode(errors='replace')}".encode())
 
     def do_GET(self):
         if self.path.startswith("/slow"):
             time.sleep(2)
+        if self.path.startswith("/redir"):
+            self._send(302, b"", extra={"Location": "/product.php?id=9"})
+            return
+        if self.path.startswith("/setcookie"):
+            self._send(200, b"cookie set",
+                       extra={"Set-Cookie": "sid=abc123; Path=/"})
+            return
+        if self.path.startswith("/showcookie"):
+            c = self.headers.get("Cookie") or "(none)"
+            self._send(200, f"cookie={c}".encode())
+            return
+        if self.path.startswith("/showhdr"):
+            self._send(200, self._headers_body().encode())
+            return
         body = f"<html>echo path={self.path}</html>".encode()
         self.send_response(200)
         self.send_header("Content-Type", "text/html")
@@ -3443,17 +3485,288 @@ class EchoHttpHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def do_HEAD(self):
+        # v1.8.1: routes HEAD (headers_recon qua Session Engine) — không body
+        if self.path.startswith("/setcookie"):
+            self._send(200, b"", extra={"Set-Cookie": "sid=abc123; Path=/"})
+            return
+        self._send(200, b"", ctype="text/html", extra={"X-Test-Header": "yes"})
+
     def do_POST(self):
-        length = int(self.headers.get("Content-Length") or 0)
-        data = self.rfile.read(length)
-        body = f"posted:{data.decode(errors='replace')}".encode()
-        self.send_response(201)
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
+        if self.path.startswith("/showhdr"):
+            # đọc body trước (không bắt buộc — _headers_body không cần) nhưng
+            # giữ đồng bộ nếu client gửi; echo HEADERS thay vì body
+            length = int(self.headers.get("Content-Length") or 0)
+            self.rfile.read(length)
+            self._send(200, self._headers_body().encode())
+            return
+        self._echo_body("posted", 201)
+
+    def do_PATCH(self):
+        self._echo_body("patched", 200)
+
+    def do_DELETE(self):
+        self._echo_body("deleted", 200)
 
     def log_message(self, *args):
         pass
+
+
+class TestHeaderRedaction(unittest.TestCase):
+    """v1.8.1: redact_headers/redact_cookies/add_sensitive_header — unit test
+    thuần (không network): case-insensitive, KHÔNG mutate dict gốc, cookie giữ
+    name + attr không bí mật còn value che <redacted>."""
+    REDACT = "<redacted>"
+
+    def test_redact_headers_masks_sensitive_values(self):
+        import http_engine as he
+        src = {"Authorization": "Bearer tok123", "X-Api-Key": "k123",
+               "Set-Cookie": "PHPSESSID=abc; Path=/; Secure; HttpOnly",
+               "Server": "nginx"}
+        out = he.redact_headers(src)
+        self.assertEqual(out["Authorization"], self.REDACT)
+        self.assertEqual(out["X-Api-Key"], self.REDACT)
+        # cookie: giữ name + attr không bí mật, che value
+        self.assertEqual(out["Set-Cookie"],
+                         "PHPSESSID=<redacted>; Path=/; Secure; HttpOnly")
+        self.assertEqual(out["Server"], "nginx")
+
+    def test_redact_headers_case_insensitive(self):
+        import http_engine as he
+        out = he.redact_headers({"AUTHORIZATION": "x", "Cookie": "a=b",
+                                 "authorization": "y", "SET-COOKIE": "c=d"})
+        self.assertEqual(out["AUTHORIZATION"], self.REDACT)
+        self.assertEqual(out["authorization"], self.REDACT)
+        self.assertIn("a=<redacted>", out["Cookie"])
+        self.assertIn("c=<redacted>", out["SET-COOKIE"])
+
+    def test_redact_headers_does_not_mutate_input(self):
+        import http_engine as he
+        src = {"Authorization": "tok", "Cookie": "sid=abc", "Server": "nginx"}
+        he.redact_headers(src)
+        self.assertEqual(src["Authorization"], "tok")
+        self.assertEqual(src["Cookie"], "sid=abc")
+        self.assertEqual(src["Server"], "nginx")
+
+    def test_redact_cookies_masks_values_keeps_names(self):
+        import http_engine as he
+        self.assertEqual(he.redact_cookies({"sid": "abc", "theme": "dark"}),
+                         {"sid": self.REDACT, "theme": self.REDACT})
+        self.assertEqual(he.redact_cookies(None), {})
+
+    def test_add_sensitive_header_registers_extra(self):
+        import http_engine as he
+        he.add_sensitive_header("X-Token")
+        self.addCleanup(self._restore_extra_sensitive, "x-token")
+        self.assertIn("x-token", he._extra_sensitive)
+        self.assertEqual(he.redact_headers({"X-Token": "sekret"})["X-Token"],
+                         self.REDACT)
+
+    @staticmethod
+    def _restore_extra_sensitive(name):
+        import http_engine as he
+        with he._redact_lock:
+            he._extra_sensitive.discard(name)
+
+
+class TestEvidenceRedactor(unittest.TestCase):
+    """v1.9.1: EvidenceRedactor THỐNG NHẤT — unit test thuần (không network):
+    deep JSON/form/params/URL, so khớp hậu tố '_<field>', KHÔNG mutate dữ
+    liệu gốc, add_sensitive_field cách ly theo instance."""
+    REDACT = "<redacted>"
+
+    def test_redact_json_deep_no_mutate(self):
+        import http_engine as he
+        src = {"user": "admin", "password": "p1",
+               "meta": {"access_token": "t2",
+                         "items": [{"id": 1, "secret": "s3"}]}}
+        out = he._default_redactor().redact_json(src)
+        self.assertEqual(out["user"], "admin")
+        self.assertEqual(out["password"], self.REDACT)
+        self.assertEqual(out["meta"]["access_token"], self.REDACT)
+        self.assertEqual(out["meta"]["items"][0]["secret"], self.REDACT)
+        self.assertEqual(out["meta"]["items"][0]["id"], 1)
+        # KHÔNG mutate obj gốc (kể cả dict lồng nhau)
+        self.assertEqual(src["password"], "p1")
+        self.assertEqual(src["meta"]["access_token"], "t2")
+        self.assertEqual(src["meta"]["items"][0]["secret"], "s3")
+
+    def test_redact_json_list_and_plain(self):
+        import http_engine as he
+        red = he._default_redactor()
+        self.assertEqual(red.redact_json([
+            {"name": "a", "token": "t"}, "plain", 7]),
+            [{"name": "a", "token": self.REDACT}, "plain", 7])
+        self.assertEqual(red.redact_json("x"), "x")
+        self.assertEqual(red.redact_json(None), None)
+
+    def test_suffix_field_matching(self):
+        import http_engine as he
+        red = he._default_redactor()
+        out = red.redact_params({"user_token": "u1",
+                                 "login_password": "p1", "csrf": "c1",
+                                 "page": "2"})
+        self.assertEqual(out, {"user_token": self.REDACT,
+                               "login_password": self.REDACT,
+                               "csrf": "c1", "page": "2"})
+
+    def test_redact_params_forms(self):
+        import http_engine as he
+        red = he._default_redactor()
+        # dict
+        self.assertEqual(red.redact_params({"q": "1", "api_key": "k"}),
+                         {"q": "1", "api_key": self.REDACT})
+        # list[(name, value)] chuẩn hóa về dict, giữ key
+        self.assertEqual(red.redact_params([("q", "1"), ("token", "t")]),
+                         {"q": "1", "token": self.REDACT})
+        # None → {} không crash
+        self.assertEqual(red.redact_params(None), {})
+        # extra: tên param bổ sung theo ngữ cảnh request
+        self.assertEqual(red.redact_params({"q": "1", "key": "supersecret"},
+                                           extra=("key",)),
+                         {"q": "1", "key": self.REDACT})
+
+    def test_redact_form(self):
+        import http_engine as he
+        out = he._default_redactor().redact_form(
+            {"user": "admin", "pass": "123"})
+        self.assertEqual(out, {"user": "admin", "pass": self.REDACT})
+
+    def test_add_sensitive_field_instance_isolation(self):
+        import http_engine as he
+        r1 = he.EvidenceRedactor()
+        r2 = he.EvidenceRedactor()
+        r1.add_sensitive_field("session_id")
+        self.assertEqual(r1.redact_params({"session_id": "abc"})
+                         ["session_id"], self.REDACT)
+        # instance khác KHÔNG bị ảnh hưởng
+        self.assertEqual(r2.redact_params({"session_id": "abc"})
+                         ["session_id"], "abc")
+        # redactor mặc định dùng cho evidence cũng KHÔNG bị ảnh hưởng
+        self.assertEqual(he._default_redactor().redact_params(
+            {"session_id": "abc"})["session_id"], "abc")
+
+    def test_redact_url(self):
+        import http_engine as he
+        red = he._default_redactor()
+        self.assertEqual(
+            red.redact_url("http://x/products?id=1&token=abc&page=2#frag"),
+            "http://x/products?id=1&token=<redacted>&page=2#frag")
+        # extra: tên param auth apiquery che theo ngữ cảnh
+        self.assertEqual(
+            red.redact_url("http://x/product.php?page=2&key=supersecret",
+                           extra=("key",)),
+            "http://x/product.php?page=2&key=<redacted>")
+        # URL không query / rỗng / không parse được → nguyên bản
+        self.assertEqual(red.redact_url("http://x/"), "http://x/")
+        self.assertEqual(red.redact_url(""), "")
+
+
+class TestEvidenceRedactorEngine(unittest.TestCase):
+    """v1.9.1: EvidenceRedactor tích hợp qua Session Engine — evidence_dict()
+    che JSON body/form/params/URL/auth nhưng KHÔNG mutate record/body: giá trị
+    THẬT vẫn lên wire (server echo) và nằm trong rec (replay dùng được)."""
+    REDACT = "<redacted>"
+
+    server = None
+
+    @classmethod
+    def setUpClass(cls):
+        cls.server = ThreadingHTTPServer(("127.0.0.1", 0), EchoHttpHandler)
+        cls.port = cls.server.server_address[1]
+        cls.thread = threading.Thread(target=cls.server.serve_forever,
+                                      daemon=True)
+        cls.thread.start()
+
+    @classmethod
+    def tearDownClass(cls):
+        if cls.server:
+            cls.server.shutdown()
+            cls.server.server_close()
+
+    def _url(self, path="/"):
+        return f"http://127.0.0.1:{self.port}{path}"
+
+    def setUp(self):
+        import http_engine as he
+        he.reset_sessions()
+        he.set_proxies(None)
+
+    def test_json_body_redacted_evidence_record_kept(self):
+        import http_engine as he
+        sess = he.session_for(self._url("/"))
+        body_src = {"user": "admin", "password": "p1",
+                    "meta": {"access_token": "t2",
+                              "ok": [{"id": 1, "secret": "s3"}]}}
+        resp, rec = sess.request(
+            "post", self._url("/login"),
+            params={"token": "t123", "page": "2"},
+            json_body=body_src)
+        self.assertEqual(resp.status_code, 201)
+        ev = rec.evidence_dict()
+        body = json.loads(ev["body"])
+        # evidence: field nhạy cảm che <redacted>, key GIỮ, data thường nguyên
+        self.assertEqual(body["user"], "admin")
+        self.assertEqual(body["password"], self.REDACT)
+        self.assertEqual(body["meta"]["access_token"], self.REDACT)
+        self.assertEqual(body["meta"]["ok"][0]["secret"], self.REDACT)
+        self.assertEqual(body["meta"]["ok"][0]["id"], 1)
+        self.assertEqual(ev["body_kind"], "json")
+        # params: token (hậu tố _token) che, page giữ — thứ tự giữ nguyên
+        self.assertEqual(ev["params"], {"token": self.REDACT, "page": "2"})
+        # record/input KHÔNG bị mutate (replay dựng lại request thật được)
+        self.assertEqual(rec.body["password"], "p1")
+        self.assertEqual(rec.body["meta"]["access_token"], "t2")
+        self.assertEqual(body_src["password"], "p1")
+        self.assertEqual(body_src["meta"]["ok"][0]["secret"], "s3")
+
+    def test_form_redacted_wire_sends_real_value(self):
+        import http_engine as he
+        sess = he.session_for(self._url("/"))
+        resp, rec = sess.request("post", self._url("/login"),
+                                 form={"user": "admin", "pass": "123"})
+        self.assertEqual(resp.status_code, 201)
+        # wire gửi giá trị THẬT (server echo body nhận được)
+        self.assertIn("user=admin", resp.text)
+        self.assertIn("pass=123", resp.text)
+        ev = rec.evidence_dict()
+        self.assertEqual(ev["body_kind"], "form")
+        self.assertEqual(json.loads(ev["body"]),
+                         {"user": "admin", "pass": self.REDACT})
+        # record giữ giá trị gốc
+        self.assertEqual(rec.body, {"user": "admin", "pass": "123"})
+
+    def test_raw_body_not_parsed(self):
+        import http_engine as he
+        sess = he.session_for(self._url("/"))
+        resp, rec = sess.request("post", self._url("/login"),
+                                 body="user=admin&pass=123")
+        self.assertEqual(resp.status_code, 201)
+        ev = rec.evidence_dict()
+        self.assertEqual(ev["body_kind"], "raw")
+        # raw không parse → giữ nguyên (không che cũng không bịa)
+        self.assertEqual(ev["body"], "user=admin&pass=123")
+
+    def test_apiquery_auth_masked_everywhere_except_record(self):
+        import http_engine as he
+        sess = he.session_for(self._url("/"))
+        resp, rec = sess.request("get", self._url("/product.php"),
+                                 params={"page": "2"},
+                                 auth="apiquery:key:supersecret")
+        self.assertEqual(resp.status_code, 200)
+        ev = rec.evidence_dict()
+        # auth: chỉ kind + name — giá trị KHÔNG bao giờ vào evidence
+        self.assertEqual(ev["auth"], {"kind": "apiquery", "name": "key"})
+        # params: param auth (extra theo ngữ cảnh) bị che
+        self.assertEqual(ev["params"], {"page": "2", "key": self.REDACT})
+        # URL/final_url/history: secret không lộ (requests ghép apiquery vào
+        # query của request thật → final_url chứa key=supersecret)
+        self.assertNotIn("supersecret", ev["url"])
+        self.assertNotIn("supersecret", ev["final_url"])
+        self.assertIn("key=" + self.REDACT, ev["final_url"])
+        self.assertEqual(ev["history"], [])
+        # record giữ giá trị THẬT (evidence chỉ là view)
+        self.assertEqual(rec.params["key"], "supersecret")
 
 
 class TestHttpRequestTool(unittest.TestCase):
@@ -3477,6 +3790,13 @@ class TestHttpRequestTool(unittest.TestCase):
 
     def _url(self, path="/"):
         return f"http://127.0.0.1:{self.port}{path}"
+
+    def setUp(self):
+        # v1.8.0: mỗi test bắt đầu Session Engine sạch — cookie jar/ring buffer
+        # + proxy của test trước KHÔNG rò sang test sau (hermetic cả suite).
+        import http_engine as he
+        he.reset_sessions()
+        he.set_proxies(None)
 
     def test_get_returns_status_headers_snippet(self):
         from tools import _http_request
@@ -3508,7 +3828,8 @@ class TestHttpRequestTool(unittest.TestCase):
         from tools import _http_request
         out = _http_request(url=self._url("/"), method="trace")
         self.assertTrue(out.startswith(
-            "[!] http_request: method phải là get|post|head|put|options"))
+            "[!] http_request: method phải là get|post|head|put|options|"
+            "patch|delete"))
 
     def test_connection_refused_reported(self):
         from tools import _http_request
@@ -3522,6 +3843,7 @@ class TestHttpRequestTool(unittest.TestCase):
         self.assertIsNone(data)  # error path → không có structured data
 
     def test_timeout_capped_at_30(self):
+        # v1.8.0: engine gọi requests.sessions.Session.request — patch đúng tầng
         from tools import _http_request
         captured = {}
 
@@ -3531,17 +3853,19 @@ class TestHttpRequestTool(unittest.TestCase):
             text = "ok"
             content = b"ok"
 
-        def fake_get(url, headers=None, timeout=None, allow_redirects=None):
-            captured["timeout"] = timeout
+        def fake_request(method, url, **kw):
+            captured["timeout"] = kw.get("timeout")
             return FakeResp()
 
-        with patch("requests.get", side_effect=fake_get):
+        with patch("requests.sessions.Session.request",
+                   side_effect=fake_request):
             out, data = _http_request(url="http://127.0.0.1:1/", _timeout=999)
         self.assertEqual(captured["timeout"], 30)  # cap 30s
         self.assertIn("200", out)
         self.assertEqual(data["status"], 200)
 
     def test_timeout_floor_at_5(self):
+        # v1.8.0: engine gọi requests.sessions.Session.request — patch đúng tầng
         from tools import _http_request
         captured = {}
 
@@ -3551,11 +3875,12 @@ class TestHttpRequestTool(unittest.TestCase):
             text = "ok"
             content = b"ok"
 
-        def fake_get(url, headers=None, timeout=None, allow_redirects=None):
-            captured["timeout"] = timeout
+        def fake_request(method, url, **kw):
+            captured["timeout"] = kw.get("timeout")
             return FakeResp()
 
-        with patch("requests.get", side_effect=fake_get):
+        with patch("requests.sessions.Session.request",
+                   side_effect=fake_request):
             out, data = _http_request(url="http://127.0.0.1:1/", _timeout=1)
         self.assertEqual(captured["timeout"], 5)  # floor 5s
         self.assertIn("200", out)
@@ -3569,12 +3894,398 @@ class TestHttpRequestTool(unittest.TestCase):
         params = spec.schema()["function"]["parameters"]
         self.assertEqual(params["required"], ["url"])
         self.assertEqual(params["properties"]["method"]["enum"],
-                         ["get", "post", "head", "put", "options"])
+                         ["get", "post", "head", "put", "options",
+                          "patch", "delete"])
 
     def test_out_of_scope_rejected_via_dispatch(self):
         a = WebXAgent(config=cfg(), chat=FakeChat())
         res = a._dispatch("http_request", {"url": "https://evil.org/"})
         self.assertEqual(res["outcome"], "scope_rejected")
+
+    # ── v1.8.0: HTTP Session Engine — adapter tests (http_request → engine) ──
+    def test_auth_api_key(self):
+        from tools import _http_request
+        out, data = _http_request(url=self._url("/showhdr"),
+                                  auth="api_key:X-API-Key:abc123")
+        self.assertEqual(data["status"], 200)
+        # v1.8.1: request_headers che value → <redacted> (giữ name)
+        self.assertEqual(data["evidence"]["request_headers"]["X-API-Key"],
+                         "<redacted>")
+        # wire THẬT: /showhdr echo lại header đã nhận — gửi ĐÚNG abc123
+        self.assertIn("x-api-key: abc123",
+                      data["evidence"]["body_snippet"].lower())
+
+    def test_auth_apiquery(self):
+        from tools import _http_request
+        out, data = _http_request(url=self._url("/product.php"),
+                                  auth="apiquery:api:xyz")
+        self.assertEqual(data["status"], 200)
+        # apiquery → param query trên WIRE thật — server echo path có ?api=xyz
+        self.assertIn("echo path=/product.php?api=xyz", out)
+        self.assertIn("?api=xyz", data["final_url"])
+        # v1.8.1: evidence che giá trị apiquery trong params (<redacted>)
+        self.assertEqual(data["evidence"]["params"], {"api": "<redacted>"})
+
+    def test_auth_basic(self):
+        from tools import _http_request
+        out, data = _http_request(url=self._url("/showhdr"),
+                                  auth="basic:admin:secret")
+        self.assertEqual(data["status"], 200)
+        # v1.8.1: Authorization che value trong evidence request_headers
+        self.assertEqual(data["evidence"]["request_headers"]["Authorization"],
+                         "<redacted>")
+        # wire THẬT: base64("admin:secret") = YWRtaW46c2VjcmV0 (server echo)
+        self.assertIn("authorization: basic ywrtaw46c2vjcmv0",
+                      data["evidence"]["body_snippet"].lower())
+
+    def test_auth_bearer(self):
+        from tools import _http_request
+        out, data = _http_request(url=self._url("/showhdr"),
+                                  auth="bearer:tok123")
+        self.assertEqual(data["status"], 200)
+        self.assertEqual(data["evidence"]["request_headers"]["Authorization"],
+                         "<redacted>")
+        self.assertIn("authorization: bearer tok123",
+                      data["evidence"]["body_snippet"].lower())
+
+    def test_cookie_jar_persists_across_calls(self):
+        from tools import _http_request
+        out1, data1 = _http_request(url=self._url("/setcookie"))
+        self.assertEqual(data1["status"], 200)
+        # v1.8.1: evidence/log che giá trị cookie — chỉ còn <redacted>
+        self.assertEqual(data1["cookies"].get("sid"), "<redacted>")
+        self.assertEqual(data1["evidence"]["cookies_received"].get("sid"),
+                         "<redacted>")
+        # lượt gọi SAU — cùng host → chung session, cookie jar vẫn còn
+        out2, data2 = _http_request(url=self._url("/showcookie"))
+        self.assertEqual(data2["status"], 200)
+        # server echo (body) KHÔNG redact — chứng minh jar thật còn sid=abc123
+        self.assertIn("cookie=sid=abc123", out2)
+
+    def test_form_body(self):
+        from tools import _http_request
+        out, data = _http_request(url=self._url("/showhdr"), method="post",
+                                  form={"user": "admin", "pass": "123"})
+        self.assertEqual(data["status"], 200)
+        self.assertIn("content-type: application/x-www-form-urlencoded",
+                      out.lower())
+
+    def test_json_body(self):
+        from tools import _http_request
+        out, data = _http_request(url=self._url("/showhdr"), method="post",
+                                  json_body={"a": 1, "b": [2, 3]})
+        self.assertEqual(data["status"], 200)
+        self.assertIn("content-type: application/json", out.lower())
+
+    def test_missing_upload_file_reported(self):
+        from tools import _http_request
+        out, data = _http_request(url=self._url("/upload"), method="post",
+                                  files={"up": "/nonexistent/x.txt"})
+        self.assertTrue(out.startswith("[!] http_request: file"))
+        self.assertIn("không tồn tại", out)
+        self.assertIsNone(data)
+
+    def test_multipart_files(self):
+        from tools import _http_request
+        fd, path = tempfile.mkstemp(suffix=".txt")
+        try:
+            with os.fdopen(fd, "w") as f:
+                f.write("filecontent123")
+            out, data = _http_request(url=self._url("/upload"), method="post",
+                                      files={"up": path})
+            self.assertIn("→ 201", out)
+            self.assertEqual(data["status"], 201)
+            self.assertIn("filecontent123", out)  # body multipart chứa nội dung
+            # evidence ghi (field, filename) — bounded, không kèm nội dung file
+            self.assertIn("up=", data["evidence"]["body"])
+        finally:
+            os.unlink(path)
+
+    def test_patch_delete_supported(self):
+        from tools import _http_request
+        out_p, data_p = _http_request(url=self._url("/note"), method="patch",
+                                      body="x")
+        self.assertIn("PATCH", out_p)
+        self.assertIn("patched:x", out_p)
+        self.assertEqual(data_p["status"], 200)
+        out_d, data_d = _http_request(url=self._url("/note"), method="delete")
+        self.assertIn("DELETE", out_d)
+        self.assertIn("deleted:", out_d)
+        self.assertEqual(data_d["status"], 200)
+
+    def test_query_params(self):
+        from tools import _http_request
+        out, data = _http_request(url=self._url("/product.php"),
+                                  params={"id": 9, "flag": 1})
+        self.assertEqual(data["status"], 200)
+        self.assertIn("echo path=/product.php?id=9&flag=1", out)
+
+    def test_redirect_history_and_final_url(self):
+        from tools import _http_request
+        out, data = _http_request(url=self._url("/redir"))
+        self.assertEqual(data["status"], 200)
+        self.assertEqual(data["final_url"], self._url("/product.php?id=9"))
+        self.assertEqual(data["history"][0]["status"], 302)
+        self.assertIn("redirects: 302 → 200", out)
+        self.assertIn("echo path=/product.php?id=9", out)
+
+    def test_redirect_not_followed(self):
+        from tools import _http_request
+        out, data = _http_request(url=self._url("/redir"),
+                                  follow_redirects=False)
+        self.assertEqual(data["status"], 302)
+        self.assertEqual(data["final_url"], self._url("/redir"))
+        self.assertNotIn("redirects:", out)
+        self.assertEqual(data["headers"].get("Location"), "/product.php?id=9")
+
+    def test_replay_reuses_last_request(self):
+        import http_engine as he
+        from tools import _http_request
+        out, data = _http_request(url=self._url("/product.php?id=1"),
+                                  method="get")
+        self.assertEqual(data["status"], 200)
+        sess = he.session_for(self._url("/"))
+        resp, rec = sess.replay()  # rec_id=None → record gần nhất
+        self.assertIsNotNone(resp)
+        self.assertEqual(resp.status_code, 200)
+        self.assertIn("echo path=/product.php?id=1", resp.body_snippet)
+
+    def test_reset_sessions_clears_cookies(self):
+        import http_engine as he
+        from tools import _http_request
+        _http_request(url=self._url("/setcookie"))
+        self.assertGreaterEqual(he.session_count(), 1)
+        he.reset_sessions()
+        out, data = _http_request(url=self._url("/showcookie"))
+        self.assertIn("cookie=(none)", out)
+
+    # ── v1.8.1: replay từ RequestSpec + probe/headers_recon qua engine ──
+    def test_replay_from_spec_applies_auth_once(self):
+        """spec (pre-merge/pre-auth) → replay áp auth đúng 1 lần; record mới
+        cũng giữ spec sạch (không double-apply ở các replay sau)."""
+        import http_engine as he
+        from tools import _http_request
+        url = self._url("/showhdr")
+        out, data = _http_request(url=url, auth="bearer:tok123")
+        self.assertEqual(data["status"], 200)
+        sess = he.session_for(url)
+        rec = sess.records[-1]
+        # spec = ý định GỐC (pre-auth) — KHÔNG chứa Authorization; record đã apply
+        self.assertNotIn(
+            "authorization",
+            {k.lower(): v for k, v in (rec.spec.headers or {}).items()})
+        self.assertEqual(rec.headers.get("Authorization"), "Bearer tok123")
+        # replay → auth áp đúng 1 lần (server echo chỉ 1 dòng Authorization)
+        resp, rec2 = sess.replay()
+        self.assertIsNotNone(resp)
+        self.assertEqual(resp.status_code, 200)
+        cnt = resp.body_snippet.lower().count("authorization: bearer tok123")
+        self.assertEqual(cnt, 1)
+        self.assertNotIn(
+            "authorization",
+            {k.lower(): v for k, v in (rec2.spec.headers or {}).items()})
+
+    def test_replay_legacy_fallback_without_spec(self):
+        """Record cũ (spec=None — phiên trước v1.8.1) vẫn replay qua legacy
+        fallback từ rec fields."""
+        import http_engine as he
+        from tools import _http_request
+        url = self._url("/product.php?id=1")
+        out, data = _http_request(url=url, method="get")
+        self.assertEqual(data["status"], 200)
+        sess = he.session_for(self._url("/"))
+        sess.records[-1].spec = None  # mô phỏng record cũ
+        resp, rec = sess.replay()
+        self.assertIsNotNone(resp)
+        self.assertEqual(resp.status_code, 200)
+        self.assertIn("echo path=/product.php?id=1", resp.body_snippet)
+
+    def test_http_probe_engine_and_redaction(self):
+        """v1.8.1: _http_probe chạy qua Session Engine; Set-Cookie value che
+        <redacted> trong out lẫn data (giữ name + attr)."""
+        from tools import _http_probe
+        out, data = _http_probe(url=self._url("/setcookie"), _timeout=10)
+        self.assertIsNotNone(data)
+        self.assertEqual(data["status"], 200)
+        self.assertIn("sid=<redacted>", out)
+        sc = data["headers"].get("Set-Cookie",
+                                  data["headers"].get("set-cookie"))
+        self.assertEqual(sc, "sid=<redacted>; Path=/")
+
+    def test_headers_recon_engine_and_redaction(self):
+        """v1.8.1: _headers_recon chạy HEAD qua Session Engine; Set-Cookie
+        value che <redacted> trong out lẫn data."""
+        from tools import _headers_recon
+        out, data = _headers_recon(url=self._url("/setcookie"))
+        self.assertIsNotNone(data)
+        self.assertEqual(data["status"], 200)
+        self.assertIn("sid=<redacted>", out)
+
+    def test_probe_redacted_set_cookie_still_detected_by_inventory(self):
+        """v1.8.1 end-to-end: probe redact value nhưng GIỮ name → inventory
+        vẫn thêm auth_hint 'cookie' từ cấu trúc Set-Cookie."""
+        from tools import _http_probe
+        out, data = _http_probe(url=self._url("/setcookie"), _timeout=10)
+        self.assertIsNotNone(data)
+        inv = Inventory()
+        n = inv.ingest([{"name": "http_probe", "outcome": "ok",
+                         "args": {"url": self._url("/setcookie")},
+                         "data": data, "output": out}])
+        self.assertGreaterEqual(n, 1)
+        h = inv.host(self._url("/setcookie"))
+        self.assertIsNotNone(h)
+        self.assertIn("cookie", h.auth_hints)
+
+
+class TestHttpEngineUnit(unittest.TestCase):
+    """v1.8.0: HTTP Session Engine (http_engine.py) — unit test hermetic:
+    patch đúng tầng engine gọi thẳng requests (requests.sessions.Session.
+    request) nên không cần network thật; + integration test agent-level
+    (run() reset session + áp proxy từ config)."""
+
+    server = None
+
+    @classmethod
+    def setUpClass(cls):
+        cls.server = ThreadingHTTPServer(("127.0.0.1", 0), EchoHttpHandler)
+        cls.port = cls.server.server_address[1]
+        cls.thread = threading.Thread(target=cls.server.serve_forever,
+                                      daemon=True)
+        cls.thread.start()
+
+    @classmethod
+    def tearDownClass(cls):
+        if cls.server:
+            cls.server.shutdown()
+            cls.server.server_close()
+
+    def _url(self, path="/"):
+        return f"http://127.0.0.1:{self.port}{path}"
+
+    @staticmethod
+    def _fake_resp(status=200, text="ok"):
+        # SimpleNamespace thay class lồng: trong class body, 'text = text'
+        # (cùng tên 2 vế) không nhìn thấy tham số enclosing scope → NameError.
+        return SimpleNamespace(
+            status_code=status, headers={"Content-Type": "text/plain"},
+            text=text, content=text.encode())
+
+    def test_parse_auth_forms(self):
+        import http_engine as he
+        self.assertEqual(he.parse_auth("basic:admin:secret"),
+                         {"kind": "basic", "user": "admin", "pass": "secret"})
+        # maxsplit=2 → pass chứa ':' giữ nguyên phần còn lại
+        self.assertEqual(he.parse_auth("basic:u:p:a:ss")["pass"], "p:a:ss")
+        self.assertEqual(he.parse_auth("bearer:tok123"),
+                         {"kind": "bearer", "token": "tok123"})
+        self.assertEqual(he.parse_auth("api_key:X-API-Key:abc"),
+                         {"kind": "api_key", "name": "X-API-Key",
+                          "value": "abc"})
+        self.assertEqual(he.parse_auth("apiquery:api:xyz")["kind"],
+                         "apiquery")
+        for bad in (None, "", 123, "basic:u", "bearer:", "nope:x:y"):
+            self.assertIsNone(he.parse_auth(bad), f"parse_auth({bad!r}) → None")
+
+    def test_proxy_config_applied_to_sessions(self):
+        import http_engine as he
+        he.reset_sessions()
+        try:
+            he.set_proxies({"http": "http://127.0.0.1:9000",
+                            "https": "http://127.0.0.1:9001"})
+            self.assertEqual(he.get_proxies()["http"], "http://127.0.0.1:9000")
+            sess = he.session_for("http://example.com/")
+            self.assertEqual(sess.proxies["http"], "http://127.0.0.1:9000")
+            self.assertEqual(sess.s.proxies.get("http"),
+                             "http://127.0.0.1:9000")
+            # session tạo TRƯỚC khi set_proxies cũng được cập nhật đồng loạt
+            he.set_proxies({"http": "http://127.0.0.1:9002"})
+            self.assertEqual(sess.proxies["http"], "http://127.0.0.1:9002")
+        finally:
+            he.set_proxies(None)
+            he.reset_sessions()
+
+    def test_replay_returns_none_when_no_records(self):
+        import http_engine as he
+        he.reset_sessions()
+        try:
+            sess = he.session_for("http://example.com/")
+            resp, rec = sess.replay()
+            self.assertIsNone(resp)
+            self.assertIsNone(rec)
+        finally:
+            he.reset_sessions()
+
+    def test_ring_buffer_bounded_at_max(self):
+        import http_engine as he
+        he.reset_sessions()
+        try:
+            sess = he.session_for("http://example.com/")
+            with patch("requests.sessions.Session.request",
+                       return_value=self._fake_resp()):
+                for i in range(25):
+                    sess.request("get", f"http://example.com/{i}")
+            self.assertEqual(len(sess.records), he.MAX_RECORDS)  # 20
+            self.assertEqual(sess.records[0].id, 5)   # id 0..4 bị đẩy ra
+            self.assertEqual(sess.records[-1].id, 24)  # request gần nhất giữ lại
+        finally:
+            he.reset_sessions()
+
+    def test_run_resets_sessions_and_applies_proxy_env(self):
+        """agent-level: run() BẮT ĐẦU bằng reset_sessions() + set_proxies từ
+        config (http_proxy/https_proxy ← WEBX_HTTP_PROXY/WEBX_HTTPS_PROXY)."""
+        import http_engine as he
+        from tools import _http_request
+        he.reset_sessions()
+        try:
+            # "lượt trước": session cũ có cookie trong jar
+            _http_request(url=self._url("/setcookie"))
+            self.assertGreaterEqual(he.session_count(), 1)
+            self.assertIn("sid", dict(he.session_for(self._url("/")).s.cookies))
+            # run() mới với proxy config → reset + áp proxy
+            a = WebXAgent(
+                config=cfg({"targets": [], "src_dirs": [],
+                            "http_proxy": "http://127.0.0.1:9999",
+                            "https_proxy": "http://127.0.0.1:9999"}),
+                chat=FakeChat())
+            res = a.run("test")
+            # res["calls"] đếm TOOL calls — FakeChat trả FINAL_JSON không kèm
+            # tool call nên bằng 0; mục tiêu test là reset + proxy wiring
+            self.assertEqual(res["calls"], 0)
+            # session cũ bị reset khi bắt đầu run
+            self.assertEqual(he.session_count(), 0)
+            self.assertEqual(he.get_proxies(),
+                             {"http": "http://127.0.0.1:9999",
+                              "https": "http://127.0.0.1:9999"})
+            sess = he.session_for(self._url("/"))
+            self.assertEqual(sess.proxies.get("http"), "http://127.0.0.1:9999")
+            self.assertNotIn("sid", dict(sess.s.cookies))  # jar sạch
+        finally:
+            he.set_proxies(None)  # không để proxy 9999 rò sang test sau
+            he.reset_sessions()
+
+    def test_session_key_isolates_hosts_and_ports(self):
+        import http_engine as he
+        he.reset_sessions()
+        try:
+            s1 = he.session_for("http://example.com/a")
+            s2 = he.session_for("http://example.com/b")
+            s3 = he.session_for("https://example.com/")
+            s4 = he.session_for("http://example.com:8080/")
+            s5 = he.session_for("http://example.com:443/")
+            self.assertIs(s1, s2)     # cùng host+port → CHUNG session (cookie jar)
+            self.assertIsNot(s1, s3)  # https → scheme khác (80 vs 443)
+            self.assertIsNot(s1, s4)  # :8080 tách biệt
+            self.assertIsNot(s3, s5)  # v1.8.1: http/https CÙNG port 443 vẫn tách
+            self.assertEqual(he.session_count(), 4)
+            # v1.8.1: key = scheme://host:port (port mặc định theo scheme)
+            self.assertEqual(he._session_key("http://example.com/a"),
+                             "http://example.com:80")
+            self.assertEqual(he._session_key("https://example.com/"),
+                             "https://example.com:443")
+            self.assertEqual(he._session_key("HTTP://EXAMPLE.com:8443/x"),
+                             "http://example.com:8443")
+        finally:
+            he.reset_sessions()
 
 
 class TestAiNativeGate(unittest.TestCase):
@@ -3716,7 +4427,9 @@ class TestPromptAiNative(unittest.TestCase):
     def test_no_ai_native_rules_by_default(self):
         p = build_system_prompt(cfg())
         self.assertNotIn("CHẾ ĐỘ AI-NATIVE", p)
-        self.assertNotIn("http_request", p)
+        # v1.8.0: http_request/Session Engine là tính năng BASE (không còn
+        # riêng ai_native) → base prompt phải có rule HTTP SESSION 1.8.0.
+        self.assertIn("HTTP SESSION (v1.8.0)", p)
 
 
 class TestLedgerHttpRequestEvidence(unittest.TestCase):
@@ -4585,6 +5298,530 @@ class TestPromptHistoryRules(unittest.TestCase):
     def test_full_mentions_test_history(self):
         self.assertIn("[TEST HISTORY]", SYSTEM_PROMPT_FULL)
         self.assertIn("ĐÃ THỬ", SYSTEM_PROMPT_FULL)
+
+
+# ─────────────────────────────────────────────
+# v1.9.0 — Crawler (GET-only BFS qua Session Engine)
+# ─────────────────────────────────────────────
+
+_CRAWL_HOME = ("<html><head><title>home</title>"
+               "<link rel=\"stylesheet\" href=\"/css/a.css\">"
+               "<script src=\"/js/app.js\"></script>"
+               "<script src=\"http://127.0.0.1:__PORT2__/ext.js\"></script></head>"
+               "<body>"
+               "<a href=\"/page2\">p2</a> "
+               "<a href=\"/page2?x=1&y=2\">p2q</a> "
+               "<a href=\"/page3\">p3</a> "
+               "<a href=\"/abs\">abs</a> "
+               "<a href=\"rel\">rel</a> "
+               "<a href=\"/q?x=1&y=2\">q</a> "
+               "<a href=\"/file.pdf\">pdf</a> "
+               "<a href=\"/404page\">404</a> "
+               "<a href=\"/big\">big</a> "
+               "<a href=\"/redir\">rd</a> "
+               "<a href=\"/redir_out\">rdo</a> "
+               "<a href=\"javascript:alert(1)\">js</a> "
+               "<a href=\"mailto:x@y.z\">mail</a> "
+               "<a href=\"#frag\">fr</a> "
+               "<a href=\"http://127.0.0.1:__PORT2__/away\">out</a> "
+               "<map><area href=\"/area\"></map> "
+               "<iframe src=\"/frame\"></iframe> "
+               "<img src=\"/logo.png\">"
+               "<form action=\"/search\" method=\"get\" id=\"sf\">"
+               "<input type=\"text\" name=\"q\">"
+               "<input type=\"hidden\" name=\"lang\" value=\"en\">"
+               "<select name=\"cat\"><option value=\"1\">a</option>"
+               "<option value=\"2\">b</option></select>"
+               "<textarea name=\"note\">x</textarea>"
+               "<button name=\"go\">Go</button></form>"
+               "<form method=\"POST\"><input name=\"user\">"
+               "<input type=\"password\" name=\"pass\"></form>"
+               "<script>fetch('/api/items');"
+               "fetch('/api/login', {method: 'POST'});"
+               "axios.post('/api/items',{a:1});"
+               "$.ajax({url:'/old'});"
+               "x.open('POST','/xhr-raw');"
+               "x.open('DELETE','/api/user/1');"
+               "fetch('http://evil.org/articles');</script>"
+               "</body></html>")
+
+_CRAWL_P2 = ("<html><body><a href=\"/deep\">deep</a> "
+             "<a href=\"/search?q=abc&lang=en\">s</a> "
+             "<a href=\"/css/min.css\">css</a></body></html>")
+
+_CRAWL_P3 = "<html><body>minimal</body></html>"
+
+_CRAWL_PAGE2B = ("<base href=\"/sub/\">"
+                 "<a href=\"abs\">abs</a> "
+                 "<a href=\"rel\">rel</a> "
+                 "<a href=\"q?x=1&y=2\">q</a> "
+                 "<a href=\"#frag\">fr</a> "
+                 "<script src=\"js/app.js?theme=1\"></script>"
+                 "<link rel=\"stylesheet\" href=\"css/a.css\">"
+                 "<img src=\"/img/p.png\">"
+                 "<area href=\"area\">"
+                 "<iframe src=\"frame\"></iframe>"
+                 "<a href=\"/abs\">rootAbs</a> "
+                 "<img src=\"/logo.png\">")
+
+
+class _CrawlSiteHandler(BaseHTTPRequestHandler):
+    """Site nội bộ: route theo path, bỏ query; 404 cho path lạ."""
+    SERVER2_PORT = 0   # set trong setUpClass
+    protocol_version = "HTTP/1.0"
+
+    def do_GET(self):  # noqa: N802
+        path = urlparse(self.path).path
+        if path == "/page2":
+            self._send(200, "text/html", _CRAWL_P2)
+        elif path == "/page3":
+            self._send(200, "text/html", _CRAWL_P3)
+        elif path == "/redir":
+            self.send_response(302)
+            self.send_header("Location", "/page2")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+        elif path == "/redir_out":
+            self.send_response(302)
+            self.send_header("Location",
+                             f"http://127.0.0.1:{self.SERVER2_PORT}/away")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+        elif path == "/file.pdf":
+            self._send(200, "application/pdf", b"%PDF-1.4 fake")
+        elif path == "/404page":
+            self._send(404, "text/html", "<html>nope</html>")
+        elif path == "/big":
+            self._send(200, "text/html",
+                       b"<html>" + b"x" * 200_000 + b"</html>")
+        elif path == "/css/a.css":
+            self._send(200, "text/css", "body{color:red}")
+        elif path == "/js/app.js":
+            self._send(200, "application/javascript", "console.log(1)")
+        else:
+            self._send(200, "text/html", _CRAWL_HOME.replace(
+                "__PORT2__", str(self.SERVER2_PORT)))
+
+    def _send(self, code, ctype, body):
+        if isinstance(body, str):
+            body = body.encode("utf-8")
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, *a):  # noqa: D102
+        pass
+
+
+class _CrawlSinkHandler(BaseHTTPRequestHandler):
+    """Sink: crawler KHÔNG BAO GIỜ được gọi tới đây (out-of-scope)."""
+    COUNT = 0
+    protocol_version = "HTTP/1.0"
+
+    def do_GET(self):  # noqa: N802
+        type(self).COUNT += 1
+        self.send_response(200)
+        self.send_header("Content-Length", "2")
+        self.end_headers()
+        self.wfile.write(b"ok")
+
+    def log_message(self, *a):  # noqa: D102
+        pass
+
+
+class _CrawlerServerCase(unittest.TestCase):
+    """Hai HTTPServer nội bộ (site + sink) — hermetic, không network ngoài."""
+    @classmethod
+    def setUpClass(cls):
+        cls.site = HTTPServer(("127.0.0.1", 0), _CrawlSiteHandler)
+        cls.sink = HTTPServer(("127.0.0.1", 0), _CrawlSinkHandler)
+        cls.port = cls.site.server_address[1]
+        cls.port2 = cls.sink.server_address[1]
+        cls.root = f"http://127.0.0.1:{cls.port}"
+        cls.root2 = f"http://127.0.0.1:{cls.port2}"
+        _CrawlSiteHandler.SERVER2_PORT = cls.port2
+        threading.Thread(target=cls.site.serve_forever,
+                         daemon=True).start()
+        threading.Thread(target=cls.sink.serve_forever,
+                         daemon=True).start()
+
+    @classmethod
+    def tearDownClass(cls):
+        for srv in (getattr(cls, "sink", None), getattr(cls, "site", None)):
+            if srv:
+                try:
+                    srv.shutdown()
+                    srv.server_close()
+                except OSError:
+                    pass
+
+    def setUp(self):
+        _CrawlSinkHandler.COUNT = 0
+
+
+class TestCrawlerUrlHelpers(unittest.TestCase):
+    """crawler.norm_url / scope_key / canon_url / query_names / is_same_scope."""
+
+    def test_norm_url(self):
+        self.assertEqual(
+            crawler.norm_url("HTTP://ExAmple.COM:8080/A?b=2&a=1#frag"),
+            "http://example.com:8080/A?a=1&b=2")
+        self.assertEqual(crawler.norm_url(""), "")
+        self.assertEqual(crawler.norm_url("ftp://x/y"), "")
+        self.assertEqual(crawler.norm_url("javascript:alert(1)"), "")
+        self.assertEqual(crawler.norm_url("http://x.y/"), "http://x.y/")
+
+    def test_scope_key(self):
+        self.assertEqual(crawler.scope_key("http://example.com/"),
+                         "http://example.com:80")
+        self.assertEqual(crawler.scope_key("https://example.com/x"),
+                         "https://example.com:443")
+        self.assertEqual(crawler.scope_key("http://example.com:8080/a"),
+                         "http://example.com:8080")
+
+    def test_canon_url(self):
+        self.assertEqual(
+            crawler.canon_url("http://example.com/p?id=1&x=2"),
+            "http://example.com/p?id={value}&x={value}")
+        self.assertEqual(crawler.canon_url("http://example.com/p"),
+                         "http://example.com/p")
+
+    def test_query_names(self):
+        self.assertEqual(crawler.query_names("http://x/a?a=1&b=2&a=3&c="),
+                         ["a", "b", "c"])
+        self.assertEqual(crawler.query_names("http://x/?=1&=2"), [""])
+        self.assertEqual(crawler.query_names("http://x/"), [])
+
+    def test_is_same_scope(self):
+        s = "http://example.com:80"
+        self.assertTrue(crawler.is_same_scope("http://example.com/x", s))
+        self.assertTrue(crawler.is_same_scope("http://EXAMPLE.com:80/y", s))
+        self.assertFalse(crawler.is_same_scope("https://example.com/x", s))
+        self.assertFalse(crawler.is_same_scope("http://example.com:81/x", s))
+        self.assertFalse(crawler.is_same_scope("http://evil.com/x", s))
+
+
+class TestCrawlerParseHtml(_CrawlerServerCase):
+    """parse_html: base href, link/area/iframe/link/form/script/js-hint."""
+
+    def _html(self):
+        return _CRAWL_HOME.replace("__PORT2__", str(self.port2))
+
+    def test_base_href_resolution(self):
+        a = crawler.parse_html(_CRAWL_PAGE2B, "http://example.com/base/page")
+        sub = "http://example.com/sub"
+        # href tương đối (rel, q, css, js, area, frame) resolve theo <base
+        # href="/sub/">; href tuyệt đối (/abs) resolve theo ORIGIN — không
+        # tiền tố base (chuẩn URL). img KHÔNG phải link.
+        self.assertEqual(a.links, {
+            sub + "/abs", sub + "/rel", sub + "/q?x=1&y=2",
+            sub + "/area", sub + "/frame", sub + "/css/a.css",
+            "http://example.com/abs"})
+        self.assertEqual(a.scripts, {sub + "/js/app.js?theme=1"})
+        self.assertEqual(a.external_links, set())
+        self.assertNotIn("http://example.com/sub/img/p.png", a.links)
+        self.assertNotIn("http://example.com/sub/logo.png", a.links)
+
+    def test_forms(self):
+        a = crawler.parse_html(self._html(), self.root)
+        forms = {(f.method, f.action): set(f.params) for f in a.forms}
+        self.assertEqual(forms.get(("GET", self.root + "/search")),
+                         {"q", "lang", "cat", "note", "go"})
+        fields = {f.action: {fd["name"]: fd["type"]
+                             for fd in f.fields} for f in a.forms}
+        self.assertEqual(fields[self.root + "/search"], {
+            "q": "text", "lang": "hidden", "cat": "select",
+            "note": "textarea", "go": "button"})
+        for f in a.forms:
+            for fd in f.fields:
+                self.assertNotIn("options", fd)
+        self.assertEqual(forms.get(("POST", self.root + "/")),
+                         {"user", "pass"})
+
+    def test_scripts_external_split(self):
+        a = crawler.parse_html(self._html(), self.root)
+        self.assertEqual(a.scripts, {self.root + "/js/app.js"})
+        self.assertEqual(a.external_scripts,
+                         {self.root2 + "/ext.js"})
+
+    def test_js_hints(self):
+        a = crawler.parse_html(self._html(), self.root)
+        # v1.9.1: tuple 4 phần tử (kind, url, method, in_scope) — method là
+        # ước lượng THẬT (axios verb / xhr.open verb / fetch GET), None nếu
+        # không chắc (fetch có options, $.ajax) → inventory lưu UNKNOWN
+        got = {(h.kind, h.url, h.method, h.in_scope) for h in a.hints}
+        self.assertIn(("fetch", self.root + "/api/items", "GET", True), got)
+        self.assertIn(("fetch", self.root + "/api/login", None, True), got)
+        self.assertIn(("axios", self.root + "/api/items", "POST", True), got)
+        self.assertIn(("jquery.ajax", self.root + "/old", None, True), got)
+        self.assertIn(("xhr", self.root + "/xhr-raw", "POST", True), got)
+        self.assertIn(("xhr", self.root + "/api/user/1", "DELETE", True), got)
+        # hint ngoài scope giữ nguyên URL, in_scope=False (bị lọc ở ingest —
+        # xem test_js_hint_scope_filter), không phải bỏ qua ở parse
+        self.assertIn(("fetch", "http://evil.org/articles", "GET", False), got)
+
+
+class TestCrawlerCrawl(_CrawlerServerCase):
+    """BFS GET-only thật: links/forms/params/scripts/hints/redirect/external."""
+
+    def test_main_bfs(self):
+        res = crawler.crawl(self.root + "/", max_depth=1)
+        self.assertEqual(res.stopped, "done")
+        self.assertEqual(res.errors, [])
+        self.assertEqual(_CrawlSinkHandler.COUNT, 0)   # không gọi sink
+        paths = {p.url.replace(self.root, "") for p in res.pages}
+        # lưu ý: trang /q được nối theo dạng query-variant /q?x=1&y=2
+        # (không có bản bare /q trong page set) — kỳ vọng theo URL thực tế
+        self.assertTrue({"/", "/page2", "/page3", "/abs", "/rel", "/q?x=1&y=2",
+                         "/area", "/frame"} <= paths)
+        # ngoài 8 trang base còn 3 trang query/redirect: /page2?x=1&y=2,
+        # /redir_out (302 ra ngoài scope), /404page — /big không parse ảnh
+        # hưởng gì (record đủ); /redir hop trong _fetch_page không thành page.
+        self.assertEqual(len(paths), 12)
+        for p in res.pages:
+            self.assertLessEqual(p.depth, 1)
+            self.assertEqual(p.depth, 0 if p.url == self.root + "/" else 1)
+        for banned in ("/deep", "/search", "/login", "/file.pdf",
+                       "/css/a.css", "/js/app.js"):
+            self.assertNotIn(banned, paths)
+        self.assertEqual(
+            {l.split("?", 1)[0] for l in res.scripts | res.external_scripts},
+            {self.root + "/js/app.js", self.root2 + "/ext.js"})
+        self.assertIn(self.root + "/q?x=1&y=2", res.links)
+        self.assertIn(self.root + "/file.pdf", res.links)
+        self.assertIn(self.root + "/css/a.css", res.links)
+        # /big VẪN nằm trong res.links (có <a href="/big"> ở home) — chỉ
+        # không bị lỗi khi fetch (200, trả 200KB → body cap test riêng)
+        self.assertIn(self.root + "/big", res.links)
+        self.assertEqual(res.scripts, {self.root + "/js/app.js"})
+        self.assertEqual(res.external_scripts,
+                         {self.root2 + "/ext.js"})
+        self.assertEqual(res.external_links, {self.root2 + "/away"})
+        forms = {(f.method, f.action): set(f.params) for f in res.forms}
+        self.assertEqual(forms.get(("GET", self.root + "/search")),
+                         {"q", "lang", "cat", "note", "go"})
+        # form POST không action → action = trang phát hiện = root
+        self.assertEqual(forms.get(("POST", self.root + "/")),
+                         {"user", "pass"})
+        self.assertEqual({h.kind for h in res.hints},
+                         {"fetch", "axios", "jquery.ajax", "xhr"})
+        # hint ngoài scope (evil.org) được GIỮ với in_scope=False; source có
+        # thể lặp (vài route trả lại HTML home) → assert theo URL dedup
+        out = {h.url for h in res.hints if not h.in_scope}
+        self.assertEqual(out, {"http://evil.org/articles"})
+        for h in res.hints:
+            if h.in_scope:
+                self.assertTrue(crawler.is_same_scope(h.url, self.root))
+        self.assertEqual(res.redirect_out, [(302, self.root2 + "/away")])
+        rd = [p for p in res.pages if p.url == self.root + "/redir_out"]
+        self.assertEqual(len(rd), 1)
+        self.assertEqual(rd[0].status, 302)
+        pg404 = [p for p in res.pages if p.url == self.root + "/404page"]
+        self.assertEqual(len(pg404), 1)
+        self.assertEqual(pg404[0].status, 404)
+        bg = [p for p in res.pages if p.url == self.root + "/big"]
+        self.assertEqual(len(bg), 1)
+        self.assertEqual(bg[0].status, 200)
+        self.assertNotIn(self.root + "/redir", paths)   # hop trong _fetch_page
+        p2 = [p for p in res.pages if p.url == self.root + "/page2"]
+        self.assertEqual(len(p2), 1)
+        self.assertEqual(p2[0].status, 200)
+        # query sắp theo thứ tự key đã chuẩn hoá (lang < q) trong res.links
+        self.assertIn(self.root + "/search?lang=en&q=abc", res.links)
+        st = res.to_data()["stats"]
+        self.assertEqual(st["pages_fetched"], len(res.pages))
+
+    def test_max_depth_zero(self):
+        res = crawler.crawl(self.root + "/", max_depth=0)
+        self.assertEqual([p.url for p in res.pages], [self.root + "/"])
+        self.assertEqual([p.depth for p in res.pages], [0])
+        self.assertEqual(res.stopped, "done")
+        self.assertTrue(res.forms)
+        self.assertTrue(res.params)
+
+    def test_non_html_page_recorded(self):
+        res = crawler.crawl(self.root + "/file.pdf", max_depth=0)
+        self.assertEqual(len(res.pages), 1)
+        self.assertEqual(res.pages[0].status, 200)
+        self.assertEqual(res.pages[0].content_type, "application/pdf")
+
+    def test_max_pages(self):
+        res = crawler.crawl(self.root + "/", max_depth=3, max_pages=4)
+        self.assertEqual(len(res.pages), 4)
+        self.assertEqual(res.stopped, "max_pages")
+
+    def test_time_budget(self):
+        res = crawler.crawl(self.root + "/", max_depth=3, delay=0.1,
+                            time_budget=0.03)
+        self.assertEqual(res.stopped, "time_budget")
+        self.assertGreaterEqual(len(res.pages), 1)
+        self.assertLess(len(res.pages), 9)
+
+    def test_invalid_start_urls(self):
+        for bad in ("", "javascript:alert(1)", "ftp://x/", "not a url"):
+            with self.assertRaises(ValueError):
+                crawler.crawl(bad)
+
+    def test_body_cap(self):
+        res = crawler.crawl(self.root + "/big", max_depth=0,
+                            max_body_bytes=4096)
+        self.assertEqual(len(res.pages), 1)
+        self.assertEqual(res.pages[0].status, 200)
+        self.assertNotIn("parse fail", " | ".join(res.errors))
+
+
+class TestCrawlerDispatch(_CrawlerServerCase):
+    """Tích hợp agent._dispatch('crawler') — outcome ok/scope_rejected + data."""
+
+    def _agent(self):
+        return WebXAgent(config=cfg({"targets": ["localhost", "http://127.0.0.1"],
+                                     "auto_exec": "all", "tool_timeout": 30}),
+                         chat=FakeChat())
+
+    def test_dispatch_ok(self):
+        a = self._agent()
+        res = a._dispatch("crawler", {"url": self.root + "/",
+                                       "max_depth": 1})
+        self.assertEqual(res["outcome"], "ok")
+        self.assertIn("CRAWL XONG", res["output"])
+        self.assertEqual(res["data"]["stats"]["stopped"], "done")
+        self.assertGreaterEqual(res["data"]["stats"]["pages_fetched"], 1)
+        self.assertIn("forms", res["data"])
+        self.assertIn("js_hints", res["data"])
+
+    def test_dispatch_max_depth_zero(self):
+        a = self._agent()
+        res = a._dispatch("crawler", {"url": self.root + "/",
+                                       "max_depth": 0})
+        self.assertEqual(res["outcome"], "ok")
+        self.assertEqual([p["depth"] for p in res["data"]["pages"]], [0])
+
+    def test_dispatch_out_of_scope(self):
+        a = self._agent()
+        res = a._dispatch("crawler", {"url": "https://evil.org/"})
+        self.assertEqual(res["outcome"], "scope_rejected")
+
+    def test_registry(self):
+        from tools import TOOL_INDEX, TOOL_TIMEOUTS  # noqa: PLC0415
+        spec = TOOL_INDEX["crawler"]
+        self.assertEqual(TOOL_TIMEOUTS["crawler"], 120)
+        self.assertEqual(spec.risk, "safe")
+        self.assertIn("url", spec.parameters["properties"])
+
+
+class TestCrawlerInventoryIngest(_CrawlerServerCase):
+    """ingest data crawler → host/endpoint/params/source (crawler:js)."""
+
+    def test_pipeline_ingest(self):
+        res = crawler.crawl(self.root + "/", max_depth=1)
+        inv = Inventory()
+        n = inv.ingest([{"name": "crawler", "outcome": "ok",
+                         "args": {"url": self.root + "/"},
+                         "data": res.to_data()}])
+        self.assertGreaterEqual(n, 5)
+        self.assertIsNotNone(inv.host(self.root + "/"))
+        eps = {e.url for e in inv.hosts["127.0.0.1"].endpoints.values()}
+        self.assertIn(self.root + "/page2", eps)
+        self.assertIn(self.root + "/search", eps)
+        self.assertIn(self.root + "/js/app.js", eps)
+        # form POST không action → action = trang phát hiện = root (trailing
+        # slash bị _norm_url strip trong ingest) — KHÔNG có endpoint /login
+        # (route login không tồn tại trong fixture site)
+        self.assertIn(self.root, eps)
+        self.assertNotIn(self.root + "/login", eps)
+        self.assertIn(self.root + "/api/items", eps)
+        self.assertNotIn(self.root2 + "/away", eps)
+        self.assertNotIn(self.root2 + "/ext.js", eps)
+        # mọi endpoint ingest đều thuộc port site — KHÔNG có endpoint port2
+        # (assert bổ trợ: any(port!=self.port) phải là False)
+        self.assertFalse(any(abs(urlparse(e).port) != self.port
+                             for e in eps))
+        p2 = [e for e in inv.hosts["127.0.0.1"].endpoints.values()
+              if e.url == self.root + "/page2?x={value}&y={value}"]
+        self.assertEqual(len(p2), 1)
+        self.assertIn("GET", p2[0].methods)
+        self.assertTrue({"x", "y"} <= p2[0].params)
+        s = [e for e in inv.hosts["127.0.0.1"].endpoints.values()
+             if e.url == self.root + "/search"]
+        self.assertEqual(len(s), 1)
+        self.assertTrue({"q", "lang", "cat", "note", "go"} <= s[0].params)
+        # form POST phát hiện ở root: endpoint root có method POST + params
+        # user/pass (ghép với phương thức GET từ pages)
+        root_ep = inv.hosts["127.0.0.1"].endpoints[self.root]
+        self.assertIn("POST", root_ep.methods)
+        self.assertTrue({"user", "pass"} <= root_ep.params)
+        api = [e for e in inv.hosts["127.0.0.1"].endpoints.values()
+               if e.url == self.root + "/api/items"]
+        self.assertEqual(len(api), 1)
+        self.assertIn("crawler:js", api[0].sources)
+        # v1.9.1: method THẬT từ hint — fetch('/api/items') + axios.post cùng
+        # endpoint → methods {GET, POST} (không còn mặc định GET cho axios.post)
+        self.assertTrue({"GET", "POST"} <= api[0].methods)
+        # fetch('/api/login', {method:'POST'}) có options → parser chưa hiểu
+        # method → UNKNOWN: endpoint VẪN tồn tại nhưng KHÔNG có method bịa
+        # (bug 1.9.0 gán GET sai — review: "UNKNOWN tốt hơn gán sai GET")
+        login = [e for e in inv.hosts["127.0.0.1"].endpoints.values()
+                 if e.url == self.root + "/api/login"]
+        self.assertEqual(len(login), 1)
+        self.assertEqual(login[0].methods, set())
+        u1 = [e for e in inv.hosts["127.0.0.1"].endpoints.values()
+              if e.url == self.root + "/api/user/1"]
+        self.assertEqual(len(u1), 1)
+        self.assertEqual(u1[0].methods, {"DELETE"})
+
+    def test_js_hint_scope_filter(self):
+        inv = Inventory()
+        data = {"url": "http://127.0.0.1:9/", "pages": [], "links": [],
+                "forms": [], "params": [], "scripts": [],
+                "external_scripts": [], "external_links": [],
+                "js_hints": [
+                    {"kind": "fetch", "url": "http://127.0.0.1:9/api/x",
+                     "in_scope": True, "source": "http://127.0.0.1:9/"},
+                    {"kind": "axios", "url": "http://127.0.0.1:9/api/y",
+                     "method": "POST", "in_scope": True,
+                     "source": "http://127.0.0.1:9/"},
+                    {"kind": "fetch", "url": "http://127.0.0.1:9/api/z",
+                     "method": "UNKNOWN", "in_scope": True,
+                     "source": "http://127.0.0.1:9/"},
+                    {"kind": "fetch", "url": "http://evil.org/hook",
+                     "in_scope": False, "source": "http://127.0.0.1:9/"}]}
+        inv.ingest([{"name": "crawler", "outcome": "ok",
+                     "args": {"url": "http://127.0.0.1:9/"},
+                     "data": data}])
+        host = inv.hosts["127.0.0.1"]
+        eps = {e.url for e in host.endpoints.values()}
+        self.assertEqual(eps, {"http://127.0.0.1:9/api/x",
+                               "http://127.0.0.1:9/api/y",
+                               "http://127.0.0.1:9/api/z"})
+        # hint không có method → methods rỗng (ưu tiên UNKNOWN, không bịa GET)
+        self.assertEqual(host.endpoints["http://127.0.0.1:9/api/x"].methods,
+                         set())
+        # method THẬT từ hint → ghi đúng {POST}
+        self.assertEqual(host.endpoints["http://127.0.0.1:9/api/y"].methods,
+                         {"POST"})
+        # UNKNOWN → KHÔNG gán method nào (bug 1.9.0: gán GET sai)
+        self.assertEqual(host.endpoints["http://127.0.0.1:9/api/z"].methods,
+                         set())
+
+    def test_error_outcome_no_ingest(self):
+        inv = Inventory()
+        data = {"url": "http://127.0.0.1:9/", "pages": [
+            {"url": "http://127.0.0.1:9/a", "status": 200, "depth": 0}]}
+        n = inv.ingest([{"name": "crawler", "outcome": "error",
+                         "args": {"url": "http://127.0.0.1:9/"},
+                         "data": data}])
+        self.assertEqual(n, 0)
+        self.assertIsNone(inv.host("http://127.0.0.1:9/"))
+
+    def test_missing_data_no_ingest(self):
+        inv = Inventory()
+        n = inv.ingest([{"name": "crawler", "outcome": "ok",
+                         "args": {"url": "http://127.0.0.1:9/"},
+                         "output": "[✓] CRAWL XONG http://127.0.0.1:9/"}])
+        self.assertEqual(n, 0)
+        self.assertIsNone(inv.host("http://127.0.0.1:9/"))
 
 
 if __name__ == "__main__":
