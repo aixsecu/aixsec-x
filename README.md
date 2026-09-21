@@ -134,9 +134,9 @@ python3 agent.py        # interactive — prompts item by item, press ENTER to s
 ```
 [*] No web target declared (WEBX_TARGETS).
     Enter authorized targets, comma-separated
-    (e.g. https://abc.vn,10.0.0.0/8) — press ENTER to skip if
+    (e.g. https://example.com,10.0.0.0/8) — press ENTER to skip if
     this session is SOURCE-CODE ANALYSIS only:
-aixsec-target> https://abc.vn
+aixsec-target> https://example.com
 [*] No source directory declared (WEBX_SRC_DIRS).
     Enter code directories allowed for SAST scanning, comma-separated
     (e.g. /var/www/html) — press ENTER to skip if sast_scan is unused:
@@ -168,6 +168,7 @@ python3 agent.py --non-interactive                # run automatically
 | `WEBX_MODEL` | `qwen2.5:7b` | Ollama model (suggestion: `huihui_ai/qwen3.5-abliterated:9b`) |
 | `WEBX_THINK` | `0` | `1`=enable thinking mode (not recommended together with function calling) |
 | `WEBX_AUTO_EXEC` | `ask` | `ask`=prompt operator before noisy/active tools; `safe`=auto-run only safe tools; `all`=auto-run everything (risky) |
+| `WEBX_AI_NATIVE` | `0` | **v1.5.6** `1`=AI-NATIVE mode: the model analyzes vulnerabilities itself via `http_request` (no mandatory wapiti/sqlmap; final JSON requires ≥1 real `http_request` response) |
 | `WEBX_MAX_ROUNDS` | `8` | Max tool-call rounds per turn (lower = faster/cheaper; a 9B model on a 4 vCPU box can take 20–30 min per round) |
 | `WEBX_TOOL_TIMEOUT` | `90` | Per-tool timeout (seconds) |
 | `WEBX_LLM_TIMEOUT` | `300` | Max time waiting for a model reply per round (seconds); a 9B model on CPU can take 1–3 minutes |
@@ -432,6 +433,20 @@ better than long prompts. `prompts.py` ships 2 variants with auto-selection:
   `break_long_words=True`, splitting `**ffuf_dir**` across a wrap boundary as
   `**ff` / `uf_dir**`. Now `break_long_words=False, break_on_hyphens=False` —
   long words jump to the next line whole.
+- **v1.5.7 — DB engine consistency:** fixed the chain where wapiti reported a
+  MySQL SQLi but downstream steps still tried `mssql`. The engine is now
+  resolved at the entry point: `engine='auto'` → guessed from response headers
+  via `_sweep_engine` (host-cached, defaults to mysql); invalid values → mysql.
+  Every downstream hint (WAF `--dbms=`, extraction-failed `sqlmap_runner
+  {"dbms": ...}`, sqlmap_cmd) uses the RESOLVED engine — no coercion of unknown
+  → mssql, and `auto` never becomes `--dbms=auto`. Wapiti AUTO-EXPLOIT hints
+  `engine` from the finding's info line ('DBMS: MySQL' → mysql, 'Microsoft SQL
+  Server' → mssql, unknown → auto). `sqli_manual_test` next-step echoes
+  `dbms:'<engine>'`; `sqli_blind_poc.TimeBlindExploiter` omits `--dbms` when
+  the engine is unknown. System prompt (ENGINE-CONSISTENCY EN / ĐỒNG BỘ ENGINE
+  VI rules) and ToolSpec enum `["mysql", "mssql", "auto"]` updated. Test suite
+  v1.5.7: **225 OK** (+14 new: `TestManualTestNextStep` 3,
+  `TestSqliBlindEngineConsistency` 8, `TestWapitiScan` 2, `TestPromptRules` 1).
 - **v1.5.6 — Banner cleanup: removed the Anonymous mask ASCII block** (the
   `.888.` figure that visually read as "AAO" text) per user request. The
   banner now opens directly with the green AIXSEC-X logo. Test suite v1.5.6:
@@ -451,9 +466,16 @@ better than long prompts. `prompts.py` ships 2 variants with auto-selection:
   system prompt gains the AI-NATIVE rules block. Test suite v1.5.6: **211 OK**
   (+18 new: `TestHttpRequestTool` 8, `TestAiNativeGate` 6,
   `TestPromptAiNative` 2, `TestLedgerHttpRequestEvidence` 2).
+- **v1.5.6 — Domain scrub: replaced all real Vietnamese test domains with
+  RFC-reserved `example.*`** across code, tests, and docs: `example.com`
+  (incl. test hosts `h{n}.example.com`, `hoisach.example.com`),
+  `example.org` (a distinct finding host). Tests that relied on the real
+  wildcard DNS of a deleted live-test domain now use a fake
+  `socket.getaddrinfo` resolution; the path-claim test uses `example.org`
+  as the finding host. Test suite v1.5.6: **211 OK**.
 - **v1.5.5 — wapiti_scan auto form sweep: type ONLY the root domain, the tool
-  finds POST-form SQLi itself (the tbu.edu.vn lesson):** wapiti crawled
-  `https://tbu.edu.vn/WebTinTuc/TimKiem?page=1..52` and the `sql` module burned
+  finds POST-form SQLi itself (the example.com lesson):** wapiti crawled
+  `https://example.com/WebTinTuc/TimKiem?page=1..52` and the `sql` module burned
   its whole `--max-attack-time` on the 52 `?page=N` URLs before ever reaching
   the real vulnerable POST form (`keyword`) — so the tool reported a false
   `page` SQLi and MISSED the real one. v1.5.5 fixes both ends:
@@ -628,7 +650,7 @@ better than long prompts. `prompts.py` ships 2 variants with auto-selection:
   này KHÔNG có conversion oracle lẫn time-based channel → sqlmap là hy vọng
   khai thác duy nhất. Test suite v1.4.7: **149 OK**.
 - **v1.4.6 MSSQL error-oracle shape fix (quote-then-paren):** ground-truth
-  tbu.edu.vn showed the search context wraps the LIKE in parens, so the
+  example.com showed the search context wraps the LIKE in parens, so the
   plain v1.4.5 payload `' AND CONVERT(int,(expr))-- -` only produced a
   syntax error (oracle silent). v1.4.6 probes 3 shapes with the quote in the
   prefix — `'{inner}-- -`, `'){inner}-- -`, `')){inner}-- -` where
@@ -661,7 +683,7 @@ better than long prompts. `prompts.py` ships 2 variants with auto-selection:
   leaks via benign error-based payloads passed through sqlmap's tamper
   pipeline.
 - **v1.4.5 `sqli_blind_extract` POST form (method/param/data):** the live
-  tbu.edu.vn case was a search FORM — call
+  example.com case was a search FORM — call
   `sqli_blind_extract{url, action, engine:'mssql', method:'post', param:'keyword',
   data:'keyword=tin tuc'}`: the tool locates the form from `data`, injects the
   probe into that param, detects via quote/comment style (mode=form) and reports
@@ -685,8 +707,8 @@ better than long prompts. `prompts.py` ships 2 variants with auto-selection:
   SAME host (`_PATH_TOKENS` regex, URL scheme stripped first, min length 3).
   A path seen only on another host (or nowhere) → `⚠ path không có bằng chứng
   trên host này`. Fixes the live-run hallucination: AI reported
-  `https://tbu.edu.vn/admincp` although no tool ever saw `/admincp` on
-  tbu.edu.vn. Probe-set extended with `find_forms`/`sqli_manual_test`/
+  `https://example.com/admincp` although no tool ever saw `/admincp` on
+  example.com. Probe-set extended with `find_forms`/`sqli_manual_test`/
   `sqli_blind_extract` so real recon outputs count as probe evidence.
 - **v1.4.4 `find_forms` (forms are the #1 missed SQLi spot):** nikto/nuclei/
   http_probe never see `<form>` tags, so a search box (classic case: POST
@@ -699,7 +721,7 @@ better than long prompts. `prompts.py` ships 2 variants with auto-selection:
   sending `AND SLEEP(3)`, the tool first sends `test` vs `test'` vs `test''`:
   if the single quote breaks the query (500 / size shift) while the doubled
   quote matches baseline, the injection point is CONFIRMED without any engine
-  or SLEEP (works on the real tbu.edu.vn MSSQL search form where `--` is
+  or SLEEP (works on the real example.com MSSQL search form where `--` is
   unusable). Only if the quote-differential is negative does it fall back to
   time-based, now engine-aware: `engine=mysql` → `SLEEP(n)`, `engine=mssql` →
   `WAITFOR DELAY '0:0:n'`, `engine=auto` (default) guesses from headers

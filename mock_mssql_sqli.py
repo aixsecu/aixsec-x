@@ -3,12 +3,12 @@
 aixsec-x — mock_mssql_sqli.py
 Mock MSSQL SQLi server (offline test fixture cho v1.4.7).
 
-Tái dựng hành vi quan sát được của target ASP.NET/MSSQL thật (tbu.edu.vn
+Tái dựng hành vi quan sát được của target ASP.NET/MSSQL thật (example.com
 WebTinTuc/TimKiem): form tìm kiếm CONTAINS/LIKE, câu query gốc nằm trong
 stored procedure SP_WEB_GetTinTucForWeb (Entity Framework), lỗi SqlException
 dạng multi-error (3 fragment nối bởi \\n), trang lỗi vàng ASP.NET.
 
-HÀNH VI v1.4.7 — KHỚP probe LIVE tbu.edu.vn 2026-09-20 (6 requests):
+HÀNH VI v1.4.7 — KHỚP probe LIVE example.com 2026-09-20 (6 requests):
   MẶC ĐỊNH (không --waf) — quote-parity oracle, KHÔNG còn conversion/
   WAITFOR/time-based (live: chúng đều vỡ cú pháp trên template thật):
     số quote CHẴN (0, 2, 4...): 200 trang FIXED byte-identical — payload bị
@@ -49,7 +49,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, unquote, urlparse
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Ground truth (verbatim từ /tmp/tbu_500.html — Exception Details, thay <br>=\\n)
+# Ground truth (verbatim từ /tmp/example_500.html — Exception Details, thay <br>=\\n)
 # ─────────────────────────────────────────────────────────────────────────────
 # run giữa "OR" và "CONTAINS" trong HTML = 14 tab + 1 space (đã đếm byte).
 _GT_TABS = "\t" * 14
@@ -58,7 +58,7 @@ GT_MSG = (
     f"{_GT_TABS} CONTAINS(tt.MoTa, ''.\n"
     "Unclosed quotation mark after the character string ''))'."
 )
-# kw='AND' → dạng lỗi 1-error khác (tbu_err.html)
+# kw='AND' → dạng lỗi 1-error khác (example_err.html)
 SILENT_MSG = "Incorrect syntax near the keyword 'AND'."
 # lỗi syntax shape sai (đóng ngoặc sai / ngoặc trước quote) — oracle silent
 BROKEN_MSG = "Incorrect syntax near ')'."
@@ -67,7 +67,7 @@ VERSION_STR = (
     "Microsoft SQL Server 2019 (RTM) 15.0.2000.5 (X64) - Enterprise Edition "
     "(64-bit) on Windows Server 2019 (X64) 10.0 <17763>"
 )
-DB_NAME = "tbu_web"
+DB_NAME = "example_web"
 DB_USER = "sa"
 
 # Dữ liệu mẫu (fictional) — bảng TinTuc (alias tt trong query thật).
@@ -126,7 +126,7 @@ SQL_ESCAPE = re.compile(r"(?i)^SELECT\s+")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# v1.4.7 — quote-parity oracle (hành vi MẶC ĐỊNH, khớp probe live tbu 2026-09-20)
+# v1.4.7 — quote-parity oracle (hành vi MẶC ĐỊNH, khớp probe live example.com 2026-09-20)
 # ─────────────────────────────────────────────────────────────────────────────
 def _near_token(kw: str) -> str:
     """Token cho lỗi 'Incorrect syntax near <tok>': đoạn sau quote đầu tiên cho
@@ -145,7 +145,7 @@ def _near_token(kw: str) -> str:
 
 
 def parse_err_msg(kw: str) -> str:
-    """3-fragment parse-error leak cho quote LẺ (shape hệt ground-truth tbu)."""
+    """3-fragment parse-error leak cho quote LẺ (shape hệt ground-truth example.com)."""
     tok = _near_token(kw)
     return (
         f"Incorrect syntax near '{tok}\n"
@@ -424,7 +424,7 @@ def extract_if_cond(kw: str) -> str | None:
 # Trang HTML (ASP.NET yellow screen + search page)
 # ─────────────────────────────────────────────────────────────────────────────
 def aspnet_500(sql_message: str) -> str:
-    # GIỮ message THÔ (không html.escape) — khớp ground-truth tbu_500.html:
+    # GIỮ message THÔ (không html.escape) — khớp ground-truth example_500.html:
     # ASP.NET yellow screen render Exception Details với quote/<> trần.
     # (html.escape cũ biến ' thành &#x27; → VALUE_RX của client không đọc được
     # giá trị leak từ lỗi conversion — oracle detect/SUBSTRING fail.)
