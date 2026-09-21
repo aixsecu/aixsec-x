@@ -34,7 +34,10 @@ from tools import (TOOL_REGISTRY, TOOL_INDEX, TOOL_BINS, TOOL_TIMEOUTS,
                    LONG_RUN_TOOLS, available_tools, _WAPITI_FIX, capability_report)
 
 # ── terminal colors (AIXSEC-X style) ──
-VERSION = "1.7.0"
+# v1.8.0: HTTP Session Engine (http_engine.py) — http_request là adapter trên
+# engine (cookie jar theo host, auth, redirect history, timing, evidence, replay,
+# proxy WEBX_HTTP_PROXY/WEBX_HTTPS_PROXY).
+VERSION = "1.9.1"
 
 # v1.7.0 (#12 attack memory): phân loại vuln_class cho TestHistory theo tool
 # (sqli→sqli, scanner→scan, recon→recon, poc→poc; tool không khớp → "").
@@ -45,7 +48,7 @@ for _t in ("wapiti_scan", "nikto_scan", "nuclei_scan", "sast_scan"):
     _TOOL_VULN[_t] = "scan"
 for _t in ("http_probe", "http_request", "headers_recon", "detect_cms",
            "waf_detect", "ffuf_dir", "param_discovery", "subdomain_enum",
-           "dns_lookup"):
+           "dns_lookup", "crawler"):
     _TOOL_VULN[_t] = "recon"
 for _t in ("generate_poc", "poc_executor"):
     _TOOL_VULN[_t] = "poc"
@@ -342,6 +345,14 @@ class WebXAgent:
     # MAIN LOOP
     # ─────────────────────────────────────────
     def run(self, user_text: str) -> dict:
+        # v1.8.0: mỗi run() bắt đầu với Session Engine SẠCH (cookie jar + request
+        # records của lượt trước KHÔNG rò sang lượt này) + áp proxy từ config
+        # (WEBX_HTTP_PROXY/WEBX_HTTPS_PROXY) — http_request dùng CHUNG engine này.
+        import http_engine as _he
+        _he.reset_sessions()
+        _px = {k: v for k, v in (("http", self.config.get("http_proxy")),
+                                 ("https", self.config.get("https_proxy"))) if v}
+        _he.set_proxies(_px or None)
         msgs = [
             {"role": "system", "content": self.system_prompt +
              f"\n\nSCOPE ĐƯỢC ỦY QUYỀN: {self.policy.describe()}"},

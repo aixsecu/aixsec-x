@@ -98,6 +98,7 @@ TOOL_TIMEOUTS: dict[str, int] = {
     "nikto_scan": 180,       # nikto vốn chậm — cap đủ cho scan trung bình
     "sqlmap_runner": 300,   # v1.4.7: sqlmap bounded — đủ cho 1 lần chạy technique set
     "wapiti_scan": 600,      # v1.5.0: scan cả website (crawler+attack) — operator tăng WEBX_TOOL_TIMEOUT nếu cần
+    "crawler": 120,          # v1.9.1: BFS crawl GET-only (hint có method thật; UNKNOWN không ép GET; time_budget tự dừng)
 }
 
 # v1.5.1: tool QUÉT DÀI — _dispatch dùng SÀN max(tool_timeout, cap) thay vì trần
@@ -188,19 +189,25 @@ def _url_host(url: str) -> str:
 def _http_probe(**kw):
     url, timeout = kw["url"], kw["_timeout"]
     try:
+        import http_engine as he
         import requests
-        r = requests.get(url, timeout=min(timeout, 20), allow_redirects=True,
-                         headers={"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) Firefox/120.0"})
+        # v1.8.1: dùng Session Engine (cookie jar + UA mặc định khớp cũ) — bỏ
+        # requests.get riêng; output/data giữ nguyên format v1.5.6/v1.7.0,
+        # header giá trị nhạy cảm che <redacted> (giữ name để inventory dò được).
+        resp, _rec = he.session_for(url).request(
+            "get", url, timeout=min(timeout, 20))
         keys = ["Server", "X-Powered-By", "Content-Security-Policy", "X-Frame-Options",
                 "X-XSS-Protection", "Strict-Transport-Security", "Set-Cookie", "Location",
                 "WWW-Authenticate", "Content-Type"]
-        h = {k: v for k, v in r.headers.items() if k in keys or k.lower() in [x.lower() for x in keys]}
-        body = re.sub(r"\s+", " ", (r.text or "")[:600])
+        h = he.redact_headers({k: v for k, v in resp.headers.items()
+                               if k in keys or k.lower() in [x.lower() for x in keys]})
+        body = re.sub(r"\s+", " ", (resp.text or "")[:600])
         # v1.7.0 (structured ToolResult): (output_text, data_dict) — inventory
         # đọc data trực tiếp (headers THẬT, không cần regex trên text).
-        data = {"url": url, "method": "GET", "status": r.status_code,
-                "headers": {k: v for k, v in r.headers.items()}}
-        return ((f"GET {url} → {r.status_code} ({len(r.content)} bytes)\n"
+        data = {"url": url, "method": "GET", "status": resp.status_code,
+                "headers": he.redact_headers(
+                    {k: v for k, v in resp.headers.items()})}
+        return ((f"GET {url} → {resp.status_code} ({len(resp.content)} bytes)\n"
                  f"headers: {h}\nbody_snippet: {body}"), data)
     except ImportError:
         return run_cmd(["curl", "-sS", "-i", "--max-time", "20", url], timeout), None
@@ -211,56 +218,88 @@ def _http_probe(**kw):
 
 
 def _http_request(**kw):
-    """v1.5.6: AI-native primitive — gửi request HTTP tùy ý (method/headers/body)
-    và trả response THẬT (status, headers, body snippet, thời gian) để model TỰ
-    phân tích lỗ hổng (quote-differential, error-based, timing, XSS reflection,
-    SSTI, path traversal...) KHÔNG cần tool chuyên dụng hay binary ngoài.
-    Bounded: timeout ≤30s, body snippet ≤2000 ký tự, headers đầy đủ."""
+    """v1.8.0: ADAPTER trên HTTP Session Engine (http_engine.py) — giữ NGUYÊN
+    interface + output format v1.5.6. Session Engine đảm nhiệm cookie jar theo
+    host, query params, form/JSON/multipart/raw body, basic/bearer/API-key auth,
+    redirect history, timing, evidence, replay, proxy.
+    AI → http_request tool → Session Engine → requests.Session.
+    Bounded: timeout ≤30s (mặc định 5, được kẹp 5..30), body snippet ≤2000 ký tự."""
+    import http_engine as he
     import requests
     url = kw["url"]
     method = str(kw.get("method") or "get").lower().strip()
-    if method not in ("get", "post", "head", "put", "options"):
-        return (f"[!] http_request: method phải là get|post|head|put|options "
+    if method not in he.METHODS:
+        return (f"[!] http_request: method phải là {'|'.join(he.METHODS)} "
                 f"(nhận '{method}').")
-    headers = dict(kw.get("headers") or {})
-    headers.setdefault("User-Agent",
-                       "Mozilla/5.0 (X11; Linux x86_64) Firefox/120.0")
-    body = str(kw.get("body") or kw.get("data") or "")
     follow = bool(kw.get("follow_redirects", True))
     timeout = min(max(5, int(kw.get("_timeout") or 30)), 30)
     try:
-        t0 = time.time()
-        if method == "get":
-            r = requests.get(url, headers=headers, timeout=timeout,
-                             allow_redirects=follow)
-        elif method == "head":
-            r = requests.head(url, headers=headers, timeout=timeout,
-                              allow_redirects=follow)
-        elif method == "options":
-            r = requests.options(url, headers=headers, timeout=timeout,
-                                  allow_redirects=follow)
-        elif method == "put":
-            r = requests.put(url, data=body, headers=headers, timeout=timeout,
-                             allow_redirects=follow)
-        else:  # post
-            r = requests.post(url, data=body, headers=headers, timeout=timeout,
-                              allow_redirects=follow)
-        dt = round(time.time() - t0, 2)
-        hdrs = {k: v for k, v in r.headers.items()}
-        body_snip = re.sub(r"\s+", " ", (r.text or ""))[:2000]
-        # v1.7.0 (structured ToolResult): data = response THẬT, không regex
-        data = {"url": url, "method": method.upper(), "status": r.status_code,
-                "headers": hdrs, "body_snippet": body_snip}
-        return ((f"{method.upper()} {url} → {r.status_code} "
-                 f"({len(r.content)} bytes, {dt}s)\n"
-                 f"headers:\n" + "\n".join(f"  {k}: {v}" for k, v in hdrs.items())
-                 + f"\nbody_snippet:\n{body_snip}"), data)
+        sess = he.session_for(url)
+        resp, rec = sess.request(
+            method, url,
+            headers=dict(kw.get("headers") or {}),
+            params=dict(kw.get("params") or {}),
+            body=kw.get("body"), data=kw.get("data"),
+            json_body=kw.get("json_body"), form=kw.get("form"),
+            files=kw.get("files"),
+            auth=kw.get("auth"),
+            cookies=dict(kw.get("cookies") or {}),
+            follow_redirects=follow, timeout=timeout)
+        # v1.8.1: headers/cookies trong out lẫn data đều redact (che giá trị
+        # nhạy cảm, giữ name) — inventory vẫn dò được cấu trúc, log không lộ secret.
+        hdrs = he.redact_headers({k: v for k, v in resp.headers.items()})
+        body_snip = resp.body_snippet
+        dt = round(resp.elapsed or rec.elapsed, 2)
+        # v1.8.0: data bổ sung final_url/history/cookies/evidence (bounded) —
+        # inventory + finding evidence đọc trực tiếp, không regex.
+        data = {"url": url, "method": resp.method, "status": resp.status_code,
+                "headers": hdrs, "body_snippet": body_snip,
+                "final_url": resp.url or url, "elapsed": dt,
+                "history": [{"status": h["status"], "url": h["url"]}
+                             for h in resp.history],
+                "cookies": he.redact_cookies(resp.cookies or {}),
+                "evidence": rec.evidence_dict()}
+        out = (f"{resp.method} {url} → {resp.status_code} "
+               f"({len(resp.content)} bytes, {dt}s)\n"
+               f"headers:\n" + "\n".join(f"  {k}: {v}" for k, v in hdrs.items()))
+        if resp.history:
+            chain = " → ".join(str(h["status"]) for h in resp.history)
+            out += f"\nredirects: {chain} → {resp.status_code}"
+        out += f"\nbody_snippet:\n{body_snip}"
+        return out, data
     except requests.exceptions.ConnectionError as e:
         return f"[!] http_request: không kết nối được: {e}", None
     except requests.exceptions.Timeout:
         return "[!] http_request: timeout HTTP", None
     except requests.exceptions.RequestException as e:
         return f"[!] http_request: lỗi request: {e}", None
+    except ValueError as e:
+        return f"[!] http_request: {e}", None
+
+
+def _crawl(**kw):
+    """v1.9.0: BFS crawl GET-only qua CHUNG Session Engine (http_engine.
+    session_for) — khám phá link/form/param/script/js-hint; không submit form,
+    không chạy exploit. record=False: traffic crawl KHÔNG vào ring buffer
+    evidence (replay/PoC giữ cho http_request).
+    time_budget = max(5, _timeout-5): crawler TỰ dừng đúng hạn (Python tool
+    không bị kill ngoài); cap TOOL_TIMEOUTS["crawler"]=120s qua _dispatch."""
+    import crawler  # lazy — tránh import nặng nếu session không dùng tool này
+    url = kw["url"]
+    timeout = int(kw.get("_timeout") or 90)
+    try:
+        result = crawler.crawl(
+            url,
+            # KHÔNG dùng `x or 3`: max_depth=0/max_pages nhỏ là giá trị HỢP LỆ
+            # (test/hộp thoại) — chỉ default khi tham số VẮNG MẶT.
+            max_depth=int(kw["max_depth"]) if kw.get("max_depth") is not None else 3,
+            max_pages=int(kw["max_pages"]) if kw.get("max_pages") is not None else 100,
+            same_scope=bool(kw.get("same_scope", True)),
+            timeout=float(kw.get("request_timeout") or 30),
+            time_budget=max(5, timeout - 5))
+        return result.render(), result.to_data()
+    except ValueError as e:
+        return f"[!] crawler: {e}", None
 
 
 def _dns_lookup(**kw):
@@ -276,14 +315,18 @@ def _dns_lookup(**kw):
 def _headers_recon(**kw):
     url = kw["url"]
     try:
+        import http_engine as he
         import requests
-        r = requests.head(url, timeout=15, allow_redirects=True,
-                          headers={"User-Agent": "Mozilla/5.0"})
-        # v1.7.0 (structured ToolResult): data = headers THẬT
-        data = {"url": url, "method": "HEAD", "status": r.status_code,
-                "headers": {k: v for k, v in r.headers.items()}}
-        return ("HEAD " + url + f" → {r.status_code}\n" + "\n".join(
-            f"{k}: {v}" for k, v in r.headers.items()), data)
+        # v1.8.1: dùng Session Engine (HEAD qua cookie jar, UA như cũ) — bỏ
+        # requests.head riêng; header nhạy cảm che <redacted> trong out lẫn data.
+        resp, _rec = he.session_for(url).request(
+            "head", url, timeout=15, headers={"User-Agent": "Mozilla/5.0"})
+        hdrs = he.redact_headers({k: v for k, v in resp.headers.items()})
+        # v1.7.0 (structured ToolResult): data = headers THẬT (đã redact value)
+        data = {"url": url, "method": "HEAD", "status": resp.status_code,
+                "headers": hdrs}
+        return ("HEAD " + url + f" → {resp.status_code}\n" + "\n".join(
+            f"{k}: {v}" for k, v in hdrs.items()), data)
     except Exception as e:
         return f"[!] {e}", None
 
@@ -1949,28 +1992,76 @@ TOOL_REGISTRY: list[ToolSpec] = [
     ToolSpec("http_probe", "GET một URL: trả status code, headers chọn lọc, snippet body.",
              {"type": "object", "properties": {"url": {"type": "string", "pattern": "^https?://"}},
               "required": ["url"]}, _http_probe, risk="safe"),
-    # v1.5.6: AI-native primitive — model TỰ gửi payload và TỰ phân tích response
+    # v1.8.0: adapter trên HTTP Session Engine — cookie jar theo host QUA các
+    # lần gọi, query params, form/JSON/multipart/raw body, auth, redirect history,
+    # timing, evidence; giữ NGUYÊN interface + output format v1.5.6.
     ToolSpec("http_request",
-             "Gửi request HTTP tùy ý (method/headers/body) và trả response THẬT: "
-             "status, headers, body snippet, thời gian. Dùng để TỰ phân tích lỗ hổng "
-             "(quote-differential, error-based, timing, XSS reflection, SSTI, path "
-             "traversal...) — không cần tool chuyên dụng hay binary ngoài. "
-             "method=get|post|head|put|options (mặc định get); body cho post/put; "
-             "headers dict tùy chọn; follow_redirects mặc định true. "
+             "Gửi request HTTP tùy ý qua Session Engine và trả response THẬT: status, "
+             "headers, body snippet, redirect chain, final_url, thời gian. "
+             "method=get|post|head|put|options|patch|delete (mặc định get). Body: "
+             "form (form-urlencoded dict) | json_body (JSON) | body/data (raw) | "
+             "files (multipart dict, value = 'path' | ('name','path') | ('name','path','ctype')). "
+             "auth=basic:user:pass | bearer:token | api_key:name:value | apiquery:name:value. "
+             "Có params (query), headers, cookies, follow_redirects (mặc định true). "
+             "SESSION: cookie jar chia theo host, HIỆU LỰC trong cả phiên chạy — dùng "
+             "cho authenticated testing (login rồi gọi tiếp). Dùng để TỰ phân tích lỗ "
+             "hổng (quote-differential, error-based, timing, XSS reflection, SSTI, path "
+             "traversal...) — không cần binary ngoài. "
              "MỌI finding phải dựa trên ít nhất 1 response http_request thật.",
              {"type": "object",
               "properties": {
                   "url": {"type": "string", "pattern": "^https?://"},
-                  "method": {"type": "string", "enum": ["get", "post", "head", "put", "options"],
-                              "description": "get (mặc định), post, head, put, options"},
+                  "method": {"type": "string", "enum": ["get", "post", "head", "put", "options", "patch", "delete"],
+                              "description": "get (mặc định), post, head, put, options, patch, delete"},
                   "headers": {"type": "object",
                                "description": "Headers tùy chọn (dict, vd {'X-Custom': '1'})"},
-                  "body": {"type": "string",
-                            "description": "Body cho post/put (form-encoded hoặc raw)"},
+                  "params": {"type": "object",
+                              "description": "Query params (dict, vd {'id': '9'}) — cộng vào URL"},
+                  "body": {"type": "string", "description": "Raw body cho post/put/patch/delete"},
+                  "data": {"type": "string",
+                            "description": "Alias của body (raw) — giữ tương thích v1.5.6"},
+                  "json_body": {"type": "object",
+                                 "description": "Body JSON (dict/list) — gửi Content-Type: application/json"},
+                  "form": {"type": "object",
+                            "description": "Body form-urlencoded (dict) cho post/put/patch"},
+                  "files": {"type": "object",
+                             "description": "Multipart upload (dict field → 'path' hoặc tuple) — chỉ post/put/patch"},
+                  "auth": {"type": "string",
+                            "description": "basic:user:pass | bearer:token | api_key:name:value | apiquery:name:value"},
+                  "cookies": {"type": "object",
+                               "description": "Cookie gửi kèm request này (dict); cookie jar host vẫn hoạt động"},
                   "follow_redirects": {"type": "boolean",
-                                        "description": "Theo redirect (mặc định true)"}},
+                                        "description": "Theo redirect (mặc định true); false để xem 30x + Location"}},
               "required": ["url"]},
              _http_request, risk="active"),
+
+    # v1.9.0: crawler GET-only trên Session Engine — link/form/param/script/
+    # js-hint discovery, bounded (depth/pages/body/time_budget), redirect ra
+    # ngoài scope không theo. record=False — không làm ô nhiễm evidence ring.
+    ToolSpec("crawler",
+             "BFS crawl GET-only một website (dùng CHUNG Session Engine, không "
+             "submit form, không chạy exploit): khám phá link nội bộ, external "
+             "link, form (action/method/field name), query parameter, script src, "
+             "và endpoint hint trong JS (fetch/axios/$.ajax/XHR — CHỈ LÀ ỨNG VIÊN, "
+             "cần xác minh). Bounded: max_depth BFS, max_pages, request_timeout, "
+             "time_budget tự dừng. Redirect: theo tối đa 5 hop trong scope; ra "
+             "ngoài scope thì dừng và ghi. Kết quả tự vào inventory (endpoint "
+             "canonical /x?id={value}, parameter, form, script, JS-hint source "
+             "'crawler:js'). Dùng SAU http_probe/headers_recon khi đã có base URL.",
+             {"type": "object",
+              "properties": {
+                  "url": {"type": "string", "pattern": "^https?://",
+                           "description": "Start URL (cùng scheme+host+port = scope crawl)"},
+                  "max_depth": {"type": "integer", "minimum": 0, "maximum": 10,
+                                 "description": "Độ sâu BFS tối đa (mặc định 3)"},
+                  "max_pages": {"type": "integer", "minimum": 1, "maximum": 500,
+                                 "description": "Tối đa trang sẽ GET (mặc định 100)"},
+                  "same_scope": {"type": "boolean",
+                                  "description": "Chỉ crawl cùng scheme+host+port (mặc định true)"},
+                  "request_timeout": {"type": "number", "minimum": 1, "maximum": 60,
+                                       "description": "Timeout mỗi request (giây, mặc định 30)"}},
+              "required": ["url"]},
+             _crawl, risk="safe"),
     ToolSpec("dns_lookup", "Tra cứu DNS A records của domain.",
              {"type": "object", "properties": {"host": {"type": "string"}},
               "required": ["host"]}, _dns_lookup, risk="safe"),

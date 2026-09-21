@@ -303,6 +303,7 @@ root@aixsec-x:~# q                                             → quit
 | Tool | Type | Risk | Notes |
 |---|---|---|---|
 | http_probe / headers_recon / dns_lookup | recon | safe | Python requests |
+| crawler | recon | safe | **v1.9.0:** Python-native BFS crawl GET-only (dùng CHUNG Session Engine — cookie jar + proxy + auth header) — NO wapiti binary needed. Khám phá: link nội bộ + external, form (action/method/field name), query param, script src, JS endpoint hint (`fetch`/`axios`/`$.ajax`/XHR — ỨNG VIÊN, cần xác minh, nguồn `crawler:js` trong inventory). Bounds: `max_depth` 0–10 (mặc định 3), `max_pages`, `request_timeout`, `time_budget` tự dừng, `trailing_slash`, `max_body_bytes`; redirect theo ≤5 hop trong scope, ra ngoài scope dừng + ghi `redirect_out`. Form KHÔNG bị submit; script/static/PDF ghi nhận nhưng KHÔNG enqueue. Query chuẩn hoá (sort key, strip anchor), canonical `/x?id={value}`, `<base href>` đúng chuẩn urljoin, `same_scope` mặc định true. **Bug fixed (test phát hiện):** `max_depth=0` trước bị `or 3` ép thành depth-3 crawl — giờ tôn trọng 0. Tự đổ inventory qua `_DATA_INGEST["crawler"]` **v1.9.1:** JS hint kèm method ƯỚC LƯỢNG (axios verb / `xhr.open('V')` → verb; `fetch('url')` → GET chỉ khi không có options; `$.ajax`/fetch có options → UNKNOWN — UNKNOWN KHÔNG bị ép thành GET trong inventory); **EvidenceRedactor** che secret trong `evidence_dict()` (headers/cookies/params/form/json/url, `add_sensitive_field`, `pass` đã được thêm vào field mặc định) |
 | sast_scan | sast | safe | Source-code scan: pattern heuristics (PHP/Python/JS/Java) + secret scan; optional semgrep/gitleaks; scoped via WEBX_SRC_DIRS |
 | waf_detect (wafw00f) / detect_cms (whatweb) | recon | safe | fingerprint |
 | subdomain_enum (subfinder) | recon | safe | |
@@ -862,6 +863,150 @@ python3 agent.py --recon
 ```
 
 ## Changelog
+
+### v1.9.1 — EvidenceRedactor tập trung trên evidence + JS hint method thật (UNKNOWN không gán GET)
+
+- **`http_engine.py` — `EvidenceRedactor`** (hoàn thiện chuỗi secret redaction từ
+  1.8.1/1.9.0): lớp redaction tập trung, mask `REDACT_MASK = "<redacted>"`, dùng
+  chung cho mọi phần evidence — `redact_headers`, `redact_cookies`, `redact_params`,
+  `redact_form`, `redact_json` (đệ quy, KHÔNG mutate input), `redact_url`;
+  `add_sensitive_field()` thêm field nhạy cảm tùy instance. Field mặc định
+  `_SENSITIVE_FIELDS` giờ **bao gồm `pass`** (trước thiếu → `pass=` trong form/json
+  lộ ra evidence). `RequestRecord.evidence_dict()` áp redactor lên headers/cookies/
+  params/body/url/final_url/history — bản ghi gốc (`rec.body`) GIỮ giá trị thật
+  cho replay/PoC.
+- **`crawler.py` — `JsHint.method` (`str | None`):** `axios.get/post/put/patch/
+  delete/head/options('url')` và `xhr.open('DELETE','url')` → verb viết hoa;
+  `fetch('url')` → GET chỉ khi KHÔNG có options object (peek ký tự sau quote: gặp
+  `,` → có options → không chắc → `None`); `$.ajax({url})` → `None`. `to_data()`
+  xuất `"method": … or "UNKNOWN"` — lưu UNKNOWN khi không chắc, không gán bừa GET.
+- **`inventory.py` — `_ingest_data_crawler`:** dùng method thật của hint;
+  `""`/`"UNKNOWN"` → endpoint với tập method RỖNG (không ép GET). Hết cảnh
+  `axios.post('/api/login')` biến thành `GET /api/login` trong inventory.
+- **Tests** — mới `TestEvidenceRedactor` (unit: headers/cookies/params/form/json
+  deep no-mutate/url/suffix field/add_sensitive_field isolation) + `TestEvidenceRedactorEngine`
+  (server thật: JSON/FORM body bị che trong evidence nhưng bản ghi giữ nguyên — wire
+  vẫn nhận giá trị thật; apiquery auth che mọi nơi trừ bản ghi); `test_js_hints`
+  chuyển 4-tuple (kind,url,method,in_scope), `TestCrawlerInventoryIngest` /
+  `test_js_hint_scope_filter` / `test_pipeline_ingest` xác nhận UNKNOWN → methods
+  rỗng. Full suite: **339 tests OK** (previously 328).
+
+### v1.9.0 — Python-native crawler: BFS GET-only on the Session Engine + JS hints + Shadow Inventory ingest
+
+- **`crawler.py` — pure-Python BFS GET-only crawler** (no wapiti binary):
+  reuses `http_engine.session_for(host)`, inheriting the Session Engine's cookie
+  jar, proxy, auth headers and redirect history (no second HTTP implementation
+  in the project). Sends GET only; forms are NOT submitted; script/static/PDF
+  resources are recorded but not enqueued.
+- **Discovery:** internal + external links, forms (`action`/`method`/field
+  names — a form without `action` resolves to the current page URL), query
+  params, `script src`, and JS endpoint hints (`fetch`/`axios`/`$.ajax`/XHR —
+  `JsHint` with `in_scope` flag + source `crawler:js`; hints are CANDIDATES
+  awaiting verification, not confirmed endpoints). Out-of-scope hints are still
+  surfaced (semantic risk: possible SSRF / redirect targeting) but kept out of
+  the inventory.
+- **Normalization/scope:** query keys sorted (anchors dropped), canonical shape
+  `/x?id={value}`, `<base href>` handled via proper urljoin, `same_scope`
+  defaults to true; redirects follow ≤5 in-scope hops, an out-of-scope hop stops
+  and is marked `redirect_out`. `robots.txt` is NOT honored (pentest crawler).
+- **Bounds (`crawler` ToolSpec schema):** `url` (required), `max_depth` 0–10
+  default 3 — **bug fix: `max_depth=0` used to be treated as falsy by
+  `int(kw.get(...) or 3)` and silently crawled depth 3; it now truly means
+  crawl the root URL only**; `max_pages` 1–500 default 100;
+  `request_timeout` 1–60 default 30; `time_budget` (early stop),
+  `trailing_slash`, `max_body_bytes` optional. `risk="safe"`, `_TOOL_VULN`
+  maps it to `recon`; TOOL_TIMEOUTS has a dedicated entry.
+- **Automatic Shadow Inventory ingest:** `_DATA_INGEST["crawler"]` +
+  `_ingest_data_crawler` (`inventory.py`) — endpoints/methods/params/tech flow
+  into the attack surface map like any recon tool, response-header tech carries
+  `source="crawler"`; out-of-scope `crawler:js` hints are dropped from the
+  inventory.
+- **Tests** — hermetic suites `TestCrawlerUrlHelpers` (`norm_url`/`scope_key`/
+  `canon_url`/`query_names`), `TestCrawlerParseHtml` (multi-route echo fixture
+  `/abs,/rel,/q,/area,/frame`), `TestCrawlerCrawl` (BFS page order,
+  max_depth=0, max_pages, scope, base href, redirect out, no-action form,
+  query sort), `TestCrawlerDispatch` (tool adapter + OFFLINE_ASSETS/
+  READ_TIMEOUT), `TestCrawlerInventoryIngest` (endpoint/param/tech/hint
+  round-trip), `test_js_hints`, `test_main_bfs` (run-loop + ledger probe set
+  contains crawler) and `test_pipeline_ingest`. Full suite:
+  **328 tests OK** (previously 304).
+
+### v1.8.1 — Credential redaction + spec-first replay (RequestSpec) + scheme-aware sessions
+
+- **Header/cookie redaction (`http_engine.redact_headers` / `redact_cookies`):**
+  values of sensitive headers (`Authorization`, `Proxy-Authorization`, `Cookie`,
+  `Set-Cookie`, `X-Api-Key`, `Api-Key`) are masked to `<redacted>` at the
+  adapter/output boundary — case-insensitive matching, the input dict is NOT
+  mutated (safe to reuse). `Set-Cookie` keeps the cookie NAME + non-secret
+  attributes (`sid=<redacted>; Path=/`) so structure-based detection (e.g.
+  inventory `auth_hints`) still works; `Cookie` is fully masked.
+  `add_sensitive_header(name)` registers extra header names (thread-safe, shared
+  across sessions) for project-specific secrets.
+- **Spec-first replay (`RequestSpec`):** every `RequestRecord` now carries
+  `.spec` — the PRE-AUTH request intent (method/url/params/body/headers WITHOUT
+  `Authorization` or credentials). `session.replay()` rebuilds the request from
+  the spec and applies auth only at send time, so credentials hit the wire
+  EXACTLY ONCE per replay and later replays of the same record never
+  double-inject. Records from prior versions (no spec) fall back to the legacy
+  rec-fields path — no breakage for old artifacts.
+- **Scheme-aware session keys:** key is now `scheme://host:port` with
+  scheme-default ports (`http://example.com:80`, `https://example.com:443`) and
+  lowercased host — `http://example.com:443` and `https://example.com:443` are
+  DISTINCT sessions (cookie scope matches browser behavior), replacing the old
+  `host:port` key that conflated schemes.
+- **Evidence redaction:** `evidence_dict()` ships MASKED `request_headers` and
+  `cookies_received` (values `<redacted>`), plus masked `params` (apiquery
+  secrets redacted), while `body_snippet` keeps the RAW server echo as wire
+  truth — tests assert BOTH the mask and the real value on the wire.
+- **Adapters migrated (`tools.py`):** `_http_request`, `_http_probe` and
+  `_headers_recon` all run through engine sessions and return redacted
+  headers/cookies in `data` and pretty-printed output; `_headers_recon` now
+  issues HEAD via the engine (test echo server gained a `do_HEAD` route).
+- **Tests** — 10 new/updated hermetic tests: `TestHeaderRedaction` (5 units:
+  masking, case-insensitivity, no input mutation, cookies, `add_sensitive_header`
+  with cleanup), auth tests assert evidence masking + wire truth via
+  `body_snippet`, cookie-jar test asserts the redacted value,
+  `_session_key`/session-count assertions, spec-replay (auth applied exactly
+  once; legacy fallback without spec), probe/headers_recon redaction, and an
+  end-to-end inventory test proving a redacted `Set-Cookie` still registers the
+  `cookie` auth hint. Full suite: **304 tests pass** (was 294).
+
+### v1.8.0 — Phase 2 kickoff: HTTP Session Engine (session-aware HTTP layer + cookie jar + auth + redirect history + replay + proxy)
+
+- **`http_engine.py` — Session Engine (stateful HTTP layer):** one `requests.Session`
+  per host (`host:port` key, port defaults by scheme) so cookies NEVER leak across
+  hosts; the engine is the SINGLE HTTP implementation — `http_request` is now a thin
+  adapter on top of it, and the upcoming crawler will reuse the same engine (no
+  second HTTP implementation in the project). Supported methods: `get/post/head/
+  put/options/patch/delete`; bodies: `params` (query) → `form` (urlencoded) →
+  `json_body` → `body`/`data` (raw) → `files` (multipart), in that precedence;
+  headers; auth kinds: `basic:user:pass`, `bearer:token`, `api_key:name:value`
+  (header), `apiquery:name:value` (query param). Redirects follow by default; each
+  response carries `history` (the full redirect chain: status/location/url),
+  `final_url` (the ACTUAL last URL — previously the request URL was reported),
+  `elapsed` timing, cookies and raw evidence.
+- **Cookie jar per host + login-by-POST flow:** a `Set-Cookie` from any response is
+  stored in that host's jar and sent automatically on later calls — the agent can
+  POST a login form (`form` or `json_body`) and immediately call authenticated
+  endpoints without copying cookie values by hand.
+- **Ring buffer + replay:** every request is recorded in a per-host ring buffer
+  (max 20 records) with its exact headers/params/body/auth/cookies; `replay(rec_id)`
+  re-sends it (multipart re-opens the file path — raises `ValueError` if deleted).
+- **Proxy support:** `config` reads `WEBX_HTTP_PROXY` / `WEBX_HTTPS_PROXY` and
+  `agent.run()` calls `reset_sessions()` + `set_proxies()` at start so every
+  session (current and future) uses the same proxy config; tests are hermetic
+  because `set_proxies(None)` restores direct routing.
+- **`http_request` tool — adapter, interface kept:** `tools._http_request` now
+  delegates to the engine and keeps the EXACT same tool interface and output
+  format (`url/method/status/headers/body_snippet/final_url/elapsed/history/
+  cookies/evidence`); prompts rule 5d (compact) / 6d (full) document the session
+  behavior so the model can do multi-step authenticated testing. AI-NATIVE gate
+  unchanged — `http_request` remains a BASE feature.
+- **Tests** — 21 new hermetic tests: `TestHttpEngineUnit` (methods, body kinds,
+  auth kinds, redirect history + final_url, cookie jar per host, isolation,
+  ring buffer + replay, proxy env) plus 15 adapter tests in `TestHttpRequestTool`
+  (engine reuse, cookie/login flow, final_url, error mapping) and the 2 timeout
+  tests updated to the new engine. Full suite: **294 tests pass** (was 273).
 
 ### v1.7.0 — Phase 1 complete (ChatGPT review): structured results + multi-service inventory + attack memory + evidence provenance
 

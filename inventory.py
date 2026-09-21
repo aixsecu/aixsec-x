@@ -45,6 +45,9 @@ Nguồn dữ liệu theo tool:
       (transcript/output text) vẫn parse được
   sqli_manual_test / sqli_blind_extract       → data {url, method, param,
       engine, confirmed, injection...} nếu có; text nếu không
+  crawler (v1.9.0)                           → data {url, pages, links,
+      forms, params, scripts, js_hints} — endpoint canonical /x?id={value},
+      query/field params, script src, js-hint nguồn "crawler:js" (ỨNG VIÊN)
   subdomain_enum (subfinder -silent)          → text: 1 subdomain mỗi dòng
 """
 from __future__ import annotations
@@ -53,6 +56,7 @@ import json
 import re
 import time
 from dataclasses import dataclass, field
+from urllib.parse import parse_qsl, urlparse, urlunsplit
 
 
 # ─────────────────────────────────────────────
@@ -571,6 +575,18 @@ def _ingest_data_http(inv: Inventory, name: str, args: dict, data: dict) -> int:
     method = str(data.get("method") or "get").upper()
     ep = inv.add_endpoint(host, url, method=method, source=name)
     n = 0
+    # v1.8.0: redirect final_url (# http_request theo follow_redirects) — URL
+    # cuối (site khác hoặc path khác) được ghi endpoint riêng để attack surface
+    # phản ánh đúng nơi response THẬT tới. KHÔNG copy headers/tech (đó là của
+    # response cuối thật: nếu final_url cùng host thì headers đã được áp qua
+    # ensure_web/add_endpoint phía trên; khác host → ghi host+endpoint, header
+    # của redirect target sẽ được thu khi có request trực tiếp tới nó).
+    furl = str(data.get("final_url") or "")
+    if furl and _norm_url(furl) != url:
+        fhost = inv.ensure_web(furl, name)
+        if fhost is not None:
+            inv.add_endpoint(fhost, furl, method="GET", source=name)
+            n += 1
     for k, v in (data.get("headers") or {}).items():
         if _apply_header(inv, host, url, str(k), str(v), name,
                          service=inv.service_for(host, url)):
@@ -609,6 +625,115 @@ def _ingest_data_wapiti(inv: Inventory, name: str, args: dict, data: dict) -> in
     return n
 
 
+def _crawl_canon(url: str) -> str:
+    """Canonical endpoint shape từ URL crawl: giá trị query → {value}
+    (/product.php?id=1&x=2 → /product.php?id={value}&x={value}). Giữ
+    scheme+host+path, lowercase scheme/host. '' nếu không phải URL tuyệt
+    đối. Không percent-encode badge — inventory render đọc được."""
+    u = urlparse((url or "").strip())
+    if not u.scheme or not u.netloc:
+        return ""
+    names = [k for k, _ in parse_qsl(u.query, keep_blank_values=True)]
+    q = "&".join(f"{k}={{value}}" for k in names) if names else ""
+    return urlunsplit((u.scheme.lower(), u.netloc.lower(), u.path or "/", q, ""))
+
+
+def _query_names(url: str) -> list[str]:
+    """Tên query param (thứ tự xuất hiện, dedup) của URL crawl."""
+    out: list[str] = []
+    seen: set[str] = set()
+    for k, _ in parse_qsl(urlparse((url or "").strip()).query,
+                          keep_blank_values=True):
+        if k not in seen:
+            seen.add(k)
+            out.append(k)
+    return out
+
+
+def _ingest_data_crawler(inv: Inventory, name: str, args: dict, data: dict) -> int:
+    """crawler (v1.9.0) — data {url, pages[], links[], forms[], params[],
+    scripts[], js_hints[]}: gom attack surface từ crawl GET-only (không có
+    text parser — tool Python-native, data cấu trúc luôn có).
+      - pages    → endpoint raw (URL cuối đã GET thật)
+      - links    → endpoint CANONICAL /path?id={value} + tên query param
+      - forms    → action + method + field name (params)
+      - params   → bổ sung tên query param theo canonical key của crawler
+      - scripts  → endpoint (tài nguyên JS — chưa fetch)
+      - js_hints → endpoint nguồn "crawler:js" — CHỈ in-scope (ỨNG VIÊN,
+        chưa phải endpoint thật; nguồn tag riêng để AI biết cần xác minh);
+        method THẬT từ hint (axios.verb/xhr.open/fetch GET); UNKNOWN → methods
+        rỗng, KHÔNG gán GET bừa (v1.9.1)
+    external_links/external_scripts/redirect_out: KHÔNG thêm (ngoài scope)."""
+    url = _norm_url(str(data.get("url") or args.get("url") or ""))
+    host = inv.ensure_web(url, name)
+    if host is None:
+        return 0
+    n = 0
+    for p in data.get("pages") or []:
+        if not isinstance(p, dict):
+            continue
+        pu = _norm_url(str(p.get("url") or ""))
+        if not pu:
+            continue
+        inv.add_endpoint(host, pu, method="GET", source=name)
+        n += 1
+    for u in data.get("links") or []:
+        u = _norm_url(str(u or ""))
+        if not u:
+            continue
+        canon = _crawl_canon(u)
+        if not canon:
+            continue
+        ep = inv.add_endpoint(host, canon, method="GET", source=name)
+        for qn in _query_names(u):
+            ep.params.add(qn)
+        n += 1
+    for f in data.get("forms") or []:
+        if not isinstance(f, dict):
+            continue
+        fa = _norm_url(str(f.get("action") or ""))
+        if not fa:
+            continue
+        ep = inv.add_endpoint(host, fa, method=str(f.get("method") or "GET"),
+                              source=name)
+        for pname in f.get("params") or []:
+            if pname:
+                ep.params.add(str(pname))
+        n += 1
+    for item in data.get("params") or []:
+        if not isinstance(item, dict):
+            continue
+        cu = _norm_url(str(item.get("url") or ""))
+        if not cu:
+            continue
+        ep = inv.add_endpoint(host, cu, method="GET", source=name)
+        for pn in item.get("params") or []:
+            if pn:
+                ep.params.add(str(pn))
+        n += 1
+    for u in data.get("scripts") or []:
+        u = _norm_url(str(u or ""))
+        if not u:
+            continue
+        inv.add_endpoint(host, u, method="GET", source=name)
+        n += 1
+    for h in data.get("js_hints") or []:
+        if not isinstance(h, dict) or not h.get("in_scope"):
+            continue
+        hu = _norm_url(str(h.get("url") or ""))
+        if not hu:
+            continue
+        # v1.9.1: method THẬT từ hint (axios.verb/xhr.open/fetch GET). UNKNOWN
+        # hoặc thiếu → KHÔNG gán GET bừa (endpoint methods rỗng — review:
+        # "UNKNOWN tốt hơn việc gán sai GET").
+        hm = str(h.get("method") or "").strip().upper()
+        if hm in ("", "UNKNOWN"):
+            hm = ""
+        inv.add_endpoint(host, hu, method=hm, source=name + ":js")
+        n += 1
+    return n
+
+
 def _ingest_data_sqli(inv: Inventory, name: str, args: dict, data: dict) -> int:
     if not data.get("confirmed") and data.get("verdict") != "CONFIRMED":
         return 0
@@ -626,6 +751,7 @@ _DATA_INGEST = {
     "http_probe": _ingest_data_http,
     "http_request": _ingest_data_http,
     "headers_recon": _ingest_data_http,
+    "crawler": _ingest_data_crawler,
     "wapiti_scan": _ingest_data_wapiti,
     "sqli_manual_test": _ingest_data_sqli,
     "sqli_blind_extract": _ingest_data_sqli,
