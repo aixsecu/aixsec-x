@@ -24,7 +24,7 @@ import time
 
 # ── local imports ──
 from config import load_config
-from inventory import Inventory
+from inventory import Inventory, TestHistory
 from ledger import (Ledger, parse_findings_json, render_markdown, validation_plan,
                    check_findings_evidence)
 from llm import InjectionGuard, ollama_chat
@@ -34,7 +34,21 @@ from tools import (TOOL_REGISTRY, TOOL_INDEX, TOOL_BINS, TOOL_TIMEOUTS,
                    LONG_RUN_TOOLS, available_tools, _WAPITI_FIX, capability_report)
 
 # ── terminal colors (AIXSEC-X style) ──
-VERSION = "1.6.0"
+VERSION = "1.7.0"
+
+# v1.7.0 (#12 attack memory): phân loại vuln_class cho TestHistory theo tool
+# (sqli→sqli, scanner→scan, recon→recon, poc→poc; tool không khớp → "").
+_TOOL_VULN = {}
+for _t in ("sqli_manual_test", "sqli_blind_extract", "sqlmap_check", "sqlmap_runner"):
+    _TOOL_VULN[_t] = "sqli"
+for _t in ("wapiti_scan", "nikto_scan", "nuclei_scan", "sast_scan"):
+    _TOOL_VULN[_t] = "scan"
+for _t in ("http_probe", "http_request", "headers_recon", "detect_cms",
+           "waf_detect", "ffuf_dir", "param_discovery", "subdomain_enum",
+           "dns_lookup"):
+    _TOOL_VULN[_t] = "recon"
+for _t in ("generate_poc", "poc_executor"):
+    _TOOL_VULN[_t] = "poc"
 
 # v1.5.8 (Bug A): chuỗi lỗi LLM từ llm.py — nhận diện để KHÔNG đếm là plan-only
 # (trước đây timeout bị coi là "văn bản kế hoạch" → plan_only=2 → forced break →
@@ -189,6 +203,9 @@ class WebXAgent:
         # v1.6.0 (roadmap #1/#12/#13): Attack Surface Inventory — host→port→
         # service→URL→method→param→auth→tech, tích lũy từ tool output OK thật.
         self.inventory = Inventory()
+        # v1.7.0 (#12): attack memory — cái GÌ ĐÃ THỬ (endpoint×param×vuln_class×
+        # tool×outcome), KHÔNG lặp lại; tách khỏi attack surface (cái ĐÃ BIẾT).
+        self.test_history = TestHistory()
         self.capabilities = None   # v1.6.0 (#14): lazy — probe version chỉ khi yêu cầu
         self.tools = TOOL_REGISTRY
         self.extra_context = ""
@@ -276,18 +293,50 @@ class WebXAgent:
             # v1.4.4: chỉ đo thời gian THỰC THI tool — chờ operator duyệt
             # (_risk_ok/input()) nằm ngoài try này nên không bị tính vào duration.
             t0 = time.time()
-            out = spec.exec_fn(**kw)
+            res = spec.exec_fn(**kw)
             dt = round(time.time() - t0, 1)
+            # v1.7.0 (structured ToolResult): tool TIÊN TIẾN trả (output_text,
+            # data_dict); tool cũ/binary vẫn trả plain string → data=None.
+            if (isinstance(res, tuple) and len(res) == 2
+                    and isinstance(res[0], str)):
+                out, data = res
+            else:
+                out, data = res, None
             # v1.4.4: output mở đầu '[!]' = lỗi thực thi (timeout, thiếu binary,
             # connect fail, args sai) → outcome=error để gate/fail-count đúng.
             oc = "error" if isinstance(out, str) and out.startswith("[!]") else "ok"
-            return {"name": name, "outcome": oc, "output": out, "exec_time": dt}
+            r = {"name": name, "outcome": oc, "output": out, "exec_time": dt}
+            if data is not None:
+                r["data"] = data
+            return r
         except TypeError as e:
             return {"name": name, "outcome": "error",
                     "output": f"[!] Invalid arguments for '{name}': {e}", "exec_time": 0.0}
         except Exception as e:  # noqa: BLE001
             return {"name": name, "outcome": "error",
                     "output": f"[!] {name} error: {e}", "exec_time": 0.0}
+
+    def _record_test(self, name: str, args: dict, r: dict) -> None:
+        """v1.7.0 (#12): ghi attack memory — endpoint/param đã THỬ (mọi outcome
+        trừ duplicate). vuln_class theo _TOOL_VULN; evidence_id bỏ trống cho
+        Phase 2 (evidence state machine gắn bằng chứng/kết quả vào record)."""
+        if r.get("outcome") == "duplicate":
+            return
+        url = ""
+        for k in ("url", "target"):
+            v = args.get(k)
+            if v:
+                url = str(v)
+                break
+        if not url:
+            return
+        self.test_history.add(
+            endpoint=url,
+            parameter=str(args.get("param") or ""),
+            vuln_class=_TOOL_VULN.get(name, ""),
+            tool=name,
+            outcome=r.get("outcome") or "ok",
+        )
 
     # ─────────────────────────────────────────
     # MAIN LOOP
@@ -456,6 +505,10 @@ class WebXAgent:
                       flush=True)
                 r.setdefault("args", args)  # giữ args để đối chiếu bằng chứng
                 results.append(r)
+                # v1.7.0 (#12): attack memory — ghi NGAY sau khi có kết quả
+                # (kể cả error/blocked; duplicate đã ghi ở lần dispatch đầu).
+                if r.get("outcome") != "duplicate":
+                    self._record_test(name, args, r)
             disp.done()
             self.transcript.append({"round": rnd, "type": "tools", "calls": results})
             # v1.6.0 (#1/#12/#13): gom tool output OK của round vào attack surface
@@ -494,11 +547,15 @@ class WebXAgent:
             surf_note = ("\n[ATTACK SURFACE — đã biết, KHÔNG rescan các mục này; "
                          "dùng tech/endpoint để chọn bước TIẾP THEO]:\n" + surf
                          ) if surf else ""
+            # v1.7.0 (#12): attack memory — những gì ĐÃ THỬ để model KHÔNG lặp
+            # lại tool-call trên cùng endpoint/param/lớp lỗ hổng.
+            th_note = ("\n" + self.test_history.render()) \
+                if self.test_history.record_count() else ""
             msgs.append({"role": "user", "content":
                         "[TOOL RESULTS BEGIN]\n" +
                         json.dumps(tool_msgs, ensure_ascii=False)[:12000] +
                         "\n[TOOL RESULTS END]\nTiếp tục. Khi đủ dữ liệu trả JSON cuối cùng."
-                        + surf_note})
+                        + surf_note + th_note})
 
         # v1.5.2 (tail-order 1): AUTO-WAPITI — hết vòng lặp mà web scope active
         # và wapiti_scan chưa từng chạy (model bỏ qua dù prompt/gate bắt buộc)
@@ -816,6 +873,7 @@ class WebXAgent:
         self.transcript.append({"round": 0, "type": "tools", "calls": [r],
                                 "auto": True})
         self.inventory.ingest([r])   # v1.6.0: wapiti auto cũng vào attack surface
+        self._record_test("wapiti_scan", args, r)
         out = InjectionGuard.sanitize(r.get("output", ""),
                                       self.config["output_cap"])
         msg = {"role": "tool", "name": "wapiti_scan",
@@ -860,6 +918,9 @@ class WebXAgent:
         hdrs = _try_dispatch(self, "headers_recon", {"url": target})
         # v1.6.0: recon bootstrap cũng nuôi attack surface
         self.inventory.ingest([probe, hdrs])
+        # v1.7.0 (#12): recon bootstrap cũng là attack memory
+        self._record_test("http_probe", {"url": target}, probe)
+        self._record_test("headers_recon", {"url": target}, hdrs)
         self.extra_context = f"TARGET: {target}\nPROBE:\n{probe['output'][:1500]}\nHEADERS:\n{hdrs['output'][:1500]}"
         return self.extra_context
 
@@ -870,6 +931,11 @@ class WebXAgent:
         surf = self.inventory.render(limit=60)
         if surf:
             md += f"\n## Attack Surface (phiên này)\n```\n{surf}\n```\n"
+        # v1.7.0 (#12): report kèm attack memory (cái đã thử) — phân biệt rõ
+        # với findings (ledger) để operator thấy phần việc đã làm.
+        th = self.test_history.render(limit=60)
+        if th:
+            md += f"\n## Test History (đã thử — attack memory)\n```\n{th}\n```\n"
         path = f"aixsec-x_report_{int(time.time())}.md"
         with open(path, "w") as f:
             f.write(md)

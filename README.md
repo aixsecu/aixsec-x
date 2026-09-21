@@ -863,6 +863,49 @@ python3 agent.py --recon
 
 ## Changelog
 
+### v1.7.0 — Phase 1 complete (ChatGPT review): structured results + multi-service inventory + attack memory + evidence provenance
+
+- **Structured ToolResult (`tools.py`)** — every native Python tool now returns
+  `(output_text, data_dict)`: the human-readable text for the model plus a
+  structured dict generated from the tool's own data (headers, findings,
+  parameters…). `Inventory.ingest` prefers `data` (no text regex for
+  http_probe / http_request / headers_recon / wapiti / SQLi tools); text
+  parsers remain only as fallback for binary tools (whatweb, wafw00f, ffuf,
+  arjun, subfinder) and old transcripts. A one-character change in a printed
+  line no longer breaks the inventory for Python-native tools.
+- **Multi-service host (`inventory.py`)** — `HostInfo.services` is now
+  `{port: ServiceInfo(port, scheme, protocol, tech, tech_obs, endpoints,
+  sources)}`; one host can carry 80/http + 443/https + 8080/http at once.
+  `primary()` picks the lowest numeric port; convenience views
+  (`port`/`service`/`tech`/`endpoints`) aggregate over services. v1.6.0 flat
+  save files still load: a service is synthesized with observations tagged
+  `source="legacy"` and endpoint URL keys are normalized.
+- **`auth_hints` is a set** — an endpoint can need `cookie` + `csrf` + `bearer`
+  at the same time (previously a single string).
+- **TestHistory — attack memory (`inventory.py` + `agent.py`)** — every tested
+  combination `endpoint × parameter × vuln_class × tool × outcome` is recorded
+  (`TestRecord`/`TestHistory`); the runner records recon and wapiti attempts
+  too. The next round's user message gets a `[TEST HISTORY]` block and the
+  prompts (compact rule 5d / full rule 6d) forbid repeating the same tool on
+  the same endpoint+param+class. The planner queries deterministic
+  `already_tested()` instead of letting the LLM re-read the transcript.
+- **Evidence provenance (`inventory.py`)** — `TechObservation(name, version,
+  source, evidence)` keeps the origin of every observation (`header:X-Powered-By`,
+  `whatweb:<token>`, …); the `tech` aggregate is rebuilt from observations so
+  no information is lost when deduping. Observations dedupe by (name, version,
+  source, evidence); the first versioned observation wins in the aggregate.
+- **Bug fixes from the review** — `_ingest_cms` bracket branch now passes
+  `source=name` like the keyword branch (`HTTPServer[x]` takes the tech name
+  from the value); the bracket parser accepts values starting with a letter
+  (whatweb emits `HTTPServer[nginx/1.24.0]`) — previously only digit-leading
+  values matched; `Inventory.load` normalizes endpoint URL keys in both the
+  v1.7.0 and legacy flat schemas so keys match the in-memory model.
+- **Tests** — 23 new hermetic tests (TestHistory add/dedupe/render and
+  run-loop injection, multi-service host routing, structured-data ingest and
+  data-over-text precedence, evidence provenance incl. save/load roundtrip
+  and legacy v1.6.0 load, `_ingest_cms` bracket source, prompt history rules).
+  Full suite: 273 tests pass.
+
 ### v1.6.0 — Attack Surface Inventory + Capability Discovery + multi-source findings
 
 - **Attack Surface Inventory (`inventory.py`)** — a unified `host → port →
