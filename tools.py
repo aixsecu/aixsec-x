@@ -505,6 +505,11 @@ _WAPITI_FORM_SKIP_FIELDS: tuple[str, ...] = (
     "file", "image", "x", "y", "op", "action",
 )
 _WAPITI_MAX_SWEEP_FORMS = 10  # số field form POST tối đa sweep mỗi lượt
+# v1.5.8 (Bug C): trần budget form sweep (giây) — sweep là BỔ TRỢ (wapiti đã
+# chạy module sql), không được ăn hết budget tool sau khi wapiti xong. Trước
+# đây sweep nhận NGUYÊN budget (vd 1200s) nên tổng thời gian wapiti_scan vượt
+# xa max_scan_time + max_attack_time (user thấy 965.7s dù khai báo ~360s).
+_WAPITI_SWEEP_MAX_BUDGET = 240
 
 # v1.5.0: hướng dẫn BƯỚC TIẾP THEO theo category trong report JSON wapiti
 # (category ổn định theo version — không phải tên module). Category chưa có
@@ -1018,7 +1023,13 @@ def _wapiti_scan(**kw):
     # ── v1.5.5: FORM SWEEP — tự tìm SQLi trên form POST từ session DB wapiti
     # (không cần user trỏ tay vào URL form). Chạy NGAY CẢ khi wapiti 0 finding;
     # kết quả merge vào findings TRƯỚC early-return và trước summary/auto-exploit.
-    sweep_findings, sweep_logs = _form_sweep(url, session_dir, budget,
+    # v1.5.8 (Bug C): sweep nhận budget CÒN LẠI (budget - elapsed) thay vì nguyên
+    # budget — trước đây sweep chạy sau wapiti với đầy đủ budget nên có thể ăn
+    # thêm hàng trăm giây, đẩy tổng thời gian vượt xa giới hạn khai báo. Trần
+    # _WAPITI_SWEEP_MAX_BUDGET giữ sweep ở mức bổ trợ; sàn 30s cho ít nhất vài field.
+    elapsed = time.monotonic() - t0
+    sweep_budget = max(30, min(int(budget - elapsed), _WAPITI_SWEEP_MAX_BUDGET))
+    sweep_findings, sweep_logs = _form_sweep(url, session_dir, sweep_budget,
                                              req_timeout, cookie=str(kw.get("cookie") or ""))
     if sweep_findings:
         existing = {(f["category"], f["method"], f["path"], f["parameter"])
@@ -1032,7 +1043,8 @@ def _wapiti_scan(**kw):
                                      x["category"], x["path"]), reverse=True)
 
     lines = [f"[✓] wapiti QUÉT XONG (v{ver}) — {rep['target']} "
-             f"[scope={rep['scope']}, {craw} URL/form, {len(findings)} mục]"]
+             f"[scope={rep['scope']}, {craw} URL/form, {len(findings)} mục, "
+             f"{elapsed:.0f}s]"]
     if sweep_logs:
         lines.append("[i] FORM SWEEP (tự tìm SQLi trên form POST):")
         lines.extend(sweep_logs)

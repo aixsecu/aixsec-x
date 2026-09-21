@@ -30,10 +30,22 @@ from llm import InjectionGuard, ollama_chat
 from prompts import SYSTEM_PROMPT, build_system_prompt
 from scope import ScopePolicy, normalize_host
 from tools import (TOOL_REGISTRY, TOOL_INDEX, TOOL_BINS, TOOL_TIMEOUTS,
-                   LONG_RUN_TOOLS, available_tools)
+                   LONG_RUN_TOOLS, available_tools, _WAPITI_FIX)
 
 # ── terminal colors (AIXSEC-X style) ──
-VERSION = "1.5.7"
+VERSION = "1.5.8"
+
+# v1.5.8 (Bug A): chuỗi lỗi LLM từ llm.py — nhận diện để KHÔNG đếm là plan-only
+# (trước đây timeout bị coi là "văn bản kế hoạch" → plan_only=2 → forced break →
+# final round cũng timeout → final_text = chuỗi lỗi → ledger rỗng dù wapiti đã
+# chạy thành công). Lần 1: thử lại (model có thể đang load). Lần 2 liên tiếp:
+# coi model down → tổng hợp findings từ tool output thật (Bug B).
+_LLM_FAIL_PREFIXES = ("[!] Ollama timeout", "[!] Cannot reach Ollama",
+                       "[!] Ollama error")
+
+
+def _llm_failure(content: str) -> bool:
+    return (content or "").strip().startswith(_LLM_FAIL_PREFIXES)
 
 # v1.5.2: wapiti-first gate — web scope active mà wapiti_scan CHƯA chạy
 # (chưa có outcome=ok/error) thì final JSON bị từ chối và model bị ép gọi
@@ -288,6 +300,8 @@ class WebXAgent:
         max_rounds = self.config["max_rounds"]
         result = {"risk_level": "UNKNOWN", "overall_summary": "", "final_text": "", "calls": 0}
         forced = False  # dừng sớm: round thoái hóa → ép trả JSON ngay
+        llm_down = False  # v1.5.8 (Bug A/B): model down (2 lỗi LLM liên tiếp)
+        self._llm_fail = 0  # v1.5.8: bộ đếm lỗi LLM liên tiếp (reset mỗi run)
         self._plan_only = 0  # v1.4.3: reset bộ đếm plan-only mỗi run()
         self._wapiti_done = False  # v1.5.2: reset wapiti-first gate mỗi run()
         self._no_wapiti_json = 0   # v1.5.2: reset bộ đếm JSON-thiếu-wapiti
@@ -300,6 +314,24 @@ class WebXAgent:
             if not calls:
                 disp.done()
                 result["final_text"] = resp.get("content", "")
+                # v1.5.8 (Bug A): chuỗi lỗi LLM (timeout/không kết nối) KHÔNG
+                # phải văn bản kế hoạch — trước đây bị đếm plan_only → forced
+                # break sớm + final round cũng timeout → ledger rỗng dù wapiti
+                # đã chạy ok. Lần 1: thử lại (model có thể đang load). Lần 2
+                # liên tiếp: model down → dừng sớm, tổng hợp từ tool output thật.
+                if _llm_failure(result["final_text"]):
+                    self._llm_fail += 1
+                    if self._llm_fail >= 2:
+                        forced = True
+                        llm_down = True
+                        break
+                    msgs.append({"role": "assistant", "content": result["final_text"]})
+                    msgs.append({"role": "user", "content":
+                                "⚠ Lỗi kết nối model (timeout) — có thể model "
+                                "đang load. Thử lại lượt này: gọi ÍT NHẤT 1 "
+                                "function call NGAY, không cần văn bản dài."})
+                    continue
+                self._llm_fail = 0  # phản hồi thật → reset bộ đếm lỗi LLM
                 if self._looks_like_json(result["final_text"]):
                     self._commit_findings(result)
                     try:
@@ -361,6 +393,7 @@ class WebXAgent:
                     break
                 continue
             self._plan_only = 0  # lượt có tool call thật → reset bộ đếm plan-only
+            self._llm_fail = 0   # v1.5.8: lượt có tool call thật → model OK
 
             # chạy tool tuần tự: in lệnh → dedup/block → dispatch → kết quả kèm thời gian
             results = []
@@ -506,11 +539,31 @@ class WebXAgent:
                             "nữa — trả final JSON trung thực với dữ liệu đã thu; "
                             "nếu chưa đủ bằng chứng, risk_level=UNKNOWN là kết quả "
                             "trung thực (đừng bịa dữ liệu scan)."})
+        # v1.5.8 (Bug B): model đã down (2 lỗi liên tiếp) → BỎ final chat
+        # (tiết kiệm 300s chắc chắn timeout) và tổng hợp findings từ tool
+        # output THẬT trong history (wapiti đã chạy ok). Nếu final chat vẫn
+        # lỗi → fallback tổng hợp tương tự.
+        if llm_down:
+            result["llm_down"] = True
+            result["llm_note"] = ("[!] Model không phản hồi (Ollama timeout) — "
+                                  "kết quả được tổng hợp từ tool output thật "
+                                  "của phiên (không có phân tích của model).")
+            self._synthesize_findings_json(result)
+            self._commit_findings(result)
+            return result
         disp = _LiveDisplay(0 if forced else max_rounds, max_rounds)
         resp = self.chat(msgs, tools=[t.schema() for t in self.tools], json_mode=True,
                          on_token=disp.on_token, on_reasoning=disp.on_reasoning)
         disp.done()
         result["final_text"] = resp.get("content", "")
+        if _llm_failure(result["final_text"]):
+            result["llm_down"] = True
+            result["llm_note"] = ("[!] Model không phản hồi ở final round — "
+                                  "kết quả được tổng hợp từ tool output thật "
+                                  "của phiên (không có phân tích của model).")
+            self._synthesize_findings_json(result)
+            self._commit_findings(result)
+            return result
         self._commit_findings(result)
         try:
             d = json.loads(result["final_text"]) if result["final_text"].strip().startswith("{") else {}
@@ -530,6 +583,79 @@ class WebXAgent:
     @staticmethod
     def _looks_like_json(t: str) -> bool:
         return t.strip().startswith("{") or "findings" in t[:200]
+
+    def _synthesize_findings_json(self, result: dict) -> None:
+        """v1.5.8 (Bug B): model down → tổng hợp findings từ tool output THẬT
+        trong history (wapiti_scan đã chạy ok). Chỉ parse dòng detail wapiti:
+        `[SEVERITY] CATEGORY (param=X) — METHOD /path [module=...]` + dòng
+        `    → ` theo sau (bỏ wstg:/curl:). Dừng ở marker `[✓] TỔNG HỢP LỖ
+        HỔNG` — phần summary có dòng no-param match regex → duplicate. Không
+        bịa: không có dòng nào → risk UNKNOWN, findings rỗng."""
+        detail_re = re.compile(
+            r"^\[(CRITICAL|HIGH|MEDIUM|LOW|INFO)\]\s+(.+?)(?:\s+\(param=([^)]+)\))?"
+            r"\s+—\s+(\S+)\s+(\S+)(?:\s+\[module=([^\]]+)\])?$")
+        scope_re = re.compile(r"\[✓\] wapiti QUÉT XONG.*—\s+(\S+)\s+\[scope=")
+        stop_marker = "[✓] TỔNG HỢP LỖ HỔNG"
+        seen: set = set()
+        findings: list[dict] = []
+        target = ""
+        for msg in self._history():
+            text = msg.get("output") or ""
+            if not text:
+                continue
+            if not target:
+                m = scope_re.search(text)
+                if m:
+                    target = m.group(1)
+            lines = text.splitlines()
+            for i, line in enumerate(lines):
+                if stop_marker in line:
+                    break
+                m = detail_re.match(line.strip())
+                if not m:
+                    continue
+                sev, cat, param, method, path, module = m.groups()
+                key = (cat, method, path, param)
+                if key in seen:
+                    continue
+                seen.add(key)
+                detail = ""
+                if i + 1 < len(lines):
+                    nxt = lines[i + 1].strip()
+                    if nxt.startswith("→") and not nxt.startswith(("→ wstg:", "→ curl:")):
+                        detail = nxt[1:].strip()
+                desc = f"{cat} phát hiện bởi wapiti (module={module or '?'})"
+                if detail:
+                    desc += f" — {detail}"
+                findings.append({
+                    "name": cat,
+                    "severity": sev.lower(),
+                    "url": f"{target}{path}" if target else path,
+                    "port": "",
+                    "service": "",
+                    "description": desc,
+                    "fix": _WAPITI_FIX.get(cat, _WAPITI_FIX.get("_default", "")),
+                    "cves": [],
+                    "source": "wapiti_scan (auto — model down)",
+                })
+        rank = {"critical": 4, "high": 3, "medium": 2, "low": 1, "info": 0}
+        findings.sort(key=lambda f: rank.get(f["severity"], 0), reverse=True)
+        result["risk_level"] = findings[0]["severity"] if findings else "UNKNOWN"
+        if findings:
+            result["overall_summary"] = (
+                f"Tổng hợp tự động từ tool output thật (wapiti_scan) — model "
+                f"không phản hồi (Ollama timeout) nên không có phân tích của "
+                f"model. {len(findings)} finding từ wapiti.")
+        else:
+            result["overall_summary"] = (
+                "Model không phản hồi (Ollama timeout) và không có finding nào "
+                "tổng hợp được từ tool output — risk UNKNOWN là kết quả trung thực.")
+        result["findings"] = findings
+        result["final_text"] = json.dumps({
+            "risk_level": result["risk_level"],
+            "overall_summary": result["overall_summary"],
+            "findings": findings,
+        }, ensure_ascii=False, indent=2)
 
     def _mentioned_tools(self, text: str) -> list[str]:
         """Tên tool đăng ký xuất hiện trong văn bản model — để nhắc model gọi
@@ -916,6 +1042,8 @@ def main():
         prompt_text = one_shot if isinstance(one_shot, str) else \
             "Hãy phân tích và khai thác target trong scope. Bắt đầu bằng recon rồi active check. Khi đủ dữ liệu trả JSON findings."
         result = agent.run(prompt_text)
+        if result.get("llm_down"):
+            print("\n" + result.get("llm_note", ""))
         print("\n" + result.get("final_text", "")[:3000])
         _print_findings(agent)
         print(f"\n[*] Report: {agent.export_report()}")
@@ -944,6 +1072,8 @@ def main():
             print(f"[*] Saved: {agent.export_report()}")
             continue
         result = agent.run(line)
+        if result.get("llm_down"):
+            print("\n" + result.get("llm_note", ""))
         print("\n" + (result.get("final_text", "") or "(no response)")[:4000])
         if result.get("overall_summary"):
             print(f"\n[RISK] {result['risk_level']}\n[SUMMARY] {result['overall_summary']}")

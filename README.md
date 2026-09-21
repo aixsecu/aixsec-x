@@ -433,6 +433,31 @@ better than long prompts. `prompts.py` ships 2 variants with auto-selection:
   `break_long_words=True`, splitting `**ffuf_dir**` across a wrap boundary as
   `**ff` / `uf_dir**`. Now `break_long_words=False, break_on_hyphens=False` —
   long words jump to the next line whole.
+- **v1.5.8 — LLM-timeout resilience + wapiti form-sweep budget cap:** three
+  fixes for the "model times out, ledger stays empty" failure mode seen on
+  slow local LLMs (Ollama):
+  - **Bug A (LLM timeout counted as plan-only):** an `[!] Ollama timeout` /
+    connection-error response is no longer treated as a plan-only round
+    (which forced an early break and then burned a guaranteed-300s final
+    round). The first consecutive LLM error now triggers ONE retry with a
+    "model may still be loading" hint; a second consecutive error marks the
+    model down.
+  - **Bug B (model down → empty ledger + 300s wasted final chat):** after two
+    consecutive LLM errors the agent SKIPS the final chat entirely and
+    synthesizes findings from the REAL tool output already in the session
+    history (auto wapiti still runs at the tail first). Detail lines
+    `[SEV] CATEGORY (param=X) — METHOD /path [module=...]` + following
+    `→ ` lines are parsed (stopping at the `[✓] TỔNG HỢP LỖ HỔNG` marker),
+    deduped, sorted by severity, fix text taken from `_WAPITI_FIX`, and
+    committed to the ledger with `source: wapiti_scan (auto — model down)`.
+    If the final chat itself errors, the same fallback synthesis runs. The
+    result is marked `llm_down: true` with an honest `llm_note`.
+  - **Bug C (wapiti form sweep ate the whole budget):** the POST-form SQLi
+    sweep ran after wapiti with the FULL remaining budget (e.g. 1200s), which
+    is why `wapiti_scan` could take 965.7s despite `max_scan_time=120`. The
+    sweep now receives only the REMAINING budget and is hard-capped at
+    `_WAPITI_SWEEP_MAX_BUDGET = 240s` (30s floor).
+  Test suite v1.5.8: **229 OK** (+4 new: `TestLlmDownSynthesis`).
 - **v1.5.7 — DB engine consistency:** fixed the chain where wapiti reported a
   MySQL SQLi but downstream steps still tried `mssql`. The engine is now
   resolved at the entry point: `engine='auto'` → guessed from response headers

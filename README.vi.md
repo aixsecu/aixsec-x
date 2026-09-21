@@ -406,6 +406,27 @@ Model 7B/9B (vd: `huihui_ai/qwen3.5-abliterated:9b`) tuân theo **ít quy tắc*
   với `break_long_words=True` làm tách `**ffuf_dir**` thành `**ff` + `uf_dir**`.
   Giờ dùng `break_long_words=False, break_on_hyphens=False` — từ dài nhảy
   trọn sang dòng tiếp theo.
+- **v1.5.8 — Chống chịu LLM-timeout + trần budget form sweep wapiti:** sửa 3
+  lỗi trong chuỗi "model timeout → ledger rỗng" gặp trên LLM local chậm
+  (Ollama):
+  - **Bug A (lỗi LLM bị đếm là plan-only):** phản hồi `[!] Ollama timeout` /
+    lỗi kết nối KHÔNG còn bị coi là lượt văn bản kế hoạch (trước đây gây
+    forced break sớm rồi đốt thêm 300s chắc chắn timeout ở final round). Lỗi
+    LLM liên tiếp lần 1 → THỬ LẠI một lần kèm gợi ý "model có thể đang load";
+    lỗi lần 2 liên tiếp → coi model down.
+  - **Bug B (model down → ledger rỗng + final chat 300s vô ích):** sau 2 lỗi
+    LLM liên tiếp agent BỎ final chat và tổng hợp findings từ tool output
+    THẬT trong history (auto wapiti vẫn chạy ở tail trước đó). Parse dòng
+    detail `[SEV] CATEGORY (param=X) — METHOD /path [module=...]` + dòng `→ `
+    theo sau (dừng ở marker `[✓] TỔNG HỢP LỖ HỔNG`), dedupe, sắp xếp theo
+    severity, fix lấy từ `_WAPITI_FIX`, commit vào ledger với `source:
+    wapiti_scan (auto — model down)`. Final chat lỗi → fallback tổng hợp
+    tương tự. Kết quả đánh dấu `llm_down: true` kèm `llm_note` trung thực.
+  - **Bug C (form sweep ăn hết budget):** sweep SQLi trên form POST chạy SAU
+    wapiti với NGUYÊN budget còn lại (vd 1200s) — lý do `wapiti_scan` chạy
+    965.7s dù `max_scan_time=120`. Sweep giờ chỉ nhận budget CÒN LẠI và bị
+    trần cứng `_WAPITI_SWEEP_MAX_BUDGET = 240s` (sàn 30s).
+  Test suite v1.5.8: **229 OK** (+4 mới: `TestLlmDownSynthesis`).
 - **v1.5.7 — ĐỒNG BỘ DB ENGINE (engine-consistency):** sửa chuỗi lỗi khi wapiti
   báo SQLi MySQL nhưng các bước sau vẫn cố thử `mssql`. Engine giờ được resolve
   NGAY ở entry-point: `engine='auto'` → đoán từ response headers qua
