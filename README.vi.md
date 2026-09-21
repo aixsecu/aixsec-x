@@ -134,9 +134,9 @@ python3 agent.py        # interactive — hỏi từng mục, để TRỐNG mụ
 ```
 [*] No web target declared (WEBX_TARGETS).
     Enter authorized targets, comma-separated
-    (e.g. https://abc.vn,10.0.0.0/8) — press ENTER to skip if
+    (e.g. https://example.com,10.0.0.0/8) — press ENTER to skip if
     this session is SOURCE-CODE ANALYSIS only:
-aixsec-target> https://abc.vn
+aixsec-target> https://example.com
 [*] No source directory declared (WEBX_SRC_DIRS).
     Enter code directories allowed for SAST scanning, comma-separated
     (e.g. /var/www/html) — press ENTER to skip if sast_scan is unused:
@@ -170,6 +170,7 @@ Chế độ `--non-interactive`/`--oneshot` chỉ đọc env (không hỏi) — 
 | `WEBX_MODEL` | `qwen2.5:7b` | Model Ollama (gợi ý: `huihui_ai/qwen3.5-abliterated:9b`) |
 | `WEBX_THINK` | `0` | `1`=bật thinking mode (không khuyến nghị khi dùng function calling) |
 | `WEBX_AUTO_EXEC` | `ask` | `ask`=hỏi operator với tool noisy/active; `safe`=chỉ tự chạy tool an toàn; `all`=tự chạy hết (rủi ro) |
+| `WEBX_AI_NATIVE` | `0` | **v1.5.6** `1`=chế độ AI-NATIVE: model TỰ phân tích lỗ hổng qua `http_request` (không bắt buộc wapiti/sqlmap; final JSON cần ≥1 response `http_request` thật) |
 | `WEBX_MAX_ROUNDS` | `8` | Số vòng tool-call tối đa mỗi lượt (thấp hơn = nhanh/rẻ hơn; model 9B trên máy 4 vCPU có thể mất 20–30 phút/vòng) |
 | `WEBX_TOOL_TIMEOUT` | `90` | Timeout mỗi tool (giây) |
 | `WEBX_LLM_TIMEOUT` | `300` | Timeout tối đa chờ model trả lời mỗi lượt (giây); model 9B trên CPU có thể mất 1–3 phút |
@@ -405,6 +406,20 @@ Model 7B/9B (vd: `huihui_ai/qwen3.5-abliterated:9b`) tuân theo **ít quy tắc*
   với `break_long_words=True` làm tách `**ffuf_dir**` thành `**ff` + `uf_dir**`.
   Giờ dùng `break_long_words=False, break_on_hyphens=False` — từ dài nhảy
   trọn sang dòng tiếp theo.
+- **v1.5.7 — ĐỒNG BỘ DB ENGINE (engine-consistency):** sửa chuỗi lỗi khi wapiti
+  báo SQLi MySQL nhưng các bước sau vẫn cố thử `mssql`. Engine giờ được resolve
+  NGAY ở entry-point: `engine='auto'` → đoán từ response headers qua
+  `_sweep_engine` (cache theo host, mặc định mysql); giá trị không hợp lệ →
+  mysql. Mọi hint downstream (WAF `--dbms=`, extraction-failed `sqlmap_runner
+  {"dbms": ...}`, sqlmap_cmd) dùng ĐÚNG engine đã resolve — KHÔNG coerce
+  unknown → mssql, `auto` KHÔNG bao giờ thành `--dbms=auto`. Wapiti AUTO-EXPLOIT
+  hint `engine` theo DBMS trong dòng info finding ('DBMS: MySQL' → mysql,
+  'Microsoft SQL Server' → mssql, không rõ → auto). `sqli_manual_test`
+  next-step echo đúng `dbms:'<engine>'`; `sqli_blind_poc.TimeBlindExploiter`
+  bỏ `--dbms` khi engine unknown. System prompt (luật ENGINE-CONSISTENCY EN /
+  ĐỒNG BỘ ENGINE VI) + ToolSpec enum `["mysql", "mssql", "auto"]` cập nhật.
+  Test suite v1.5.7: **225 OK** (+14 mới: `TestManualTestNextStep` 3,
+  `TestSqliBlindEngineConsistency` 8, `TestWapitiScan` 2, `TestPromptRules` 1).
 - **v1.5.6 — Dọn banner: bỏ khối ASCII mặt nạ Anonymous** (hình `.888.` đọc
   thành chữ "AAO") theo yêu cầu user. Banner giờ mở thẳng bằng logo AIXSEC-X
   xanh. Test suite v1.5.6: **211 OK** (sửa test banner: mặt nạ đã bỏ + logo
@@ -424,9 +439,16 @@ Model 7B/9B (vd: `huihui_ai/qwen3.5-abliterated:9b`) tuân theo **ít quy tắc*
   nối thêm khối luật AI-NATIVE. Test suite v1.5.6: **211 OK** (+18 mới:
   `TestHttpRequestTool` 8, `TestAiNativeGate` 6, `TestPromptAiNative` 2,
   `TestLedgerHttpRequestEvidence` 2).
+- **v1.5.6 — Dọn domain thật: thay toàn bộ domain test Việt Nam thật bằng
+  `example.*` dành riêng RFC** trong code, test và docs: `example.com`
+  (gồm host test `h{n}.example.com`, `hoisach.example.com`),
+  `example.org` (host finding riêng). Test vốn dựa ngầm vào wildcard DNS
+  thật của domain live-test đã xóa giờ dùng fake `socket.getaddrinfo`;
+  test path-claim dùng `example.org` làm host finding. Test suite v1.5.6:
+  **211 OK**.
 - **v1.5.5 — wapiti_scan TỰ QUÉT form POST: chỉ cần nhập ROOT DOMAIN, tool tự
-  tìm SQLi trên form (bài học tbu.edu.vn):** wapiti crawl
-  `https://tbu.edu.vn/WebTinTuc/TimKiem?page=1..52` và module `sql` đốt hết
+  tìm SQLi trên form (bài học example.com):** wapiti crawl
+  `https://example.com/WebTinTuc/TimKiem?page=1..52` và module `sql` đốt hết
   `--max-attack-time` vào 52 URL `?page=N` trước khi chạm tới form POST
   thực sự dính lỗi (`keyword`) — nên tool báo SQLi GIẢ ở `page` và BỎ SÓT
   lỗi thật. v1.5.5 sửa cả 2 đầu:
@@ -595,7 +617,7 @@ Model 7B/9B (vd: `huihui_ai/qwen3.5-abliterated:9b`) tuân theo **ít quy tắc*
   Template này KHÔNG có conversion oracle lẫn time-based channel → sqlmap là
   hy vọng khai thác duy nhất. Test suite v1.4.7: **149 OK**.
 - **v1.4.6 — Sửa shape oracle MSSQL (quote-then-paren):** ground-truth
-  tbu.edu.vn cho thấy context tìm kiếm bọc LIKE trong ngoặc, nên payload
+  example.com cho thấy context tìm kiếm bọc LIKE trong ngoặc, nên payload
   v1.4.5 cũ `' AND CONVERT(int,(expr))-- -` chỉ tạo lỗi syntax (oracle câm).
   v1.4.6 probe 3 shape với quote nằm ở TIỀN TỐ — `'{inner}-- -`,
   `'){inner}-- -`, `')){inner}-- -` với `inner = " AND CONVERT(int,({expr}))"`
@@ -625,7 +647,7 @@ Model 7B/9B (vd: `huihui_ai/qwen3.5-abliterated:9b`) tuân theo **ít quy tắc*
   `WAITFOR`/`CONVERT` thường vẫn lộ qua payload error-based vô hại xử lý bằng
   pipeline tamper của sqlmap.
 - **v1.4.5 — `sqli_blind_extract` form POST (method/param/data):** case live-run
-  tbu.edu.vn là FORM tìm kiếm — gọi
+  example.com là FORM tìm kiếm — gọi
   `sqli_blind_extract{url, action, engine:'mssql', method:'post', param:'keyword',
   data:'keyword=tin tuc'}`: tool định vị form từ `data`, inject probe vào param
   đó, detect bằng quote/comment style (mode=form) và báo
@@ -648,8 +670,8 @@ Model 7B/9B (vd: `huihui_ai/qwen3.5-abliterated:9b`) tuân theo **ít quy tắc*
   (`/admincp`, `/WebTinTuc/TimKiem`) PHẢI xuất hiện trong tool output OK CỦA
   CÙNG host (`_PATH_TOKENS` regex, strip scheme URL trước, min 3 ký tự). Path
   chỉ thấy trên host khác (hoặc không đâu) → `⚠ path không có bằng chứng trên
-  host này`. Sửa đúng bệnh live-run: AI báo `https://tbu.edu.vn/admincp` trong
-  khi không tool nào thấy `/admincp` trên tbu.edu.vn. Probe set mở rộng thêm
+  host này`. Sửa đúng bệnh live-run: AI báo `https://example.com/admincp` trong
+  khi không tool nào thấy `/admincp` trên example.com. Probe set mở rộng thêm
   `find_forms`/`sqli_manual_test`/`sqli_blind_extract` để output recon thật
   được tính là bằng chứng probe.
 - **v1.4.4 — `find_forms` (form là chỗ SQLi dễ sót #1):** nikto/nuclei/
@@ -663,7 +685,7 @@ Model 7B/9B (vd: `huihui_ai/qwen3.5-abliterated:9b`) tuân theo **ít quy tắc*
   `AND SLEEP(3)`, tool gửi trước `test` vs `test'` vs `test''`: nếu quote đơn làm
   hỏng query (500 / lệch size) còn quote kép khớp baseline thì điểm inject ĐƯỢC
   XÁC NHẬN mà không cần engine hay SLEEP (chạy đúng form tìm kiếm MSSQL thật
-  tbu.edu.vn nơi `--` vô dụng). Chỉ khi quote-differential âm mới fallback
+  example.com nơi `--` vô dụng). Chỉ khi quote-differential âm mới fallback
   time-based, giờ hiểu engine: `engine=mysql` → `SLEEP(n)`, `engine=mssql` →
   `WAITFOR DELAY '0:0:n'`, `engine=auto` (mặc định) đoán từ headers
   (ASP.NET/IIS/ASP.NET_SessionId → mssql, PHP → mysql). Trả verdict

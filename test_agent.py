@@ -6,6 +6,7 @@ import json
 import os
 import re
 import shutil
+import socket
 import sqlite3
 import sys
 import tempfile
@@ -31,10 +32,10 @@ from llm import InjectionGuard  # noqa: E402
 FINAL_JSON = json.dumps({
     "findings": [
         {"name": "SQL Injection tại /product.php", "severity": "high",
-         "url": "https://abc.vn/product.php", "service": "PHP",
+         "url": "https://example.com/product.php", "service": "PHP",
          "description": "Tham số id không được sanitize",
          "fix": "Prepared statements", "cves": ["CVE-2024-0001"]},
-        {"name": "Missing CSP", "severity": "low", "url": "https://abc.vn/",
+        {"name": "Missing CSP", "severity": "low", "url": "https://example.com/",
          "description": "Không có header CSP", "fix": "Thêm CSP", "cves": []},
     ],
     "risk_level": "HIGH",
@@ -61,17 +62,17 @@ class FakeChat:
         if self.script:
             return self.script.pop(0)
         if self.always_tools:
-            # host đổi MỖI vòng → không bị dedup/URL-block; round n gọi h{n}.abc.vn
+            # host đổi MỖI vòng → không bị dedup/URL-block; round n gọi h{n}.example.com
             n = len(self.calls) + 1
             return {"content": "", "tool_calls": [
-                {"name": "dns_lookup", "arguments": {"host": f"h{n}.abc.vn"}}]}
+                {"name": "dns_lookup", "arguments": {"host": f"h{n}.example.com"}}]}
         return {"content": FINAL_JSON, "tool_calls": []}
 
 
 def cfg(extra=None):
     base = {"ollama_url": "http://x", "model": "m", "max_rounds": 9,
             "tool_timeout": 10, "output_cap": 5000,
-            "targets": ["https://abc.vn", "10.0.0.0/8"],
+            "targets": ["https://example.com", "10.0.0.0/8"],
             "src_dirs": [],
             "auto_exec": "all", "temperature": 0.1, "num_ctx": 4096, "db": {}}
     base.update(extra or {})
@@ -80,17 +81,17 @@ def cfg(extra=None):
 
 class TestScope(unittest.TestCase):
     def test_url_in_scope(self):
-        p = ScopePolicy(["https://abc.vn", "10.0.0.0/8"])
-        self.assertTrue(p.in_scope("https://abc.vn/product.php?id=1"))
-        self.assertTrue(p.in_scope("https://sub.abc.vn/"))
+        p = ScopePolicy(["https://example.com", "10.0.0.0/8"])
+        self.assertTrue(p.in_scope("https://example.com/product.php?id=1"))
+        self.assertTrue(p.in_scope("https://sub.example.com/"))
         self.assertFalse(p.in_scope("https://evil.org/"))
         self.assertTrue(p.in_scope("10.10.1.1"))
         self.assertFalse(p.in_scope("8.8.8.8"))
-        self.assertFalse(p.in_scope("http://abc.vn.evil.org"))
+        self.assertFalse(p.in_scope("http://example.com.evil.org"))
 
     def test_no_scope_locks_tools(self):
         p = ScopePolicy([])
-        self.assertIn("[SCOPE]", p.check_param("nuclei_scan", "url", "https://abc.vn"))
+        self.assertIn("[SCOPE]", p.check_param("nuclei_scan", "url", "https://example.com"))
 
 
 class TestInjectionGuard(unittest.TestCase):
@@ -118,7 +119,7 @@ class TestLedger(unittest.TestCase):
             led.add(f)
         plan = validation_plan(led)
         self.assertEqual(len(plan), 2)
-        self.assertIsInstance(render_markdown(led, "abc.vn", plan), str)
+        self.assertIsInstance(render_markdown(led, "example.com", plan), str)
 
 
 class TestAgentLoop(unittest.TestCase):
@@ -139,11 +140,11 @@ class TestAgentLoop(unittest.TestCase):
     def test_tool_then_final(self):
         script = [
             {"content": "Đang probe...", "tool_calls": [
-                {"name": "http_probe", "arguments": {"url": "https://abc.vn/"}}]},
+                {"name": "http_probe", "arguments": {"url": "https://example.com/"}}]},
             {"content": FINAL_JSON, "tool_calls": []},
         ]
         a = self._agent(script=script)
-        res = a.run("Phân tích abc.vn")
+        res = a.run("Phân tích example.com")
         self.assertEqual(len(a.ledger.all()), 2)
         self.assertEqual(res["risk_level"], "HIGH")
         # v1.5.2: round tool + 1 auto wapiti ở tail (stub error → gate mở)
@@ -163,7 +164,7 @@ class TestAgentLoop(unittest.TestCase):
     def test_unknown_tool_error(self):
         script = [
             {"content": "", "tool_calls": [
-                {"name": "rm_rf", "arguments": {"url": "https://abc.vn/"}}]},
+                {"name": "rm_rf", "arguments": {"url": "https://example.com/"}}]},
             {"content": FINAL_JSON, "tool_calls": []},
         ]
         a = self._agent(script=script)
@@ -174,7 +175,7 @@ class TestAgentLoop(unittest.TestCase):
         # auto_exec mặc định 'ask' → tool active* bị từ chối khi input không phải 'y'
         script = [
             {"content": "", "tool_calls": [
-                {"name": "nuclei_scan", "arguments": {"url": "https://abc.vn/"}}]},
+                {"name": "nuclei_scan", "arguments": {"url": "https://example.com/"}}]},
             {"content": FINAL_JSON, "tool_calls": []},
         ]
         with patch("builtins.input", return_value="n"):
@@ -184,7 +185,12 @@ class TestAgentLoop(unittest.TestCase):
 
     def test_budget_enforced(self):
         a = self._agent(always_tools=True)
-        res = a.run("test")
+        # h{n}.example.com không tồn tại trên DNS thật → fake resolution để
+        # vòng lặp chạy đủ budget (bản cũ dựa ngầm vào wildcard DNS của domain
+        # thật đã được thay bằng example.*)
+        fake = [(socket.AF_INET, socket.SOCK_STREAM, 6, "", "93.184.216.34")]
+        with patch("socket.getaddrinfo", return_value=fake):
+            res = a.run("test")
         # v1.5.2: loại entry auto (round=0) do _auto_wapiti thêm ở tail
         rounds = [t for t in a.transcript
                   if t["type"] == "tools" and t.get("round", 0) > 0]
@@ -198,10 +204,10 @@ class TestAgentLoop(unittest.TestCase):
         script = [
             {"content": "", "tool_calls": [
                 {"name": "nuclei_scan",
-                 "arguments": {"url": "https://abc.vn/", "severity": "medium"}}]},
+                 "arguments": {"url": "https://example.com/", "severity": "medium"}}]},
             {"content": "", "tool_calls": [
                 {"name": "nuclei_scan",
-                 "arguments": {"url": "https://abc.vn/", "severity": "medium"}}]},
+                 "arguments": {"url": "https://example.com/", "severity": "medium"}}]},
             {"content": FINAL_JSON, "tool_calls": []},
         ]
         a = self._agent(script=script)
@@ -231,7 +237,7 @@ class TestAgentLoop(unittest.TestCase):
         script = [
             {"content": "", "tool_calls": [
                 {"name": "nuclei_scan",
-                 "arguments": {"url": f"https://abc.vn/?a={i}", "severity": f"low{i}"}}]}
+                 "arguments": {"url": f"https://example.com/?a={i}", "severity": f"low{i}"}}]}
             for i in range(1, 5)
         ] + [{"content": FINAL_JSON, "tool_calls": []}]
         a = self._agent(script=script)
@@ -262,10 +268,10 @@ class TestAgentLoop(unittest.TestCase):
         script = [
             {"content": "", "tool_calls": [
                 {"name": "nuclei_scan",
-                 "arguments": {"url": "https://abc.vn/", "severity": "low"}}]},
+                 "arguments": {"url": "https://example.com/", "severity": "low"}}]},
             {"content": "", "tool_calls": [
                 {"name": "nuclei_scan",
-                 "arguments": {"url": "https://abc.vn/", "severity": "high"}}]},
+                 "arguments": {"url": "https://example.com/", "severity": "high"}}]},
             {"content": FINAL_JSON, "tool_calls": []},
         ]
         a = WebXAgent(config=cfg({"auto_exec": "ask"}), chat=FakeChat(script=script))
@@ -295,9 +301,9 @@ class TestAgentLoop(unittest.TestCase):
         # final JSON ngay bằng dữ liệu đã thu thập.
         script = [
             {"content": "", "tool_calls": [
-                {"name": "http_probe", "arguments": {"url": "https://abc.vn/"}}]},
+                {"name": "http_probe", "arguments": {"url": "https://example.com/"}}]},
             {"content": "", "tool_calls": [
-                {"name": "http_probe", "arguments": {"url": "https://abc.vn/"}}]},
+                {"name": "http_probe", "arguments": {"url": "https://example.com/"}}]},
         ]
         a = self._agent(script=script)
         res = a.run("test")
@@ -336,7 +342,7 @@ class TestPlanOnlyGuard(unittest.TestCase):
         # (stub error); round5 ép trả JSON json_mode.
         script = [
             {"content": "", "tool_calls": [
-                {"name": "http_probe", "arguments": {"url": "https://abc.vn/"}}]},
+                {"name": "http_probe", "arguments": {"url": "https://example.com/"}}]},
             {"content": "Tôi sẽ fuzz thư mục với ffuf_dir và kiểm tra thêm nuclei.",
              "tool_calls": []},
             {"content": FINAL_JSON, "tool_calls": []},
@@ -419,11 +425,11 @@ class TestWapitiGate(unittest.TestCase):
         caught = {}
         script = [
             {"content": "", "tool_calls": [
-                {"name": "http_probe", "arguments": {"url": "https://abc.vn/"}}]},
+                {"name": "http_probe", "arguments": {"url": "https://example.com/"}}]},
             {"content": FINAL_JSON, "tool_calls": []},
             {"content": "", "tool_calls": [
                 {"name": "wapiti_scan", "arguments": {
-                    "url": "https://abc.vn/", "scope": "domain",
+                    "url": "https://example.com/", "scope": "domain",
                     "modules": "sql,xss,file,exec", "max_scan_time": 120}}]},
         ]
 
@@ -496,15 +502,15 @@ class TestWapitiGate(unittest.TestCase):
         script = [
             {"content": "", "tool_calls": [
                 {"name": "sqli_manual_test", "arguments": {
-                    "url": "https://abc.vn/product.php", "param": "id",
+                    "url": "https://example.com/product.php", "param": "id",
                     "method": "get", "data": "id=1"}}]},
             {"content": FINAL_JSON, "tool_calls": []},
             {"content": "", "tool_calls": [
                 {"name": "wapiti_scan", "arguments": {
-                    "url": "https://abc.vn/", "scope": "domain",
+                    "url": "https://example.com/", "scope": "domain",
                     "modules": "sql,xss,file,exec", "max_scan_time": 120}}]},
         ]
-        # sqli_manual_test thật gọi network (https://abc.vn) → fake bằng tay
+        # sqli_manual_test thật gọi network (https://example.com) → fake bằng tay
         with patch.object(TOOL_INDEX["sqli_manual_test"], "exec_fn",
                           lambda **kw: "confirmed: quote-differential (id)"), \
              patch.object(TOOL_INDEX["wapiti_scan"], "exec_fn",
@@ -525,11 +531,11 @@ class TestWapitiGate(unittest.TestCase):
         # (agent đã cố) → JSON round sau được chấp nhận, không auto chạy lại.
         script = [
             {"content": "", "tool_calls": [
-                {"name": "http_probe", "arguments": {"url": "https://abc.vn/"}}]},
+                {"name": "http_probe", "arguments": {"url": "https://example.com/"}}]},
             {"content": FINAL_JSON, "tool_calls": []},
             {"content": "", "tool_calls": [
                 {"name": "wapiti_scan", "arguments": {
-                    "url": "https://abc.vn/", "scope": "domain",
+                    "url": "https://example.com/", "scope": "domain",
                     "modules": "sql,xss,file,exec", "max_scan_time": 120}}]},
         ]
         with patch("tools.shutil.which", return_value=None):
@@ -595,7 +601,7 @@ class TestSQLiManualTest(unittest.TestCase):
         resp = self._mock_resp()
         with patch("requests.post", return_value=resp) as mp, \
              patch("requests.get", return_value=resp) as mg:
-            out = self._exec(url="https://abc.vn/WebTinTuc/TimKiem",
+            out = self._exec(url="https://example.com/WebTinTuc/TimKiem",
                              param="q", method="post", data="q=test")
         # v2: baseline + quote-single + quote-double + time-based (4 POST)
         posts = [c[1]["data"] for c in mp.call_args_list]
@@ -605,7 +611,7 @@ class TestSQLiManualTest(unittest.TestCase):
         self.assertEqual(mp.call_count, 4)
         self.assertEqual(mg.call_count, 0)                # không dùng GET
         self.assertEqual(mp.call_args_list[0][0][0],
-                         "https://abc.vn/WebTinTuc/TimKiem")
+                         "https://example.com/WebTinTuc/TimKiem")
         # auto → không có header DB → mặc định mysql; quote-diff âm tính (mock
         # đồng nhất) → rơi vào time-based → NOT_CONFIRMED
         self.assertIn("engine=mysql", out)
@@ -617,15 +623,15 @@ class TestSQLiManualTest(unittest.TestCase):
         # data truyền rác (kiểu v1.4.3) phải bị bỏ qua.
         resp = self._mock_resp()
         with patch("requests.post", return_value=resp) as mp:
-            self._exec(url="https://abc.vn/x", param="q", method="post",
+            self._exec(url="https://example.com/x", param="q", method="post",
                        data="param=1&junk=x")
-        self.assertEqual(mp.call_args_list[0][0][0], "https://abc.vn/x")
+        self.assertEqual(mp.call_args_list[0][0][0], "https://example.com/x")
         self.assertEqual(mp.call_args_list[0][1]["data"], {"q": "test"})
 
     def test_mssql_engine_uses_waitfor(self):
         resp = self._mock_resp()
         with patch("requests.post", return_value=resp) as mp:
-            self._exec(url="https://abc.vn/x", param="q", method="post",
+            self._exec(url="https://example.com/x", param="q", method="post",
                        engine="mssql", delay=3)
         last = mp.call_args_list[-1][1]["data"]
         self.assertEqual(last, {"q": "test' AND WAITFOR DELAY '0:0:3'-- -"})
@@ -634,13 +640,13 @@ class TestSQLiManualTest(unittest.TestCase):
         resp = self._mock_resp()
         with patch("requests.get", return_value=resp) as mg, \
              patch("requests.post", return_value=resp) as mp:
-            self._exec(url="https://abc.vn/x", param="id")
+            self._exec(url="https://example.com/x", param="id")
         self.assertEqual(mp.call_count, 0)
         urls = [c[0][0] for c in mg.call_args_list]
-        self.assertEqual(urls, ["https://abc.vn/x?id=test",
-                                "https://abc.vn/x?id=test'",
-                                "https://abc.vn/x?id=test''",
-                                "https://abc.vn/x?id=test' AND SLEEP(3)-- -"])
+        self.assertEqual(urls, ["https://example.com/x?id=test",
+                                "https://example.com/x?id=test'",
+                                "https://example.com/x?id=test''",
+                                "https://example.com/x?id=test' AND SLEEP(3)-- -"])
 
 
 class QuoteDiffHandler(BaseHTTPRequestHandler):
@@ -666,7 +672,7 @@ class QuoteDiffHandler(BaseHTTPRequestHandler):
 
 class TestQuoteDifferential(unittest.TestCase):
     """v1.4.4: sqli_manual_test xác nhận chèn qua KHÁC BIỆT quote — không cần
-    engine, không cần SLEEP (trường hợp thật: form tìm kiếm MSSQL tbu.edu.vn)."""
+    engine, không cần SLEEP (trường hợp thật: form tìm kiếm MSSQL example.com)."""
     server = None
 
     @classmethod
@@ -732,7 +738,7 @@ class TestTimeoutOutcome(unittest.TestCase):
              patch("tools.run_cmd", return_value=run_cmd_out):
             a = WebXAgent(config=cfg({"tool_timeout": tool_timeout}),
                           chat=FakeChat(script=[]))
-            return a._dispatch("nikto_scan", {"url": "https://abc.vn/"})
+            return a._dispatch("nikto_scan", {"url": "https://example.com/"})
 
     def test_timeout_is_error(self):
         r = self._dispatch_nikto("[!] Timeout sau 170s.")
@@ -761,7 +767,7 @@ class TestNiktoMaxtime(unittest.TestCase):
              patch("tools.run_cmd", side_effect=fake_run_cmd):
             a = WebXAgent(config=cfg({"tool_timeout": tool_timeout}),
                           chat=FakeChat(script=[]))
-            r = a._dispatch("nikto_scan", {"url": "https://abc.vn/"})
+            r = a._dispatch("nikto_scan", {"url": "https://example.com/"})
         return r, caught
 
     def test_capped_timeout_maxtime(self):
@@ -791,7 +797,7 @@ class TestDispatchExecTime(unittest.TestCase):
                           lambda **kw: "scan ok"):
             a = WebXAgent(config=cfg({"auto_exec": "ask"}),
                           chat=FakeChat(script=[]))
-            r = a._dispatch("nikto_scan", {"url": "https://abc.vn/"})
+            r = a._dispatch("nikto_scan", {"url": "https://example.com/"})
         self.assertEqual(r["outcome"], "ok")
         self.assertLess(r["exec_time"], 0.2)   # 0.3s chờ duyệt KHÔNG tính vào
 
@@ -812,6 +818,15 @@ class TestPromptRules(unittest.TestCase):
         self.assertIn("MAPPING WAPITI (v1.5.3)", SYSTEM_PROMPT_FULL)
         self.assertIn("→ khai thác", SYSTEM_PROMPT_FULL)
         self.assertIn("→ khắc phục", SYSTEM_PROMPT_FULL)
+
+
+    def test_prompt_engine_consistency_rules(self):
+        """v1.5.7: EN 5b + VI 6b đều có luật đồng bộ engine — CẤM ép mssql khi DBMS khác."""
+        self.assertIn("ENGINE-CONSISTENCY (v1.5.7)", SYSTEM_PROMPT_COMPACT)
+        self.assertIn("ĐỒNG BỘ ENGINE (v1.5.7)", SYSTEM_PROMPT_FULL)
+        self.assertIn("NEVER switch to engine:'mssql' when wapiti reported MySQL",
+                      SYSTEM_PROMPT_COMPACT)
+        self.assertIn('CẤM đổi sang engine: "mssql" khi wapiti', SYSTEM_PROMPT_FULL)
 
 
 class TestFindFormsRemoved(unittest.TestCase):
@@ -882,7 +897,7 @@ class TestToolTimeoutCap(unittest.TestCase):
              patch("tools.shutil.which", return_value="/usr/bin/arjun"):
             a = WebXAgent(config=cfg({"tool_timeout": 300}),
                           chat=FakeChat(script=[]))
-            r = a._dispatch("param_discovery", {"url": "https://abc.vn/"})
+            r = a._dispatch("param_discovery", {"url": "https://example.com/"})
         self.assertEqual(r["outcome"], "ok")
         # điều kiện cấu hình 300s nhưng cap param_discovery=60s phải thắng
         self.assertEqual(caught["t"], TOOL_TIMEOUTS["param_discovery"])
@@ -899,7 +914,7 @@ class TestToolTimeoutCap(unittest.TestCase):
         with patch.object(TOOL_INDEX["http_probe"], "exec_fn", fake_probe):
             a = WebXAgent(config=cfg({"tool_timeout": 300}),
                           chat=FakeChat(script=[]))
-            r = a._dispatch("http_probe", {"url": "https://abc.vn/"})
+            r = a._dispatch("http_probe", {"url": "https://example.com/"})
         self.assertEqual(r["outcome"], "ok")
         self.assertEqual(caught["t"], 300)  # không nằm trong cap → giữ nguyên
 
@@ -917,7 +932,7 @@ class TestToolTimeoutCap(unittest.TestCase):
              patch("tools.shutil.which", return_value="/usr/bin/wapiti"):
             a = WebXAgent(config=cfg({"tool_timeout": 90}),
                           chat=FakeChat(script=[]))
-            r = a._dispatch("wapiti_scan", {"url": "https://abc.vn/"})
+            r = a._dispatch("wapiti_scan", {"url": "https://example.com/"})
         self.assertEqual(r["outcome"], "ok")
         # cấu hình 90s nhưng sàn wapiti 600s phải thắng (không còn min())
         self.assertEqual(caught["t"], TOOL_TIMEOUTS["wapiti_scan"])
@@ -929,10 +944,10 @@ class TestScopePrompt(unittest.TestCase):
 
     def test_prompt_targets_only(self):
         # chỉ nhập target, src để trống → phiên web-only OK
-        with patch("builtins.input", side_effect=["https://abc.vn", ""]):
+        with patch("builtins.input", side_effect=["https://example.com", ""]):
             cfg2 = cfg({"targets": [], "src_dirs": []})
             cfg2 = resolve_scope_interactive(cfg2)
-        self.assertEqual(cfg2["targets"], ["https://abc.vn"])
+        self.assertEqual(cfg2["targets"], ["https://example.com"])
         self.assertEqual(cfg2["src_dirs"], [])
 
     def test_prompt_src_only(self):
@@ -944,10 +959,10 @@ class TestScopePrompt(unittest.TestCase):
         self.assertEqual(cfg2["src_dirs"], ["/var/www/html"])
 
     def test_prompt_both(self):
-        with patch("builtins.input", side_effect=["https://abc.vn,10.0.0.0/8", "/var/www/html, /opt/api"]):
+        with patch("builtins.input", side_effect=["https://example.com,10.0.0.0/8", "/var/www/html, /opt/api"]):
             cfg2 = cfg({"targets": [], "src_dirs": []})
             cfg2 = resolve_scope_interactive(cfg2)
-        self.assertEqual(cfg2["targets"], ["https://abc.vn", "10.0.0.0/8"])
+        self.assertEqual(cfg2["targets"], ["https://example.com", "10.0.0.0/8"])
         self.assertEqual(cfg2["src_dirs"], ["/var/www/html", "/opt/api"])
 
     def test_prompt_skipped_when_env_set(self):
@@ -1307,7 +1322,7 @@ class TestOllamaRemote(unittest.TestCase):
             {"message": {"role": "assistant", "content": "llo"}},
             {"message": {"role": "assistant", "tool_calls": [
                 {"function": {"name": "http_probe",
-                               "arguments": '{"url": "https://abc.vn/"}'}}]}},
+                               "arguments": '{"url": "https://example.com/"}'}}]}},
             {"done": True},
         ]
         seen = {"tokens": [], "reasoning": [], "stream_flag": None}
@@ -1326,7 +1341,7 @@ class TestOllamaRemote(unittest.TestCase):
         self.assertEqual(seen["reasoning"], ["Phân tích endpoint /login..."])
         self.assertEqual(out["tool_calls"],
                          [{"name": "http_probe",
-                           "arguments": {"url": "https://abc.vn/"}}])
+                           "arguments": {"url": "https://example.com/"}}])
 
     def test_ollama_chat_stream_disconnect_midway_friendly(self):
         """Đứt kết nối giữa chừng khi streaming → thông báo thân thiện, không crash."""
@@ -1667,12 +1682,12 @@ class TestEvidenceGuard(unittest.TestCase):
     (prompt rule v1.4 đã chứng minh là chưa đủ với model 9B)."""
 
     @staticmethod
-    def _call(name, out, url="https://abc.vn", outcome="ok"):
+    def _call(name, out, url="https://example.com", outcome="ok"):
         args = {"url": url} if url else {}
         return {"name": name, "args": args, "outcome": outcome, "output": out}
 
     @staticmethod
-    def _f(name, url="https://abc.vn", **kw):
+    def _f(name, url="https://example.com", **kw):
         return Finding(name=name, url=url, **kw)
 
     # ── G1: 404/error-page claim ──────────────────────────────────
@@ -1722,7 +1737,7 @@ class TestEvidenceGuard(unittest.TestCase):
 
     # ── G6: host chưa từng có output OK ───────────────────────────
     def test_host_without_ok_evidence_flagged(self):
-        history = [self._call("http_probe", "status 200", url="https://abc.vn")]
+        history = [self._call("http_probe", "status 200", url="https://example.com")]
         f = self._f("Vuln X", url="https://other.vn/path")
         self.assertEqual(check_findings_evidence([f], history), 1)
         self.assertTrue(any("other.vn" in g for g in f.evidence_gaps))
@@ -1745,9 +1760,9 @@ class TestEvidenceGuard(unittest.TestCase):
         """subdomain_enum chỉ tìm ra h1, KHÔNG có lệnh probe nào lên h1
         (cả dns_lookup lẫn subdomain_enum đều không nằm trong nhóm
         probe-like) → finding trên h1 phải bị cờ thiếu bằng chứng."""
-        history = [self._call("subdomain_enum", "thấy host mới: https://h1.abc.vn",
-                              url="https://abc.vn")]
-        f = self._f("H1 exposed", url="https://h1.abc.vn")
+        history = [self._call("subdomain_enum", "thấy host mới: https://h1.example.com",
+                              url="https://example.com")]
+        f = self._f("H1 exposed", url="https://h1.example.com")
         self.assertEqual(check_findings_evidence([f], history), 1)
         self.assertTrue(any("không có tool output OK" in g for g in f.evidence_gaps))
 
@@ -1759,22 +1774,22 @@ class TestEvidenceGuard(unittest.TestCase):
                      "| content-security-policy: default-src https: data: "
                      "'unsafe-inline' 'unsafe-eval' | set-cookie: LADI_CLIENT_ID")
         history = [self._call("http_probe", probe_out,
-                              url="https://hoisach.dinhtibooks.com.vn")]
+                              url="https://hoisach.example.com")]
         findings = [
             Finding("OpenResty server exposed",
-                    url="https://hoisach.dinhtibooks.com.vn",
+                    url="https://hoisach.example.com",
                     description="Server banner lộ openresty"),
             Finding("CSP quá permissive",
-                    url="https://hoisach.dinhtibooks.com.vn",
+                    url="https://hoisach.example.com",
                     description="CSP cho phép unsafe-inline/unsafe-eval + data:"),
             Finding("LADI CDN tham gia",
-                    url="https://hoisach.dinhtibooks.com.vn",
+                    url="https://hoisach.example.com",
                     description="Set-Cookie LADI_CLIENT_ID trên response"),
             Finding("Dynamic 404 page",
-                    url="https://hoisach.dinhtibooks.com.vn",
+                    url="https://hoisach.example.com",
                     description="Path lạ trả về trang 404 tùy biến"),
             Finding("OpenResty config rò rỉ",
-                    url="https://hoisach.dinhtibooks.com.vn",
+                    url="https://hoisach.example.com",
                     description="Cấu hình server hiển thị trực tiếp"),
         ]
         n = check_findings_evidence(findings, history)
@@ -1804,7 +1819,7 @@ escalate sqli_blind_extract (kèm method/param/data sẵn cho POST form)."""
         base, broken, ok = self._resp(200, b"k" * 500), self._resp(500, b"error!"), \
             self._resp(200, b"k" * 500)
         with patch("requests.post", side_effect=[base, broken, ok]) as mp:
-            out = _sqli_manual_test(url="https://abc.vn/WebTinTuc/TimKiem",
+            out = _sqli_manual_test(url="https://example.com/WebTinTuc/TimKiem",
                                     param="q", method="post", engine="mssql")
         self.assertEqual(mp.call_count, 3)  # CONFIRMED quote-diff → không cần time-based
         self.assertIn("[✓] SQLI CONFIRMED", out)
@@ -1823,13 +1838,133 @@ escalate sqli_blind_extract (kèm method/param/data sẵn cho POST form)."""
         base, broken, ok = self._resp(200, b"k" * 500), self._resp(500, b"error!"), \
             self._resp(200, b"k" * 500)
         with patch("requests.get", side_effect=[base, broken, ok]) as mg:
-            out = _sqli_manual_test(url="https://abc.vn/search", param="id",
+            out = _sqli_manual_test(url="https://example.com/search", param="id",
                                     method="get", engine="mssql")
         self.assertEqual(mg.call_count, 3)
         self.assertIn("BƯỚC TIẾP THEO", out)
         # v1.4.6: next-step khâu sẵn known_confirmed để bỏ qua lưới 9 probe
         self.assertIn("known_confirmed:true", out)
         self.assertIn("poc_executor", out)
+
+    def test_post_confirmed_mysql_echoes_mysql_engine(self):
+        """v1.5.7: engine='mysql' CONFIRMED → next-step dbms:'mysql' (KHÔNG mssql)."""
+        from tools import _sqli_manual_test
+        base, broken, ok = self._resp(200, b"k" * 500), self._resp(500, b"error!"), \
+            self._resp(200, b"k" * 500)
+        with patch("requests.post", side_effect=[base, broken, ok]) as mp:
+            out = _sqli_manual_test(url="https://example.com/WebTinTuc/TimKiem",
+                                    param="q", method="post", engine="mysql")
+        self.assertEqual(mp.call_count, 3)
+        self.assertIn("[✓] SQLI CONFIRMED", out)
+        self.assertIn("dbms:'mysql'", out)
+        self.assertIn("engine:'mysql'", out)
+        self.assertNotIn("mssql", out)
+
+    def test_auto_engine_resolves_mysql_from_php_headers(self):
+        """v1.5.7: engine='auto' + header X-Powered-By: PHP → mysql (không coerce mssql)."""
+        from tools import _sqli_manual_test
+        base, broken, ok = self._resp(200, b"k" * 500), self._resp(500, b"error!"), \
+            self._resp(200, b"k" * 500)
+        base.headers = {"X-Powered-By": "PHP/7.4"}
+        with patch("requests.post", side_effect=[base, broken, ok]) as mp:
+            out = _sqli_manual_test(url="https://example.com/WebTinTuc/TimKiem",
+                                    param="q", method="post", engine="auto")
+        self.assertEqual(mp.call_count, 3)
+        self.assertIn("engine=mysql", out)
+        self.assertIn("dbms:'mysql'", out)
+        self.assertNotIn("dbms:'mssql'", out)
+
+    def test_auto_engine_resolves_mssql_from_aspnet_headers(self):
+        """v1.5.7: engine='auto' + header X-Powered-By: ASP.NET → mssql."""
+        from tools import _sqli_manual_test
+        base, broken, ok = self._resp(200, b"k" * 500), self._resp(500, b"error!"), \
+            self._resp(200, b"k" * 500)
+        base.headers = {"X-Powered-By": "ASP.NET"}
+        with patch("requests.post", side_effect=[base, broken, ok]) as mp:
+            out = _sqli_manual_test(url="https://example.com/WebTinTuc/TimKiem",
+                                    param="q", method="post", engine="auto")
+        self.assertEqual(mp.call_count, 3)
+        self.assertIn("engine=mssql", out)
+        self.assertIn("dbms:'mssql'", out)
+        self.assertIn("engine:'mssql'", out)
+
+
+class TestSqliBlindEngineConsistency(unittest.TestCase):
+    """v1.5.7: _sqli_blind_extract engine-consistency — engine='auto' resolve qua
+    _sweep_engine (1 GET, cache theo host); hint WAF/extraction-failed dùng ĐÚNG
+    engine (mysql|mssql), KHÔNG coerce unknown → mssql; 'auto' KHÔNG bao giờ
+    thành '--dbms=auto'."""
+
+    def _run_report(self, engine, sweep_return, run_data, action="detect"):
+        from tools import _sqli_blind_extract
+        with patch("tools._sweep_engine", return_value=sweep_return) as ms, \
+             patch("sqli_blind_poc.TimeBlindExploiter") as mt:
+            mt.return_value.report.return_value = run_data
+            out = _sqli_blind_extract(url="https://example.com/search",
+                                      action=action, engine=engine,
+                                      method="get", param="q",
+                                      threshold=0.7, delay=1)
+        return out, ms, mt
+
+    def test_auto_unknown_sweep_defaults_mysql(self):
+        out, ms, mt = self._run_report("auto", "",
+                                       {"confirmed": True, "data": {"version": "5.7"}})
+        ms.assert_called_once_with("https://example.com/search", 15)
+        self.assertEqual(mt.call_args.kwargs["engine"], "mysql")
+        self.assertIn("[✓] SQLi CONFIRMED", out)
+
+    def test_auto_sweep_mssql_resolves_mssql(self):
+        out, ms, mt = self._run_report("auto", "mssql",
+                                       {"confirmed": True, "data": {"version": "15.0"}})
+        self.assertEqual(mt.call_args.kwargs["engine"], "mssql")
+        self.assertIn("[✓] SQLi CONFIRMED", out)
+
+    def test_waf_path_uses_resolved_mysql_not_mssql(self):
+        out, ms, mt = self._run_report("auto", "", {
+            "confirmed": False, "waf_suspected": True,
+            "error": "WAF suspected", "data": {}})
+        self.assertEqual(mt.call_args.kwargs["engine"], "mysql")
+        self.assertIn("WAF suspected", out)
+        self.assertIn("--dbms=mysql", out)
+        self.assertNotIn("--dbms=mssql", out)
+
+    def test_waf_path_keeps_explicit_mssql(self):
+        out, ms, mt = self._run_report("mssql", "", {
+            "confirmed": False, "waf_suspected": True,
+            "error": "WAF suspected", "data": {}})
+        self.assertIn("--dbms=mssql", out)
+
+    def test_waf_path_invalid_engine_defaults_mysql(self):
+        out, ms, mt = self._run_report("oracle", "", {
+            "confirmed": False, "waf_suspected": True,
+            "error": "WAF suspected", "data": {}})
+        self.assertEqual(mt.call_args.kwargs["engine"], "mysql")
+        self.assertIn("--dbms=mysql", out)
+        self.assertNotIn("--dbms=mssql", out)
+
+    def test_extraction_failed_defaults_mysql_not_mssql(self):
+        out, ms, mt = self._run_report("auto", "", {
+            "confirmed": True, "extraction_failed": True,
+            "error": "Oracle trích xuất im lặng — 0 byte",
+            "data": {}, "sqlmap_cmd": None}, action="database")
+        self.assertIn("Chuyển sang sqlmap", out)
+        self.assertIn('"dbms": "mysql"', out)
+        self.assertIn("--dbms=mysql", out)
+        self.assertNotIn("mssql", out)
+
+    def test_extraction_failed_keeps_explicit_mssql(self):
+        out, ms, mt = self._run_report("mssql", "", {
+            "confirmed": True, "extraction_failed": True,
+            "error": "Oracle trích xuất im lặng — 0 byte",
+            "data": {}, "sqlmap_cmd": None}, action="database")
+        self.assertIn('"dbms": "mssql"', out)
+        self.assertIn("--dbms=mssql", out)
+
+    def test_engine_schema_accepts_auto(self):
+        from tools import TOOL_INDEX
+        enum = TOOL_INDEX["sqli_blind_extract"] \
+            .parameters["properties"]["engine"]["enum"]
+        self.assertEqual(enum, ["mysql", "mssql", "auto"])
 
 
 class PostFormSqliHandler(BaseHTTPRequestHandler):
@@ -1908,7 +2043,7 @@ class TestPostFormBlindExtract(unittest.TestCase):
 
 
 MSSQL_VERSION = "Microsoft SQL Server 2019 (RTM) 15.0.2000.5"
-MSSQL_DB = "tbu_news"
+MSSQL_DB = "example_news"
 MSSQL_USER = "sa"
 
 
@@ -1916,7 +2051,7 @@ class ErrorOracleHandler(BaseHTTPRequestHandler):
     """MSSQL error-based oracle giả lập: payload ' AND CONVERT(int,(expr))-- -
     → 500 "Conversion failed when converting the nvarchar value '<value>'".
     Mini evaluator: SUBSTRING((inner),pos,len) unwrap đệ quy;
-    @@VERSION → MSSQL_VERSION; DB_NAME() → tbu_news; SUSER_SNAME() → sa.
+    @@VERSION → MSSQL_VERSION; DB_NAME() → example_news; SUSER_SNAME() → sa.
     Regex GREEDY 'CONVERT(int,((.+))-- -' — lazy sẽ FAIL vì tail 3 ngoặc."""
 
     VALUE = {"@@VERSION": MSSQL_VERSION, "DB_NAME()": MSSQL_DB,
@@ -2008,7 +2143,7 @@ class TestMssqlErrorOracle(unittest.TestCase):
         self.assertEqual(res["outcome"], "ok")
         self.assertIn("CONFIRMED", res["output"])
         self.assertIn("mode=form", res["output"])
-        self.assertIn("database: tbu_news", res["output"])
+        self.assertIn("database: example_news", res["output"])
 
     def test_post_form_detect_mode_form(self):
         a = self._agent()
@@ -2038,7 +2173,7 @@ class TestMssqlErrorOracle(unittest.TestCase):
 
 class ShapeAwareOracleHandler(ErrorOracleHandler):
     """v1.4.6 regression: oracle CHỈ ăn shape quote-then-paren — "') AND
-    CONVERT" và "')) AND CONVERT" (ground-truth tbu.edu.vn: context LIKE có
+    CONVERT" và "')) AND CONVERT" (ground-truth example.com: context LIKE có
     ngoặc); shape 0 "' AND CONVERT" phải KHÔNG bắn lỗi conversion."""
     def _handle(self, decoded: str):
         m = re.search(r"'\s*\)(\)?)\s+AND\s+CONVERT\s*\(\s*int\s*,\s*\((.+)\)--\s*-",
@@ -2098,7 +2233,7 @@ class TestShapeAwareOracle(unittest.TestCase):
 class WafResetHandler(BaseHTTPRequestHandler):
     """Giả lập WAF reset: nhận request rồi ĐÓNG kết nối KHÔNG trả response →
     client nhận RemoteDisconnected → status 0 (tái hiện mẫu 0.02s status-0
-    của live-run tbu.edu.vn). Đếm số request nhận được."""
+    của live-run example.com). Đếm số request nhận được."""
     count = 0
 
     def _drain_and_close(self):
@@ -2269,40 +2404,44 @@ class TestLedgerPathGuard(TestEvidenceGuard):
         /admincp (http_probe chỉ thấy IIS banner) → phải bị cờ."""
         history = [self._call("http_probe",
                               "status 200, server: Microsoft-IIS; content-type: text/html",
-                              url="https://tbu.edu.vn")]
-        f = self._f("SQL Injection tại /admincp", url="https://tbu.edu.vn",
+                              url="https://example.com")]
+        f = self._f("SQL Injection tại /admincp", url="https://example.com",
                     description="Detect /admincp qua banner IIS")
         self.assertEqual(check_findings_evidence([f], history), 1)
         self.assertTrue(any("path" in g and "admincp" in g for g in f.evidence_gaps))
 
     def test_path_claim_backed_by_same_host_ok(self):
         """Path /WebTinTuc/TimKiem xuất hiện trong output wapiti_scan CỦA CÙNG
-        host tbu.edu.vn → không gap; wapiti_scan nằm trong nhóm probe-like
+        host example.com → không gap; wapiti_scan nằm trong nhóm probe-like
         nên cũng không bị cờ 'chưa probe thật'."""
         history = [self._call(
             "wapiti_scan",
-            "[✓] wapiti QUÉT XONG (v3.2.10) — https://tbu.edu.vn/ [scope=domain, "
+            "[✓] wapiti QUÉT XONG (v3.2.10) — https://example.com/ [scope=domain, "
             "4 URL/form, 1 mục]\n[HIGH] SQL Injection (param=keyword) — "
             "POST /WebTinTuc/TimKiem [module=sql]",
-            url="https://tbu.edu.vn/")]
+            url="https://example.com/")]
         f = self._f("MSSQL Error-Based SQLi",
-                    url="https://tbu.edu.vn/WebTinTuc/TimKiem",
+                    url="https://example.com/WebTinTuc/TimKiem",
                     description="SQLi error-based tại form tìm kiếm /WebTinTuc/TimKiem "
                                 "(tham số keyword, quote-differential)")
         self.assertEqual(check_findings_evidence([f], history), 0, f.evidence_gaps)
 
     def test_path_claim_same_token_but_wrong_host_flagged(self):
-        """Path /admincp chỉ xuất hiện trong output của host KHÁC (abc.vn),
-        còn host CỦA FINDING (tbu.edu.vn) có evidence nhưng không chứa /admincp
+        """Path /admincp chỉ xuất hiện trong output của host KHÁC (example.com),
+        còn host CỦA FINDING (example.org) có evidence nhưng không chứa /admincp
         → guard path-cùng-host phải cờ (không lẫn bằng chứng liên host)."""
         history = [
             self._call("http_probe", "status 200, server: Microsoft-IIS",
-                       url="https://tbu.edu.vn"),
+                       url="https://example.com"),
             self._call("ffuf_dir", "thấy 200 /admincp (size 2841)",
-                       url="https://abc.vn"),
+                       url="https://example.com"),
+            # host CỦA FINDING có evidence riêng (http_probe) nhưng KHÔNG chứa
+            # /admincp → guard path-cùng-host mới có cơ sở để cờ
+            self._call("http_probe", "status 200, server: nginx/1.18",
+                       url="https://example.org"),
         ]
-        f = self._f("Admin panel tại /admincp", url="https://tbu.edu.vn",
-                    description="Có /admincp trên tbu")
+        f = self._f("Admin panel tại /admincp", url="https://example.org",
+                    description="Có /admincp trên example.org")
         self.assertEqual(check_findings_evidence([f], history), 1)
         self.assertTrue(any("path" in g and "admincp" in g for g in f.evidence_gaps))
 
@@ -2320,7 +2459,7 @@ class TestSqlmapRunner(unittest.TestCase):
 
     def _dispatch(self, args, tool_timeout=600,
                   run_out=("back-end DBMS: Microsoft SQL Server 2019\n"
-                            "current database: tbu_news\n")):
+                            "current database: example_news\n")):
         caught = {}
 
         def fake_run_cmd(argv, timeout=90, max_chars=5000):
@@ -2337,13 +2476,13 @@ class TestSqlmapRunner(unittest.TestCase):
         return r, caught
 
     def test_args_assembly_disciplined(self):
-        r, c = self._dispatch({"url": "https://abc.vn/WebTinTuc/TimKiem",
+        r, c = self._dispatch({"url": "https://example.com/WebTinTuc/TimKiem",
                                "technique": "tteeSS", "dbms": "mssql",
                                "data": "keyword=tin tuc", "timeout": 120})
         self.assertEqual(r["outcome"], "ok")
         # dedupe + uppercase GIỮ thứ tự: t,t,e,e,S,S → T,E,S
         self.assertEqual(c["argv"], [
-            "sqlmap", "-u", "https://abc.vn/WebTinTuc/TimKiem",
+            "sqlmap", "-u", "https://example.com/WebTinTuc/TimKiem",
             "--batch", "--technique", "TES",
             "--level", "1", "--risk", "1", "--threads", "1",
             "--timeout", "15", "--retries", "1", "--flush-session",
@@ -2351,7 +2490,7 @@ class TestSqlmapRunner(unittest.TestCase):
         self.assertEqual(c["max_chars"], 4000)  # output bounded
 
     def test_dbms_auto_omits_flag(self):
-        r, c = self._dispatch({"url": "https://abc.vn/x.php?id=1",
+        r, c = self._dispatch({"url": "https://example.com/x.php?id=1",
                                "dbms": "auto"})
         self.assertEqual(r["outcome"], "ok")
         self.assertNotIn("--dbms", c["argv"])
@@ -2359,7 +2498,7 @@ class TestSqlmapRunner(unittest.TestCase):
         self.assertEqual(c["argv"][i + 1], "BEUSTQ")  # mặc định full set
 
     def test_cookie_included(self):
-        r, c = self._dispatch({"url": "https://abc.vn/x.php?id=1",
+        r, c = self._dispatch({"url": "https://example.com/x.php?id=1",
                                "cookie": "ASP.NET_SessionId=abc123"})
         self.assertEqual(r["outcome"], "ok")
         self.assertIn("--cookie", c["argv"])
@@ -2370,7 +2509,7 @@ class TestSqlmapRunner(unittest.TestCase):
              patch("tools.run_cmd") as rc:
             a = WebXAgent(config=cfg({}), chat=FakeChat(script=[]))
             r = a._dispatch("sqlmap_runner",
-                            {"url": "https://abc.vn/", "technique": "XYZ"})
+                            {"url": "https://example.com/", "technique": "XYZ"})
         self.assertEqual(r["outcome"], "error")
         self.assertIn("technique không hợp lệ", r["output"])
         rc.assert_not_called()
@@ -2380,33 +2519,33 @@ class TestSqlmapRunner(unittest.TestCase):
              patch("tools.run_cmd") as rc:
             a = WebXAgent(config=cfg({}), chat=FakeChat(script=[]))
             r = a._dispatch("sqlmap_runner",
-                            {"url": "https://abc.vn/", "dbms": "oracle"})
+                            {"url": "https://example.com/", "dbms": "oracle"})
         self.assertEqual(r["outcome"], "error")
         self.assertIn("dbms không hợp lệ", r["output"])
         rc.assert_not_called()
 
     def test_timeout_clamp_ranges(self):
         # 10 → clamp lên 30;  9999 → clamp xuống 600 rồi bị _timeout cap 300 thắng
-        r1, c1 = self._dispatch({"url": "https://abc.vn/", "timeout": 10})
+        r1, c1 = self._dispatch({"url": "https://example.com/", "timeout": 10})
         self.assertEqual(r1["outcome"], "ok")
         self.assertEqual(c1["timeout"], 30)
-        r2, c2 = self._dispatch({"url": "https://abc.vn/", "timeout": 9999})
+        r2, c2 = self._dispatch({"url": "https://example.com/", "timeout": 9999})
         self.assertEqual(c2["timeout"], 300)  # min(600, TOOL_TIMEOUTS=300)
 
     def test_operator_tool_timeout_60_wins(self):
         # operator cấu hình 60s < cap 300 → run_cmd timeout phải 60
-        r, c = self._dispatch({"url": "https://abc.vn/", "timeout": 9999},
+        r, c = self._dispatch({"url": "https://example.com/", "timeout": 9999},
                               tool_timeout=60)
         self.assertEqual(r["outcome"], "ok")
         self.assertEqual(c["timeout"], 60)
 
     def test_markers_head_ok(self):
         r, c = self._dispatch(
-            {"url": "https://abc.vn/"},
+            {"url": "https://example.com/"},
             run_out=("is vulnerable\nParameter: keyword (POST)\n"
                      "back-end DBMS: Microsoft SQL Server 2019\n"
-                     "current database: tbu_news\ncurrent user: sa\n"
-                     "Table: tbu_tintuc"))
+                     "current database: example_news\ncurrent user: sa\n"
+                     "Table: example_tintuc"))
         self.assertEqual(r["outcome"], "ok")
         self.assertIn("[✓] sqlmap XÁC NHẬN khai thác", r["output"])
         for m in ("is vulnerable", "Parameter:", "back-end DBMS:",
@@ -2416,7 +2555,7 @@ class TestSqlmapRunner(unittest.TestCase):
 
     def test_no_parameter_marker(self):
         r, c = self._dispatch(
-            {"url": "https://abc.vn/"},
+            {"url": "https://example.com/"},
             run_out="[INFO] testing connection...\nno parameter(s) found "
                     "for testing. Going to fallback to full "
                     "scan...\n[INFO] finished")
@@ -2426,7 +2565,7 @@ class TestSqlmapRunner(unittest.TestCase):
 
     def test_run_without_markers_head(self):
         r, c = self._dispatch(
-            {"url": "https://abc.vn/"},
+            {"url": "https://example.com/"},
             run_out="[INFO] heuristics detected web page \n"
                     "custom injection marker not found")
         self.assertEqual(r["outcome"], "ok")
@@ -2438,7 +2577,7 @@ class TestSqlmapRunner(unittest.TestCase):
         """run_cmd trả '[!] Timeout sau 90s.' (bắt TimeoutExpired) — trước v1.4.9
         rơi vào nhánh 'KHÔNG thấy dấu hiệu' với outcome=ok → model tưởng
         'not injectable' và bịa chi tiết. Giờ phải error + cấm kết luận."""
-        r, c = self._dispatch({"url": "https://abc.vn/web.php?id=1",
+        r, c = self._dispatch({"url": "https://example.com/web.php?id=1",
                                "technique": "BEUSTQ"},
                               run_out="[!] Timeout sau 90s.")
         self.assertEqual(r["outcome"], "error")
@@ -2452,7 +2591,7 @@ class TestSqlmapRunner(unittest.TestCase):
         self.assertNotIn("KHÔNG thấy dấu hiệu khai thác", r["output"])
 
     def test_run_cmd_generic_error_propagates(self):
-        r, c = self._dispatch({"url": "https://abc.vn/"},
+        r, c = self._dispatch({"url": "https://example.com/"},
                               run_out="[!] Lỗi: connection reset")
         self.assertEqual(r["outcome"], "error")
         self.assertIn("sqlmap không hoàn tất (lỗi thực thi): Lỗi: connection reset",
@@ -2462,7 +2601,7 @@ class TestSqlmapRunner(unittest.TestCase):
         """sqlmap in '[!] legal disclaimer: ...' MỖI lần chạy — không được coi
         là lỗi thực thi (chạy thật: banner + disclaimer in trước log)."""
         r, c = self._dispatch(
-            {"url": "https://abc.vn/"},
+            {"url": "https://example.com/"},
             run_out="[!] legal disclaimer: usage of sqlmap for attacking "
                     "targets without prior mutual consent is illegal\n"
                     "[INFO] testing connection to the target URL")
@@ -2473,7 +2612,7 @@ class TestSqlmapRunner(unittest.TestCase):
         """sqlmap kết luận 'not injectable' → dòng '[i]' chuẩn hóa cho model
         (trước đây model tự diễn giải log trần → bịa '218 lần lỗi 500')."""
         r, c = self._dispatch(
-            {"url": "https://abc.vn/", "technique": "E"},
+            {"url": "https://example.com/", "technique": "E"},
             run_out="[INFO] heuristics detected web page\n"
                     "[INFO] all tested parameters do not appear to be "
                     "injectable\n[INFO] finished")
@@ -2605,12 +2744,12 @@ class TestBannerUpdate(unittest.TestCase):
     plain (color=False) KHÔNG chứa ANSI; color=True có ANSI nhưng KHÔNG có nền
     đen; model/scope/auto_exec/missing tools vẫn hiện đủ như bản cũ"""
 
-    _CFG = cfg({"targets": ["https://tbu.edu.vn"], "model": "m-test",
+    _CFG = cfg({"targets": ["https://example.com"], "model": "m-test",
                 "auto_exec": "ask"})
 
     def _banner(self, **kw):
         from agent import _banner
-        d = dict(cfg=self._CFG, scope="https://tbu.edu.vn", color=False)
+        d = dict(cfg=self._CFG, scope="https://example.com", color=False)
         d.update(kw)
         return _banner(**d)
 
@@ -2620,7 +2759,7 @@ class TestBannerUpdate(unittest.TestCase):
         self.assertIn("AIXSEC-X", b)
         self.assertIn(VERSION, b)  # theo dõi VERSION động, không hardcode
         self.assertIn("m-test", b)
-        self.assertIn("https://tbu.edu.vn", b)
+        self.assertIn("https://example.com", b)
         self.assertIn("ask", b)
         self.assertIn("q quit", b)
 
@@ -2667,7 +2806,7 @@ class TestBannerUpdate(unittest.TestCase):
         from agent import _print_banner
         out = io.StringIO()
         with contextlib.redirect_stdout(out):
-            _print_banner(self._CFG, scope="https://tbu.edu.vn")
+            _print_banner(self._CFG, scope="https://example.com")
         self.assertIn("AIXSEC-X", out.getvalue())
 class TestWapitiScan(unittest.TestCase):
     """v1.5.0: tool wapiti_scan — toàn bộ 29 module wapiti (mặc định), scope mặc
@@ -2679,7 +2818,7 @@ class TestWapitiScan(unittest.TestCase):
 
     _REPORT = {
         "infos": {
-            "target": "https://abc.vn/", "version": "Wapiti 3.2.10",
+            "target": "https://example.com/", "version": "Wapiti 3.2.10",
             "scope": "domain", "date": "2026-09-20T10:00:00",
             "crawled_pages_nbr": 4,
         },
@@ -2690,8 +2829,8 @@ class TestWapitiScan(unittest.TestCase):
                  "level": 2,
                  "info": "DBMS: Microsoft SQL Server. Injection in the HTTP POST body (keyword)",
                  "wstg": ["WSTG-INPV-05"],
-                 "curl_command": "curl 'https://abc.vn/WebTinTuc/TimKiem' -d \"keyword=tin'\"",
-                 "http_request": "POST /WebTinTuc/TimKiem HTTP/1.1\r\nHost: abc.vn\r\n\r\nkeyword=tin%C2%BF%27%22%28"},
+                 "curl_command": "curl 'https://example.com/WebTinTuc/TimKiem' -d \"keyword=tin'\"",
+                 "http_request": "POST /WebTinTuc/TimKiem HTTP/1.1\r\nHost: example.com\r\n\r\nkeyword=tin%C2%BF%27%22%28"},
                 # bản trùng (level thấp hơn) — dedupe phải bỏ, giữ level cao nhất
                 {"module": "sql", "method": "POST",
                  "path": "/WebTinTuc/TimKiem", "parameter": "keyword",
@@ -2703,7 +2842,7 @@ class TestWapitiScan(unittest.TestCase):
                  "parameter": "q", "level": 1,
                  "info": "Reflected XSS in /search",
                  "wstg": ["WSTG-INPV-01"],
-                 "curl_command": "curl 'https://abc.vn/search?q=%3Cscript%3E'",
+                 "curl_command": "curl 'https://example.com/search?q=%3Cscript%3E'",
                  "http_request": ""},
             ],
         },
@@ -2739,7 +2878,7 @@ class TestWapitiScan(unittest.TestCase):
         return r, caught, sm, report_path
 
     def test_defaults_domain_all_modules(self):
-        r, c, sm, rp = self._dispatch({"url": "https://abc.vn/"})
+        r, c, sm, rp = self._dispatch({"url": "https://example.com/"})
         self.assertEqual(r["outcome"], "ok")
         # scope mặc định domain (cả website) + mặc định CẢ 29 module
         self.assertIn("--scope", c["argv"])
@@ -2769,7 +2908,7 @@ class TestWapitiScan(unittest.TestCase):
         sm.assert_called_once()
 
     def test_custom_modules_and_cookie(self):
-        r, c, sm, rp = self._dispatch({"url": "https://abc.vn/",
+        r, c, sm, rp = self._dispatch({"url": "https://example.com/",
                                        "modules": "sql,xss",
                                        "scope": "folder",
                                        "cookie": "ASP.NET_SessionId=abc123"})
@@ -2781,7 +2920,7 @@ class TestWapitiScan(unittest.TestCase):
     def test_invalid_module_allowlist(self):
         with patch("tools.run_cmd") as rc, patch("tools._need", return_value=None):
             a = WebXAgent(config=cfg({}), chat=FakeChat(script=[]))
-            r = a._dispatch("wapiti_scan", {"url": "https://abc.vn/",
+            r = a._dispatch("wapiti_scan", {"url": "https://example.com/",
                                              "modules": "sql,foo,pwn"})
         self.assertEqual(r["outcome"], "error")
         self.assertIn("module không hợp lệ", r["output"])
@@ -2791,7 +2930,7 @@ class TestWapitiScan(unittest.TestCase):
     def test_invalid_scope(self):
         with patch("tools.run_cmd") as rc, patch("tools._need", return_value=None):
             a = WebXAgent(config=cfg({}), chat=FakeChat(script=[]))
-            r = a._dispatch("wapiti_scan", {"url": "https://abc.vn/",
+            r = a._dispatch("wapiti_scan", {"url": "https://example.com/",
                                              "scope": "galaxy"})
         self.assertEqual(r["outcome"], "error")
         self.assertIn("scope không hợp lệ", r["output"])
@@ -2801,14 +2940,14 @@ class TestWapitiScan(unittest.TestCase):
     def test_bad_url_no_run(self):
         with patch("tools.run_cmd") as rc, patch("tools._need", return_value=None):
             a = WebXAgent(config=cfg({}), chat=FakeChat(script=[]))
-            r = a._dispatch("wapiti_scan", {"url": "ftp://abc.vn/"})
+            r = a._dispatch("wapiti_scan", {"url": "ftp://example.com/"})
         self.assertEqual(r["outcome"], "error")
         self.assertIn("url phải là http(s)", r["output"])
         rc.assert_not_called()
 
     def test_bounds_depth_tasks_timeout(self):
         # depth 99 → clamp 10; tasks 99 → clamp 8; timeout 99 → clamp 30
-        r, c, sm, rp = self._dispatch({"url": "https://abc.vn/",
+        r, c, sm, rp = self._dispatch({"url": "https://example.com/",
                                        "depth": 99, "tasks": 99, "timeout": 99})
         self.assertEqual(r["outcome"], "ok")
         self.assertEqual(c["argv"][c["argv"].index("-d") + 1], "10")
@@ -2820,22 +2959,22 @@ class TestWapitiScan(unittest.TestCase):
         # KHÔNG còn bị giết giữa scan; budget=600 → scan=300, attack=150
         # (mặc định v1.5.5, clamp ≤ scan/2), run_cmd timeout=600 (lưới an toàn,
         # wapiti tự kết thúc theo -max-scan-time)
-        r, c, sm, rp = self._dispatch({"url": "https://abc.vn/"}, tool_timeout=90)
+        r, c, sm, rp = self._dispatch({"url": "https://example.com/"}, tool_timeout=90)
         self.assertEqual(r["outcome"], "ok")
         self.assertEqual(c["argv"][c["argv"].index("--max-scan-time") + 1], "300")
         self.assertEqual(c["argv"][c["argv"].index("--max-attack-time") + 1], "150")
         self.assertEqual(c["timeout"], 600)
         # max_scan_time=5000 bị clamp theo budget 600 → 580, run_cmd 600
-        r2, c2, sm2, _ = self._dispatch({"url": "https://abc.vn/",
+        r2, c2, sm2, _ = self._dispatch({"url": "https://example.com/",
                                          "max_scan_time": 5000})
         self.assertEqual(c2["argv"][c2["argv"].index("--max-scan-time") + 1], "580")
         self.assertEqual(c2["timeout"], 600)
 
     def test_sqlmap_handoff_post_mssql(self):
-        r, c, sm, rp = self._dispatch({"url": "https://abc.vn/"})
+        r, c, sm, rp = self._dispatch({"url": "https://example.com/"})
         self.assertEqual(r["outcome"], "ok")
         kw = sm.call_args.kwargs
-        self.assertEqual(kw["url"], "https://abc.vn/WebTinTuc/TimKiem")
+        self.assertEqual(kw["url"], "https://example.com/WebTinTuc/TimKiem")
         # hậu tố probe %C2%BF%27%22%28 bị bỏ → giá trị form GỐC 'tin'
         self.assertEqual(kw["data"], "keyword=tin")
         self.assertEqual(kw["dbms"], "mssql")        # từ "DBMS: Microsoft SQL Server"
@@ -2852,13 +2991,13 @@ class TestWapitiScan(unittest.TestCase):
              "parameter": "keyword", "level": 3,
              "info": "DBMS: Microsoft SQL Server. Time-based blind",
              "wstg": [], "curl_command": "", "http_request": ""}]}
-        r, c, sm, rp = self._dispatch({"url": "https://abc.vn/"}, report=rep)
+        r, c, sm, rp = self._dispatch({"url": "https://example.com/"}, report=rep)
         self.assertEqual(r["outcome"], "ok")
         kw = sm.call_args.kwargs
         self.assertEqual(kw["technique"], "T")        # Blind → time-based
         self.assertEqual(kw["dbms"], "mssql")
         self.assertIsNone(kw["data"])                  # GET
-        self.assertEqual(kw["url"], "https://abc.vn/search?keyword=1")
+        self.assertEqual(kw["url"], "https://example.com/search?keyword=1")
         self.assertIn("[HIGH] Blind SQL Injection (param=keyword)", r["output"])
 
     def test_exploit_capped_at_3(self):
@@ -2878,7 +3017,7 @@ class TestWapitiScan(unittest.TestCase):
              "parameter": "id", "level": 2, "info": "",
              "wstg": [], "curl_command": "", "http_request": ""},
         ]}
-        r, c, sm, rp = self._dispatch({"url": "https://abc.vn/"}, report=rep)
+        r, c, sm, rp = self._dispatch({"url": "https://example.com/"}, report=rep)
         self.assertEqual(r["outcome"], "ok")
         self.assertEqual(sm.call_count, 3)              # cap _WAPITI_MAX_EXPLOIT
         # findings sort theo path desc → d,c,b,a; DBMS suy từ info: MySQL → mysql, "" → auto
@@ -2886,7 +3025,7 @@ class TestWapitiScan(unittest.TestCase):
         self.assertEqual(dbmses, ["auto", "auto", "mysql"])
 
     def test_exploit_false_no_sqlmap(self):
-        r, c, sm, rp = self._dispatch({"url": "https://abc.vn/",
+        r, c, sm, rp = self._dispatch({"url": "https://example.com/",
                                        "exploit": False})
         self.assertEqual(r["outcome"], "ok")
         sm.assert_not_called()
@@ -2897,7 +3036,7 @@ class TestWapitiScan(unittest.TestCase):
         self.assertIn("→ khắc phục:", r["output"])
 
     def test_run_cmd_error_passthrough(self):
-        r, c, sm, rp = self._dispatch({"url": "https://abc.vn/"},
+        r, c, sm, rp = self._dispatch({"url": "https://example.com/"},
                                       run_out="[!] Timeout sau 150s.")
         self.assertEqual(r["outcome"], "error")
         self.assertIn("wapiti không hoàn tất", r["output"])
@@ -2905,7 +3044,7 @@ class TestWapitiScan(unittest.TestCase):
         sm.assert_not_called()  # không exploit gì từ lượt scan hỏng
 
     def test_missing_report_error(self):
-        r, c, sm, rp = self._dispatch({"url": "https://abc.vn/"},
+        r, c, sm, rp = self._dispatch({"url": "https://example.com/"},
                                       run_out="(no output)", write_report=False)
         self.assertEqual(r["outcome"], "error")
         self.assertIn("không tạo được report JSON", r["output"])
@@ -2921,7 +3060,7 @@ class TestWapitiScan(unittest.TestCase):
              patch("tools.run_cmd", return_value="[✓] done"), \
              patch("tools._sqlmap_runner") as sm:
             a = WebXAgent(config=cfg({}), chat=FakeChat(script=[]))
-            r = a._dispatch("wapiti_scan", {"url": "https://abc.vn/"})
+            r = a._dispatch("wapiti_scan", {"url": "https://example.com/"})
         self.assertEqual(r["outcome"], "error")
         self.assertIn("report JSON không đọc được", r["output"])
         sm.assert_not_called()
@@ -2929,7 +3068,7 @@ class TestWapitiScan(unittest.TestCase):
     def test_summary_tonghop_lists_exploit_fix(self):
         """v1.5.3 (nhiệm vụ 3): mục 'TỔNG HỢP LỖ HỔNG' — dedupe theo
         (category, method, path, parameter); mỗi mục kèm hướng khai thác + khắc phục."""
-        r, c, sm, rp = self._dispatch({"url": "https://abc.vn/"})
+        r, c, sm, rp = self._dispatch({"url": "https://example.com/"})
         self.assertEqual(r["outcome"], "ok")
         self.assertIn("[✓] TỔNG HỢP LỖ HỔNG — HƯỚNG KHAI THÁC & KHẮC PHỤC:", r["output"])
         # SQL Injection (bản level 1 trùng bị dedupe) + XSS = đúng 2 mục
@@ -2945,13 +3084,13 @@ class TestWapitiScan(unittest.TestCase):
         AI TỰ KHAI THÁC bằng sqli_blind_extract (known_confirmed=true) và
         cấm gọi lại sqlmap_runner cho url đó."""
         r, c, sm, rp = self._dispatch(
-            {"url": "https://abc.vn/"},
+            {"url": "https://example.com/"},
             sqlmap_out="[i] sqlmap: không thấy dấu hiệu injectable trên param keyword")
         self.assertEqual(r["outcome"], "ok")
         self.assertIn("[→] SQLMAP THẤT BẠI #1", r["output"])
         self.assertIn("AI TỰ KHAI THÁC (v1.5.3)", r["output"])
         self.assertIn("sqli_blind_extract", r["output"])
-        self.assertIn("'url': 'https://abc.vn/WebTinTuc/TimKiem'", r["output"])
+        self.assertIn("'url': 'https://example.com/WebTinTuc/TimKiem'", r["output"])
         self.assertIn("'action': 'detect'", r["output"])
         self.assertIn("'known_confirmed': true", r["output"])
         self.assertIn("'method': 'post'", r["output"])
@@ -2962,12 +3101,42 @@ class TestWapitiScan(unittest.TestCase):
 
     def test_sqlmap_fail_timeout_starts_bang(self):
         """Output sqlmap mở đầu '[!]' (timeout/exec lỗi) cũng = THẤT BẠI → hint fallback."""
-        r, c, sm, rp = self._dispatch({"url": "https://abc.vn/"},
+        r, c, sm, rp = self._dispatch({"url": "https://example.com/"},
                                       sqlmap_out="[!] Timeout sau 180s.")
         self.assertEqual(r["outcome"], "ok")
         self.assertIn("[→] SQLMAP THẤT BẠI #1", r["output"])
         self.assertIn("sqli_blind_extract", r["output"])
         self.assertIn("KHÔNG gọi lại sqlmap_runner", r["output"])
+
+    def test_sqlmap_fail_mysql_finding_hints_mysql_engine(self):
+        """v1.5.7: finding 'DBMS: MySQL' + sqlmap fail → hint engine='mysql' (KHÔNG mssql)."""
+        rep = json.loads(json.dumps(self._REPORT))
+        rep["vulnerabilities"] = {"SQL Injection": [
+            {"module": "sql", "method": "POST", "path": "/TimKiem",
+             "parameter": "keyword", "level": 2,
+             "info": "DBMS: MySQL. Injection in the HTTP POST body (keyword)",
+             "wstg": [], "curl_command": "", "http_request": ""}]}
+        r, c, sm, rp = self._dispatch(
+            {"url": "https://example.com/"}, report=rep,
+            sqlmap_out="[i] sqlmap: không thấy dấu hiệu injectable")
+        self.assertEqual(r["outcome"], "ok")
+        self.assertIn("AI TỰ KHAI THÁC (v1.5.3)", r["output"])
+        self.assertIn("'engine': 'mysql'", r["output"])
+        self.assertNotIn("'engine': 'mssql'", r["output"])
+
+    def test_sqlmap_fail_unknown_dbms_hints_auto_engine(self):
+        """v1.5.7: DBMS không xác định + sqlmap fail → hint engine='auto' (KHÔNG ép mssql)."""
+        rep = json.loads(json.dumps(self._REPORT))
+        rep["vulnerabilities"] = {"SQL Injection": [
+            {"module": "sql", "method": "GET", "path": "/p.php",
+             "parameter": "id", "level": 2, "info": "",
+             "wstg": [], "curl_command": "", "http_request": ""}]}
+        r, c, sm, rp = self._dispatch(
+            {"url": "https://example.com/"}, report=rep,
+            sqlmap_out="[i] sqlmap: không thấy dấu hiệu injectable")
+        self.assertEqual(r["outcome"], "ok")
+        self.assertIn("'engine': 'auto'", r["output"])
+        self.assertNotIn("'engine': 'mssql'", r["output"])
 
     def test_wapiti_exploit_fix_maps_have_default(self):
         """v1.5.3: _WAPITI_EXPLOIT/_WAPITI_FIX — mọi category trong report đều
@@ -2999,7 +3168,7 @@ class TestWapitiScan(unittest.TestCase):
     def test_no_findings_suggests_next(self):
         rep = json.loads(json.dumps(self._REPORT))
         rep["vulnerabilities"] = {}
-        r, c, sm, rp = self._dispatch({"url": "https://abc.vn/"}, report=rep)
+        r, c, sm, rp = self._dispatch({"url": "https://example.com/"}, report=rep)
         self.assertEqual(r["outcome"], "ok")
         self.assertIn("KHÔNG phát hiện lỗ hổng nào", r["output"])
         self.assertIn("BƯỚC TIẾP THEO", r["output"])
@@ -3089,7 +3258,7 @@ class TestWapitiFormSweep(unittest.TestCase):
                    return_value="[✓] sqlmap XÁC NHẬN khai thác — back-end DBMS") as sm:
             a = WebXAgent(config=cfg({"tool_timeout": 600,
                                        "targets": ["http://127.0.0.1",
-                                                    "https://abc.vn",
+                                                    "https://example.com",
                                                     "10.0.0.0/8"]}),
                           chat=FakeChat(script=[]))
             r = a._dispatch("wapiti_scan", args)
@@ -3331,11 +3500,11 @@ class TestAiNativeGate(unittest.TestCase):
         from tools import TOOL_INDEX
         script = [
             {"content": "", "tool_calls": [
-                {"name": "http_probe", "arguments": {"url": "https://abc.vn/"}}]},
+                {"name": "http_probe", "arguments": {"url": "https://example.com/"}}]},
             {"content": FINAL_JSON, "tool_calls": []},
             {"content": "", "tool_calls": [
                 {"name": "http_request", "arguments": {
-                    "method": "get", "url": "https://abc.vn/"}}]},
+                    "method": "get", "url": "https://example.com/"}}]},
         ]
         with patch.object(TOOL_INDEX["http_probe"], "exec_fn",
                           lambda **kw: "status 200 (stub)"):
@@ -3357,7 +3526,7 @@ class TestAiNativeGate(unittest.TestCase):
         script = [
             {"content": "", "tool_calls": [
                 {"name": "http_request", "arguments": {
-                    "method": "get", "url": "https://abc.vn/"}}]},
+                    "method": "get", "url": "https://example.com/"}}]},
             {"content": FINAL_JSON, "tool_calls": []},
         ]
         a = self._agent(script=script)
@@ -3373,11 +3542,11 @@ class TestAiNativeGate(unittest.TestCase):
         script = [
             {"content": "", "tool_calls": [
                 {"name": "http_request", "arguments": {
-                    "method": "get", "url": "https://abc.vn/"}}]},
+                    "method": "get", "url": "https://example.com/"}}]},
             {"content": FINAL_JSON, "tool_calls": []},
             {"content": "", "tool_calls": [
                 {"name": "http_request", "arguments": {
-                    "method": "get", "url": "https://abc.vn/product.php"}}]},
+                    "method": "get", "url": "https://example.com/product.php"}}]},
         ]
         with patch.object(TOOL_INDEX["http_request"], "exec_fn",
                           side_effect=["[!] http_request: không kết nối được",
@@ -3454,8 +3623,8 @@ class TestLedgerHttpRequestEvidence(unittest.TestCase):
     def test_http_request_counts_as_probe_evidence(self):
         history = [
             {"name": "http_request", "outcome": "ok",
-             "args": {"method": "get", "url": "https://abc.vn/product.php"},
-             "output": "GET https://abc.vn/product.php → 200 (1234 bytes, 0.3s)\n"
+             "args": {"method": "get", "url": "https://example.com/product.php"},
+             "output": "GET https://example.com/product.php → 200 (1234 bytes, 0.3s)\n"
                        "headers:\n  Content-Type: text/html\nbody_snippet:\n"
                        "<html>product page id=1</html>"},
         ]
@@ -3470,7 +3639,7 @@ class TestLedgerHttpRequestEvidence(unittest.TestCase):
         # tool output OK (không có cơ sở bằng chứng)
         history = [
             {"name": "http_request", "outcome": "error",
-             "args": {"method": "get", "url": "https://abc.vn/product.php"},
+             "args": {"method": "get", "url": "https://example.com/product.php"},
              "output": "[!] http_request: không kết nối được"},
         ]
         fs = parse_findings_json(FINAL_JSON)

