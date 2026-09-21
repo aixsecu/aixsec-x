@@ -169,6 +169,7 @@ python3 agent.py --non-interactive                # run automatically
 | `WEBX_THINK` | `0` | `1`=enable thinking mode (not recommended together with function calling) |
 | `WEBX_AUTO_EXEC` | `ask` | `ask`=prompt operator before noisy/active tools; `safe`=auto-run only safe tools; `all`=auto-run everything (risky) |
 | `WEBX_AI_NATIVE` | `0` | **v1.5.6** `1`=AI-NATIVE mode: the model analyzes vulnerabilities itself via `http_request` (no mandatory wapiti/sqlmap; final JSON requires ≥1 real `http_request` response) |
+| `WEBX_INVENTORY_FILE` | *(empty)* | **v1.6.0** path to save the Attack Surface Inventory JSON (`host→port→service→URL→endpoint→method→param→auth→tech`, accumulated from real tool output) after every round and on exit. Empty = do not save |
 | `WEBX_MAX_ROUNDS` | `8` | Max tool-call rounds per turn (lower = faster/cheaper; a 9B model on a 4 vCPU box can take 20–30 min per round) |
 | `WEBX_TOOL_TIMEOUT` | `90` | Per-tool timeout (seconds) |
 | `WEBX_LLM_TIMEOUT` | `300` | Max time waiting for a model reply per round (seconds); a 9B model on CPU can take 1–3 minutes |
@@ -273,6 +274,7 @@ root@aixsec-x:~# Analyze https://example.com                   → agent calls t
 root@aixsec-x:~# Run nuclei severity high                      → attack the target
 root@aixsec-x:~# /findings                                     → view ledger (candidate/confirmed/ruled_out)
 root@aixsec-x:~# /report                                       → export markdown report
+root@aixsec-x:~# /capabilities                                 → list tool/binary/version availability (v1.6.0)
 root@aixsec-x:~# !! nmap -p- 10.0.0.5                          → run a shell command directly (at your own risk)
 root@aixsec-x:~# q                                             → quit
 ```
@@ -858,3 +860,34 @@ python3 agent.py --recon
 # → approval prompt: "[APPROVAL] 'nuclei_scan' risk [active] — run? [y/N] y"
 # → agent returns JSON findings → /findings → /report
 ```
+
+## Changelog
+
+### v1.6.0 — Attack Surface Inventory + Capability Discovery + multi-source findings
+
+- **Attack Surface Inventory (`inventory.py`)** — a unified `host → port →
+  service → URL → endpoint → method → parameter → auth → technology` map
+  accumulated from **real tool output** (http_probe, wapiti_scan, ffuf_dir,
+  detect_cms, waf_detect…). After every round the agent ingests OK tool
+  results and prepends a `[ATTACK SURFACE — đã biết, KHÔNG rescan]` block to
+  the next round's user message, so the model picks the next tool from what is
+  already known instead of re-running recon. Save/load JSON via
+  `WEBX_INVENTORY_FILE` (opt-in; empty = not saved). Hostile tool output is
+  treated as untrusted data: instructions inside it are never ingested.
+- **Capability Discovery (`tools.capability_report`)** — on startup the agent
+  checks which Kali binaries are present and their versions (`--version` /
+  `-version` / `-V`, 3 s timeout, cached). Banner shows `capability: N/M
+  external binaries present`; `/capabilities` (interactive) and
+  `--capabilities` (CLI) print the full table. The planner only picks tools
+  that actually exist.
+- **Multi-source findings (`ledger.py`)** — findings now carry
+  `source_tool` / `sources` / `parameter`; `parse_findings_json` reads both
+  `source` (legacy) and `source_tool`/`sources`; `Ledger.add` merges the same
+  finding from several scanners (e.g. Nuclei + Wapiti + AI) into ONE finding
+  with combined evidence and never downgrades status; `render_markdown` shows
+  `Nguồn: …` and `Parameter: …`. Both prompts (compact rule 5d / full rule 6d)
+  now require adaptive tool selection and the final JSON schema includes
+  `source`/`parameter`.
+- **Tests** — 21 new hermetic tests (inventory ingest/dedupe/save-load,
+  capability report + cache, finding sources/merge, hostile-output injection
+  safety, run-loop `[ATTACK SURFACE]` injection). Full suite: 250 tests pass.

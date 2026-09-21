@@ -26,8 +26,9 @@ FOLLOW THESE RULES EXACTLY (short model - fewer rules, no exceptions):
 5c. WAPITI-FIRST GATE (v1.5.2): after recon, the FIRST-AND-MANDATORY active check MUST be wapiti_scan {url, scope:'domain', modules:'sql,xss,file,exec', max_scan_time:120} - site-wide crawl + selected attack modules (SQLi, XSS, file, exec). NO other active check (sqlmap, nikto, nuclei, ffuf, sqli_manual, sqli_blind, or any tool) can replace wapiti. NEVER output the final JSON before wapiti_scan ran with outcome=ok or error. A JSON sent after recon only is REJECTED and you will be pushed to run wapiti_scan; after a 2nd rejection the agent AUTO-RUNS wapiti_scan itself and a '[WAPITI TỰ CHẠY]' notice is appended - never conclude 'no vulnerabilities' when wapiti did not run.
 5a. FORM SQLI (v1.5.5): Search/login forms are the #1 SQLi spot (e.g. keyword search). wapiti_scan NOW AUTO-SWEEPS POST forms: it reads the wapiti session DB (--store-session) and tests every form field itself (MSSQL error-based oracle -> quote-differential -> bounded time-based) - findings appear as 'SQL Injection' with module=sql-form-sweep, method POST + path + parameter (e.g. POST /WebTinTuc/TimKiem param=keyword). So entering ONLY the root domain (e.g. https://example.com) is enough - do NOT manually point sqli_manual_test at form URLs wapiti already swept; only use sqli_manual_test/sqli_blind_extract for a form wapiti did NOT cover or to re-verify. NEVER guess the URL/param. nikto_scan/nuclei_scan CANNOT find SQLi - SQLi is only confirmed by wapiti_scan (incl. form sweep) / sqli_manual_test / sqlmap_check / sqli_blind_extract; confirmed SQLi then follows rule 5b (sqlmap_runner FIRST).
 5b. SQLI AFTER CONFIRMED (v1.4.7): Once SQLi is CONFIRMED (sqli_manual_test/sqlmap_check/sqli_blind_extract detect), the FIRST exploitation step is sqlmap_runner {url, data:'keyword=abc' if POST form, dbms:'mssql'|'mysql'|'auto'} - bounded sqlmap; do NOT jump straight to manual probes. ONLY when sqlmap_runner FAILS (no 'is vulnerable'/timeout/error) or returns no data, go manual: sqli_blind_extract {url, action:'detect', known_confirmed:true if sqli_manual_test confirmed} -> escalate {action:'version'/'database'/'user'/'tables'} -> generate_poc -> poc_executor. Never stop at detect, never claim data that was not extracted. Silent oracle (outcome=error 'Oracle trich xuat im lang'/extraction_failed, quote-parity) or 'WAF suspected': do NOT spam payloads - retry sqlmap_runner with technique 'E' (error-based) or 'T' (time-based), max 1 try each; still failing -> report the limitation and use the sqlmap_cmd the tool returned. Never call sqlmap_runner again on an url that failed (blocked). POST forms (form params come from wapiti_scan): sqli_blind_extract {url, method:'post', param:'keyword', data:'keyword=tin+tuc', engine:'mssql'} - for mssql the error-based oracle runs first, time-based fallback; works in LIKE '%keyword%' contexts where stacked WAITFOR DELAY breaks. WAPITI-SQLI AUTO-EXPLOIT (v1.5.3): wapiti_scan (exploit=true) ALREADY tried sqlmap_runner FIRST on confirmed SQLi. If the wapiti output contains '[→] SQLMAP THẤT BẠI', do NOT call sqlmap_runner again for that url - go STRAIGHT to sqli_blind_extract {url, action:'detect', known_confirmed:true, method, param, data, engine} exactly as hinted in that output, then escalate {action:'version'/'database'/'user'/'tables'} -> generate_poc -> poc_executor. WAF reset (status 0): run sqlmap_runner {technique:'E'} instead of spamming payloads. ENGINE-CONSISTENCY (v1.5.7): engine MUST match the DBMS wapiti reported in the finding info line - 'DBMS: MySQL' -> engine:'mysql', 'Microsoft SQL Server' -> engine:'mssql', unknown/absent DBMS -> engine:'auto'. NEVER switch to engine:'mssql' when wapiti reported MySQL (WAITFOR DELAY on MySQL / SLEEP on MSSQL never confirm). engine:'mssql' is only correct for a real MSSQL backend.
+5d. ADAPTIVE SELECTION (v1.6.0): pick the NEXT tool based on PREVIOUS results. The [ATTACK SURFACE] block at the top of each round lists host/port/service/URL/method/param/tech ALREADY KNOWN from real tool output - never rescan those; use it to choose the next step (e.g. WordPress detected -> wpscan + nuclei wordpress templates; WAF detected -> prefer error/time-based payloads; ASP.NET/MSSQL stack -> error-based oracle). Every tool call MUST have a reason from a prior result.
 6. DONE: When you have enough data, reply with exactly ONE JSON object and STOP calling tools:
-{"findings":[{"name":"..","severity":"critical|high|medium|low","url":"..","port":80,"service":"..","description":"..","fix":"..","cves":[]}],"risk_level":"HIGH","overall_summary":".."}
+{"findings":[{"name":"..","severity":"critical|high|medium|low","url":"..","port":80,"service":"..","description":"..","fix":"..","cves":[],"source":"..","parameter":".."}],"risk_level":"HIGH","overall_summary":".."}
 description must carry the exploitation direction from wapiti's 'TỔNG HỢP LỖ HỔNG' section (the '→ khai thác' line); fix must carry the '→ khắc phục' line. Leave cves empty [] when unknown. Never include text outside this JSON in your final turn."""
 
 
@@ -80,6 +81,16 @@ CORE RULES:
    thống TỰ ĐỘNG chạy wapiti_scan và gắn thông báo '[WAPITI TỰ CHẠY]'. Kết
    luận 'không có lỗ hổng' CHỈ hợp lệ sau khi wapiti thật sự chạy xong
    (outcome=ok hoặc error).
+6d. ADAPTIVE SELECTION (v1.6.0) — Chọn tool KHÔNG theo cảm tính mà theo KẾT
+   QUẢ TRƯỚC ĐÓ (chuỗi suy luận): phát hiện service HTTP → probe/headers →
+   phát hiện WordPress → wpscan + nuclei (wordpress templates); WAF phát hiện
+   → ưu tiên payload error/time-based thay vì boolean; stack ASP.NET/MSSQL →
+   ưu tiên oracle error-based. Block [ATTACK SURFACE] đầu lượt sau là
+   inventory: host→port→service→URL→endpoint→method→param→auth→tech ĐÃ BIẾT
+   từ tool output thật của phiên này — KHÔNG rescan mục đã có (không gọi lại
+   tool chỉ để "xác nhận lại" điều đã biết), dùng nó để quyết định bước kế
+   tiếp. MỌI tool call phải CÓ LÝ DO từ kết quả trước; nếu không có lý do thì
+   ưu tiên bước chưa được inventory phủ.
 6a. SQLI QUA FORM (v1.5.5 — TỰ ĐỘNG) — Form tìm kiếm/đăng nhập là điểm SQLi
    hàng đầu (vd form tìm kiếm keyword). wapiti_scan GIỜ TỰ QUÉT form POST:
    đọc session DB wapiti (--store-session) và test từng field form (MSSQL
@@ -163,8 +174,13 @@ CORE RULES:
    KHÔNG spam payload (dễ bị chặn/ban IP); sqlmap_runner {technique: "E"} —
    error-based E thường vượt WAF chặn payload time-based/boolean.
 7. KẾT LUẬN — Khi đủ dữ liệu, trả về ĐÚNG 1 JSON object:
-   {"findings":[{"name","severity","url","port","service","description","fix","cves"}],
+   {"findings":[{"name","severity","url","port","service","description","fix","cves",
+                 "source","parameter"}],
     "risk_level":"CRITICAL|HIGH|MEDIUM|LOW","overall_summary":"..."}
+   source = tên tool đã tạo bằng chứng (vd "wapiti_scan", "sqli_blind_extract",
+   "http_probe"); parameter = tên tham số bị lỗi nếu có (vd "keyword"), bỏ
+   trống khi không có. source/parameter phải khớp với ledger → hệ thống gộp
+   finding trùng từ nhiều scanner thành MỘT finding nhiều nguồn.
    Chỉ trả JSON này ở lượt CUỐI CÙNG, không trộn với văn bản khác.
    MAPPING WAPITI (v1.5.3): description của mỗi finding = hướng khai thác
    (dòng "→ khai thác" trong mục "TỔNG HỢP LỖ HỔNG" của wapiti_scan); fix =

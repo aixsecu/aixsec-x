@@ -122,6 +122,60 @@ def available_tools() -> tuple[set, dict]:
     return avail, missing
 
 
+# ─────────────────────────────────────────────
+# CAPABILITY DISCOVERY (v1.6.0 — roadmap item #14)
+# Planner chỉ được chọn tool có binary THẬT trên máy; version giúp model tránh
+# flag không tồn tại (vd nikto cũ/new). Probe version là subprocess → LAZY:
+# chỉ chạy khi user gọi /capabilities / --capabilities (hoặc force=True), cache
+# toàn cục — KHÔNG chạy mỗi round / lúc khởi động (giữ test 229-case nhanh).
+# ─────────────────────────────────────────────
+_VERSION_FLAGS: dict[str, tuple] = {
+    "nikto": ("-Version",),   # nikto không có --version
+}
+_DEFAULT_VERSION_FLAGS = ("--version", "-version", "-V")
+_CAP_CACHE: list | None = None
+
+
+def _version_string(binary: str) -> str:
+    """Lấy version binary (thử flags theo thứ tự; timeout 4s/flag).
+    Trả dòng đầu tiên (≤100 ký tự, phải chứa chữ số — tránh chuỗi lỗi như
+    'usage: ...') hoặc '' nếu không lấy được. Không raise — capability chỉ là
+    thông tin, KHÔNG chặn tool."""
+    flags = _VERSION_FLAGS.get(binary, _DEFAULT_VERSION_FLAGS)
+    for flag in flags:
+        try:
+            r = subprocess.run([binary, flag], capture_output=True, text=True,
+                               timeout=4)
+            if r.returncode not in (0, 1):
+                continue
+            out = (r.stdout or r.stderr or "").strip()
+            line = out.splitlines()[0].strip() if out else ""
+            if not line or len(line) > 100:
+                line = line[:100] if line else ""
+            if any(ch.isdigit() for ch in line):
+                return line
+        except (subprocess.TimeoutExpired, OSError, ValueError):
+            continue
+    return ""
+
+
+def capability_report(force: bool = False) -> list[dict]:
+    """Danh sách [{tool, binary, available, version}] theo TOOL_BINS, sort theo
+    tool. Cache toàn cục — probe lại chỉ khi force=True. Tự động reset cache khi
+    danh sách binary thay đổi (test/khởi động lại)."""
+    global _CAP_CACHE
+    if _CAP_CACHE is None or force:
+        rows = []
+        for name in sorted(TOOL_BINS):
+            binary = TOOL_BINS[name]
+            path = shutil.which(binary)
+            rows.append({"tool": name, "binary": binary,
+                         "available": path is not None,
+                         "version": _version_string(binary) if path else ""})
+        _CAP_CACHE = rows
+    return _CAP_CACHE
+
+
 def _url_host(url: str) -> str:
     from urllib.parse import urlparse
     return urlparse(url).hostname or url

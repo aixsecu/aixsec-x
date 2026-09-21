@@ -24,16 +24,17 @@ import time
 
 # ── local imports ──
 from config import load_config
+from inventory import Inventory
 from ledger import (Ledger, parse_findings_json, render_markdown, validation_plan,
                    check_findings_evidence)
 from llm import InjectionGuard, ollama_chat
 from prompts import SYSTEM_PROMPT, build_system_prompt
 from scope import ScopePolicy, normalize_host
 from tools import (TOOL_REGISTRY, TOOL_INDEX, TOOL_BINS, TOOL_TIMEOUTS,
-                   LONG_RUN_TOOLS, available_tools, _WAPITI_FIX)
+                   LONG_RUN_TOOLS, available_tools, _WAPITI_FIX, capability_report)
 
 # ── terminal colors (AIXSEC-X style) ──
-VERSION = "1.5.9"
+VERSION = "1.6.0"
 
 # v1.5.8 (Bug A): chuỗi lỗi LLM từ llm.py — nhận diện để KHÔNG đếm là plan-only
 # (trước đây timeout bị coi là "văn bản kế hoạch" → plan_only=2 → forced break →
@@ -185,6 +186,10 @@ class WebXAgent:
                                   src_dirs=self.config.get("src_dirs", []))
         self.ledger = Ledger()
         self.transcript: list[dict] = []
+        # v1.6.0 (roadmap #1/#12/#13): Attack Surface Inventory — host→port→
+        # service→URL→method→param→auth→tech, tích lũy từ tool output OK thật.
+        self.inventory = Inventory()
+        self.capabilities = None   # v1.6.0 (#14): lazy — probe version chỉ khi yêu cầu
         self.tools = TOOL_REGISTRY
         self.extra_context = ""
         # v1.4.2: phát hiện binary thiếu lúc khởi động (nuclei/arjun/... không
@@ -453,6 +458,8 @@ class WebXAgent:
                 results.append(r)
             disp.done()
             self.transcript.append({"round": rnd, "type": "tools", "calls": results})
+            # v1.6.0 (#1/#12/#13): gom tool output OK của round vào attack surface
+            self.inventory.ingest(results)
             result["calls"] += len(results)
             # v1.5.2: wapiti-first gate — chỉ wapiti_scan tính là "đã chạy" khi
             # outcome ok (thành công) HOẶC error (đã cố, fail rõ ràng). Các
@@ -481,10 +488,17 @@ class WebXAgent:
                                   "content": f"outcome={r['outcome']}\n{out}{note}"})
             msgs.append({"role": "assistant", "content": resp.get("content", "") or
                         "(calling tools...)"})
+            # v1.6.0 (#1/#13): chèn attack surface đã biết vào lượt sau — model
+            # KHÔNG rescan host/endpoint có sẵn, chỉ chọn bước mới (tech→tool).
+            surf = self.inventory.render()
+            surf_note = ("\n[ATTACK SURFACE — đã biết, KHÔNG rescan các mục này; "
+                         "dùng tech/endpoint để chọn bước TIẾP THEO]:\n" + surf
+                         ) if surf else ""
             msgs.append({"role": "user", "content":
                         "[TOOL RESULTS BEGIN]\n" +
                         json.dumps(tool_msgs, ensure_ascii=False)[:12000] +
-                        "\n[TOOL RESULTS END]\nTiếp tục. Khi đủ dữ liệu trả JSON cuối cùng."})
+                        "\n[TOOL RESULTS END]\nTiếp tục. Khi đủ dữ liệu trả JSON cuối cùng."
+                        + surf_note})
 
         # v1.5.2 (tail-order 1): AUTO-WAPITI — hết vòng lặp mà web scope active
         # và wapiti_scan chưa từng chạy (model bỏ qua dù prompt/gate bắt buộc)
@@ -636,7 +650,11 @@ class WebXAgent:
                     "description": desc,
                     "fix": _WAPITI_FIX.get(cat, _WAPITI_FIX.get("_default", "")),
                     "cves": [],
+                    # v1.6.0 (#15): source_tool = scanner chính (giữ 'source'
+                    # cho tương thích test/parse cũ)
                     "source": "wapiti_scan (auto — model down)",
+                    "source_tool": "wapiti_scan",
+                    "parameter": param or "",
                 })
         rank = {"critical": 4, "high": 3, "medium": 2, "low": 1, "info": 0}
         findings.sort(key=lambda f: rank.get(f["severity"], 0), reverse=True)
@@ -797,6 +815,7 @@ class WebXAgent:
               flush=True)
         self.transcript.append({"round": 0, "type": "tools", "calls": [r],
                                 "auto": True})
+        self.inventory.ingest([r])   # v1.6.0: wapiti auto cũng vào attack surface
         out = InjectionGuard.sanitize(r.get("output", ""),
                                       self.config["output_cap"])
         msg = {"role": "tool", "name": "wapiti_scan",
@@ -839,16 +858,45 @@ class WebXAgent:
         target = self.config["targets"][0]
         probe = _try_dispatch(self, "http_probe", {"url": target})
         hdrs = _try_dispatch(self, "headers_recon", {"url": target})
+        # v1.6.0: recon bootstrap cũng nuôi attack surface
+        self.inventory.ingest([probe, hdrs])
         self.extra_context = f"TARGET: {target}\nPROBE:\n{probe['output'][:1500]}\nHEADERS:\n{hdrs['output'][:1500]}"
         return self.extra_context
 
     def export_report(self) -> str:
         plan = validation_plan(self.ledger)
         md = render_markdown(self.ledger, ", ".join(self.config["targets"]), plan)
+        # v1.6.0 (#1): report kèm attack surface phiên này (endpoint/tech đã biết)
+        surf = self.inventory.render(limit=60)
+        if surf:
+            md += f"\n## Attack Surface (phiên này)\n```\n{surf}\n```\n"
         path = f"aixsec-x_report_{int(time.time())}.md"
         with open(path, "w") as f:
             f.write(md)
         return path
+
+    def save_inventory(self) -> str:
+        """v1.6.0: lưu attack surface JSON khi config['inventory_file'] set
+        (env WEBX_INVENTORY_FILE). Trả path đã lưu, '' nếu chưa cấu hình."""
+        path = (self.config.get("inventory_file") or "").strip()
+        if not path:
+            return ""
+        try:
+            self.inventory.save(path)
+            return path
+        except OSError as e:
+            print(f"[!] Không lưu được inventory: {e}")
+            return ""
+
+    def capability_rows(self, force: bool = False) -> list[dict]:
+        """v1.6.0 (#14 Capability Discovery): [{tool,binary,available,version}].
+        LAZY — probe version (subprocess) chỉ khi user yêu cầu; cache để không
+        chạy lại mỗi round/lúc khởi động (giữ test nhanh)."""
+        if self.capabilities is None:
+            self.capabilities = capability_report(force=False)
+        elif force:
+            self.capabilities = capability_report(force=True)
+        return self.capabilities
 
 
 def _try_dispatch(agent: WebXAgent, name: str, args: dict) -> dict:
@@ -979,8 +1027,11 @@ def _banner(cfg: dict, scope: str = "", missing=None, mode: str = "interactive",
     lines.append(f"{C}{B}[>]{RS} {D}{'host':<9}{RS} {B}{info['host']}{RS}{D}  kernel {info['kernel']}{RS}")
     lines.append(f"{C}{B}[>]{RS} {D}{'session':<9}{RS} {info['ts']}{D}  pid {info['pid']}{RS}")
     lines.append(f"{C}{B}[>]{RS} {D}{'modules':<9}{RS} {B}{n_tools}{RS}{D} tools loaded{RS}{miss_str}")
+    cap_ok = len(TOOL_BINS) - len(missing)
+    lines.append(f"{C}{B}[>]{RS} {D}{'capability':<9}{RS} {B}{cap_ok}/{len(TOOL_BINS)}{RS}"
+                 f"{D} external binaries present — '/capabilities' xem versions{RS}")
     lines.append("")
-    lines.append(center(f"{D}q quit | !! <cmd> shell | /findings ledger | /report export{RS}"))
+    lines.append(center(f"{D}q quit | !! <cmd> shell | /findings ledger | /report export | /capabilities versions{RS}"))
     lines.append("")
 
     # căn giữa cả khối theo bề rộng terminal thật (nếu rộng hơn khối + 6);
@@ -1025,6 +1076,15 @@ def main():
         sys.exit(1)
 
     agent = WebXAgent(config=cfg)
+
+    # v1.6.0 (#14): --capabilities — in bảng tool/binary/version rồi thoát
+    if "--capabilities" in sys.argv:
+        for r in agent.capability_rows():
+            mark = "✔" if r["available"] else "✗"
+            ver = r["version"] or "(chưa cài)"
+            print(f"[{mark}] {r['tool']:<22} {r['binary']:<12} {ver}")
+        return
+
     _mode = "batch" if (non_interactive or one_shot) else "interactive"
     _print_banner(cfg, scope=agent.policy.describe(),
                   missing=agent.missing_tools, mode=_mode)
@@ -1047,6 +1107,9 @@ def main():
         print("\n" + result.get("final_text", "")[:3000])
         _print_findings(agent)
         print(f"\n[*] Report: {agent.export_report()}")
+        inv_path = agent.save_inventory()   # v1.6.0: WEBX_INVENTORY_FILE
+        if inv_path:
+            print(f"[*] Attack surface: {inv_path}")
         return
 
     # ── interactive ──
@@ -1071,6 +1134,12 @@ def main():
         if line == "/report":
             print(f"[*] Saved: {agent.export_report()}")
             continue
+        if line == "/capabilities":
+            for r in agent.capability_rows():
+                mark = "✔" if r["available"] else "✗"
+                ver = r["version"] or "(chưa cài)"
+                print(f"[{mark}] {r['tool']:<22} {r['binary']:<12} {ver}")
+            continue
         result = agent.run(line)
         if result.get("llm_down"):
             print("\n" + result.get("llm_note", ""))
@@ -1078,6 +1147,7 @@ def main():
         if result.get("overall_summary"):
             print(f"\n[RISK] {result['risk_level']}\n[SUMMARY] {result['overall_summary']}")
         _print_findings(agent)
+        agent.save_inventory()   # v1.6.0: WEBX_INVENTORY_FILE (nếu set)
 
 
 if __name__ == "__main__":
