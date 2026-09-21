@@ -168,15 +168,45 @@ SYSTEM_PROMPT = SYSTEM_PROMPT_FULL
 
 _BIG_MODELS = ("14b", "32b", "70b", "122b", "72b")
 
+# v1.5.6: AI-NATIVE mode (WEBX_AI_NATIVE=1) — model TỰ phân tích lỗ hổng bằng
+# http_request (không bắt buộc wapiti/sqlmap). Khối này được nối vào prompt
+# khi bật mode; các luật khác (scope/evidence/injection) vẫn giữ nguyên.
+_AI_NATIVE_RULES = """
+
+── CHẾ ĐỘ AI-NATIVE (WEBX_AI_NATIVE=1) — QUY TẮC THAY THẾ ──
+Bạn đang chạy chế độ AI-NATIVE: KHÔNG bắt buộc wapiti_scan/sqlmap_runner.
+Thay vào đó bạn TỰ phân tích lỗ hổng bằng tool http_request:
+1. http_request là công cụ chính: gửi request (get/post/head/put/options) với
+   payload do CHÍNH BẠN thiết kế, đọc response THẬT (status, headers, body,
+   thời gian) và tự kết luận. Gọi nhiều lần với payload khác nhau để so sánh.
+2. Kỹ thuật tự phân tích được khuyến khích:
+   - SQLi quote-differential: gửi baseline 'test' vs 'test'' vs 'test"' — nếu
+     nháy đơn làm vỡ (500/khác size) mà nháy kép khớp baseline → điểm chèn.
+   - SQLi error-based: payload CONVERT/CAST gây lỗi DB lộ thông tin.
+   - SQLi time-based: SLEEP(n)/WAITFOR DELAY — so sánh thời gian phản hồi.
+   - XSS reflection: payload <script>alert(1)</script> — kiểm tra body phản hồi.
+   - SSTI/template: {{7*7}} — kiểm tra 49 trong response.
+   - Path traversal: ../../etc/passwd — kiểm tra nội dung file.
+3. MỌI finding PHẢI dựa trên ít nhất 1 response http_request THẬT (outcome=ok)
+   của phiên này — ghi method+url+payload+status trong description. Final JSON
+   gửi khi chưa có http_request nào thành công sẽ bị HỆ THỐNG TỪ CHỐI.
+4. Vẫn tuân thủ các luật khác: scope, evidence, prompt injection, tối đa 6
+   findings. Không bịa response — nếu request lỗi, ghi nhận lỗi.
+"""
+
 
 def build_system_prompt(cfg: dict | None = None) -> str:
-    """Chọn variant prompt theo WEBX_PROMPT_STYLE hoặc heuristic kích thước model."""
+    """Chọn variant prompt theo WEBX_PROMPT_STYLE hoặc heuristic kích thước model.
+    v1.5.6: nếu cfg['ai_native'] → nối thêm _AI_NATIVE_RULES vào prompt đã chọn."""
     cfg = cfg or {}
     style = str(cfg.get("prompt_style") or "auto").lower().strip()
     if style not in ("compact", "full"):
         model = str(cfg.get("model") or "").lower()
         style = "full" if any(b in model for b in _BIG_MODELS) else "compact"
-    return SYSTEM_PROMPT_FULL if style == "full" else SYSTEM_PROMPT_COMPACT
+    base = SYSTEM_PROMPT_FULL if style == "full" else SYSTEM_PROMPT_COMPACT
+    if cfg.get("ai_native"):
+        base += _AI_NATIVE_RULES
+    return base
 
 
 if __name__ == "__main__":

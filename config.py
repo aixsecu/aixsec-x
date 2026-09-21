@@ -37,6 +37,10 @@ def load_config() -> dict:
         #   ask  → hỏi operator trước hành động noisy/destructive
         #   safe → chỉ chạy tool an toàn tự động (httpx, dns, headers)
         #   all  → tự chạy mọi tool model yêu cầu (KHÔNG khuyến nghị)
+        # v1.5.6: AI-NATIVE mode — model TỰ phân tích lỗ hổng bằng http_request
+        # (không bắt buộc wapiti/sqlmap). Bật: WEBX_AI_NATIVE=1. Kết hợp
+        # WEBX_AUTO_EXEC=all để hoàn toàn hands-free (không hỏi approval).
+        "ai_native": os.environ.get("WEBX_AI_NATIVE", "0") == "1",
 
         # ── Scope (bắt buộc — comma separated) ──
         "targets": [t.strip() for t in os.environ.get("WEBX_TARGETS", "").split(",") if t.strip()],

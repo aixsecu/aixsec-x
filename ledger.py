@@ -199,7 +199,8 @@ def check_findings_evidence(findings: list[Finding], history: list[dict]) -> int
                                   "waf_detect", "_ffuf_dir", "ffuf_dir",
                                   "nikto_scan", "nuclei_scan", "param_discovery",
                                   "subdomain_probe", "wapiti_scan",
-                                  "sqli_manual_test", "sqli_blind_extract"}):
+                                  "sqli_manual_test", "sqli_blind_extract",
+                                  "http_request"}):
                 gaps.append("host chỉ mới xuất hiện qua subdomain_enum/dns_lookup — "
                             "chưa probe thật (info-only)")
         f.evidence_gaps = gaps
