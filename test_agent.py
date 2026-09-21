@@ -641,8 +641,13 @@ class TestSQLiManualTest(unittest.TestCase):
         resp = self._mock_resp()
         with patch("requests.post", return_value=resp) as mp, \
              patch("requests.get", return_value=resp) as mg:
-            out = self._exec(url="https://example.com/WebTinTuc/TimKiem",
-                             param="q", method="post", data="q=test")
+            out, data = self._exec(url="https://example.com/WebTinTuc/TimKiem",
+                                   param="q", method="post", data="q=test")
+        # v1.7.0: structured data song hành output string
+        self.assertEqual(data["url"], "https://example.com/WebTinTuc/TimKiem")
+        self.assertEqual(data["method"], "post")
+        self.assertEqual(data["param"], "q")
+        self.assertIsInstance(data["confirmed"], bool)
         # v2: baseline + quote-single + quote-double + time-based (4 POST)
         posts = [c[1]["data"] for c in mp.call_args_list]
         self.assertEqual(posts, [{"q": "test"}, {"q": "test'"},
@@ -730,10 +735,13 @@ class TestQuoteDifferential(unittest.TestCase):
 
     def test_quote_differential_confirmed(self):
         from tools import _sqli_manual_test
-        out = _sqli_manual_test(
+        out, data = _sqli_manual_test(
             url=f"http://127.0.0.1:{self.port}/search", param="q",
             method="get", engine="auto")
         self.assertIn("CONFIRMED", out)
+        # v1.7.0: structured data
+        self.assertEqual(data["url"], f"http://127.0.0.1:{self.port}/search")
+        self.assertTrue(data["confirmed"])
         self.assertIn("quote-differential", out)
         # không chạy row time-based (v1.4.5: từ 'time-based' vẫn xuất hiện
         # trong gợi ý BƯỚC TIẾP THEO — chỉ cấm row thực thi)
@@ -1881,8 +1889,8 @@ escalate sqli_blind_extract (kèm method/param/data sẵn cho POST form)."""
         base, broken, ok = self._resp(200, b"k" * 500), self._resp(500, b"error!"), \
             self._resp(200, b"k" * 500)
         with patch("requests.post", side_effect=[base, broken, ok]) as mp:
-            out = _sqli_manual_test(url="https://example.com/WebTinTuc/TimKiem",
-                                    param="q", method="post", engine="mssql")
+            out, data = _sqli_manual_test(url="https://example.com/WebTinTuc/TimKiem",
+                                          param="q", method="post", engine="mssql")
         self.assertEqual(mp.call_count, 3)  # CONFIRMED quote-diff → không cần time-based
         self.assertIn("[✓] SQLI CONFIRMED", out)
         self.assertIn("BƯỚC TIẾP THEO", out)
@@ -1894,19 +1902,25 @@ escalate sqli_blind_extract (kèm method/param/data sẵn cho POST form)."""
         self.assertIn("data:'q=test'", out)
         self.assertIn("generate_poc", out)
         self.assertIn("[+] verdict: CONFIRMED", out)
+        # v1.7.0: structured data
+        self.assertEqual(data["engine"], "mssql")
+        self.assertEqual(data["verdict"], "CONFIRMED")
+        self.assertTrue(data["confirmed"])
 
     def test_get_confirmed_next_step_hints_timebased(self):
         from tools import _sqli_manual_test
         base, broken, ok = self._resp(200, b"k" * 500), self._resp(500, b"error!"), \
             self._resp(200, b"k" * 500)
         with patch("requests.get", side_effect=[base, broken, ok]) as mg:
-            out = _sqli_manual_test(url="https://example.com/search", param="id",
-                                    method="get", engine="mssql")
+            out, data = _sqli_manual_test(url="https://example.com/search",
+                                          param="id", method="get", engine="mssql")
         self.assertEqual(mg.call_count, 3)
         self.assertIn("BƯỚC TIẾP THEO", out)
         # v1.4.6: next-step khâu sẵn known_confirmed để bỏ qua lưới 9 probe
         self.assertIn("known_confirmed:true", out)
         self.assertIn("poc_executor", out)
+        self.assertTrue(data["confirmed"])
+        self.assertEqual(data["param"], "id")
 
     def test_post_confirmed_mysql_echoes_mysql_engine(self):
         """v1.5.7: engine='mysql' CONFIRMED → next-step dbms:'mysql' (KHÔNG mssql)."""
@@ -1914,13 +1928,14 @@ escalate sqli_blind_extract (kèm method/param/data sẵn cho POST form)."""
         base, broken, ok = self._resp(200, b"k" * 500), self._resp(500, b"error!"), \
             self._resp(200, b"k" * 500)
         with patch("requests.post", side_effect=[base, broken, ok]) as mp:
-            out = _sqli_manual_test(url="https://example.com/WebTinTuc/TimKiem",
-                                    param="q", method="post", engine="mysql")
+            out, data = _sqli_manual_test(url="https://example.com/WebTinTuc/TimKiem",
+                                          param="q", method="post", engine="mysql")
         self.assertEqual(mp.call_count, 3)
         self.assertIn("[✓] SQLI CONFIRMED", out)
         self.assertIn("dbms:'mysql'", out)
         self.assertIn("engine:'mysql'", out)
         self.assertNotIn("mssql", out)
+        self.assertEqual(data["engine"], "mysql")
 
     def test_auto_engine_resolves_mysql_from_php_headers(self):
         """v1.5.7: engine='auto' + header X-Powered-By: PHP → mysql (không coerce mssql)."""
@@ -1929,12 +1944,13 @@ escalate sqli_blind_extract (kèm method/param/data sẵn cho POST form)."""
             self._resp(200, b"k" * 500)
         base.headers = {"X-Powered-By": "PHP/7.4"}
         with patch("requests.post", side_effect=[base, broken, ok]) as mp:
-            out = _sqli_manual_test(url="https://example.com/WebTinTuc/TimKiem",
-                                    param="q", method="post", engine="auto")
+            out, data = _sqli_manual_test(url="https://example.com/WebTinTuc/TimKiem",
+                                          param="q", method="post", engine="auto")
         self.assertEqual(mp.call_count, 3)
         self.assertIn("engine=mysql", out)
         self.assertIn("dbms:'mysql'", out)
         self.assertNotIn("dbms:'mssql'", out)
+        self.assertEqual(data["engine"], "mysql")
 
     def test_auto_engine_resolves_mssql_from_aspnet_headers(self):
         """v1.5.7: engine='auto' + header X-Powered-By: ASP.NET → mssql."""
@@ -1943,12 +1959,13 @@ escalate sqli_blind_extract (kèm method/param/data sẵn cho POST form)."""
             self._resp(200, b"k" * 500)
         base.headers = {"X-Powered-By": "ASP.NET"}
         with patch("requests.post", side_effect=[base, broken, ok]) as mp:
-            out = _sqli_manual_test(url="https://example.com/WebTinTuc/TimKiem",
-                                    param="q", method="post", engine="auto")
+            out, data = _sqli_manual_test(url="https://example.com/WebTinTuc/TimKiem",
+                                          param="q", method="post", engine="auto")
         self.assertEqual(mp.call_count, 3)
         self.assertIn("engine=mssql", out)
         self.assertIn("dbms:'mssql'", out)
         self.assertIn("engine:'mssql'", out)
+        self.assertEqual(data["engine"], "mssql")
 
 
 class TestSqliBlindEngineConsistency(unittest.TestCase):
@@ -1962,50 +1979,57 @@ class TestSqliBlindEngineConsistency(unittest.TestCase):
         with patch("tools._sweep_engine", return_value=sweep_return) as ms, \
              patch("sqli_blind_poc.TimeBlindExploiter") as mt:
             mt.return_value.report.return_value = run_data
-            out = _sqli_blind_extract(url="https://example.com/search",
-                                      action=action, engine=engine,
-                                      method="get", param="q",
-                                      threshold=0.7, delay=1)
-        return out, ms, mt
+            out, data = _sqli_blind_extract(url="https://example.com/search",
+                                            action=action, engine=engine,
+                                            method="get", param="q",
+                                            threshold=0.7, delay=1)
+        return out, data, ms, mt
 
     def test_auto_unknown_sweep_defaults_mysql(self):
-        out, ms, mt = self._run_report("auto", "",
+        out, data, ms, mt = self._run_report("auto", "",
                                        {"confirmed": True, "data": {"version": "5.7"}})
         ms.assert_called_once_with("https://example.com/search", 15)
         self.assertEqual(mt.call_args.kwargs["engine"], "mysql")
         self.assertIn("[✓] SQLi CONFIRMED", out)
+        self.assertTrue(data["confirmed"])
+        self.assertEqual(data["engine"], "mysql")
 
     def test_auto_sweep_mssql_resolves_mssql(self):
-        out, ms, mt = self._run_report("auto", "mssql",
+        out, data, ms, mt = self._run_report("auto", "mssql",
                                        {"confirmed": True, "data": {"version": "15.0"}})
         self.assertEqual(mt.call_args.kwargs["engine"], "mssql")
         self.assertIn("[✓] SQLi CONFIRMED", out)
+        self.assertEqual(data["engine"], "mssql")
 
     def test_waf_path_uses_resolved_mysql_not_mssql(self):
-        out, ms, mt = self._run_report("auto", "", {
+        out, data, ms, mt = self._run_report("auto", "", {
             "confirmed": False, "waf_suspected": True,
             "error": "WAF suspected", "data": {}})
         self.assertEqual(mt.call_args.kwargs["engine"], "mysql")
         self.assertIn("WAF suspected", out)
         self.assertIn("--dbms=mysql", out)
         self.assertNotIn("--dbms=mssql", out)
+        self.assertFalse(data["confirmed"])
+        self.assertIn("error", data)
 
     def test_waf_path_keeps_explicit_mssql(self):
-        out, ms, mt = self._run_report("mssql", "", {
+        out, data, ms, mt = self._run_report("mssql", "", {
             "confirmed": False, "waf_suspected": True,
             "error": "WAF suspected", "data": {}})
         self.assertIn("--dbms=mssql", out)
+        self.assertEqual(data["engine"], "mssql")
 
     def test_waf_path_invalid_engine_defaults_mysql(self):
-        out, ms, mt = self._run_report("oracle", "", {
+        out, data, ms, mt = self._run_report("oracle", "", {
             "confirmed": False, "waf_suspected": True,
             "error": "WAF suspected", "data": {}})
         self.assertEqual(mt.call_args.kwargs["engine"], "mysql")
         self.assertIn("--dbms=mysql", out)
         self.assertNotIn("--dbms=mssql", out)
+        self.assertFalse(data["confirmed"])
 
     def test_extraction_failed_defaults_mysql_not_mssql(self):
-        out, ms, mt = self._run_report("auto", "", {
+        out, data, ms, mt = self._run_report("auto", "", {
             "confirmed": True, "extraction_failed": True,
             "error": "Oracle trích xuất im lặng — 0 byte",
             "data": {}, "sqlmap_cmd": None}, action="database")
@@ -2013,14 +2037,18 @@ class TestSqliBlindEngineConsistency(unittest.TestCase):
         self.assertIn('"dbms": "mysql"', out)
         self.assertIn("--dbms=mysql", out)
         self.assertNotIn("mssql", out)
+        self.assertTrue(data["confirmed"])
+        self.assertEqual(data["extracted"], {})
 
     def test_extraction_failed_keeps_explicit_mssql(self):
-        out, ms, mt = self._run_report("mssql", "", {
+        out, data, ms, mt = self._run_report("mssql", "", {
             "confirmed": True, "extraction_failed": True,
             "error": "Oracle trích xuất im lặng — 0 byte",
             "data": {}, "sqlmap_cmd": None}, action="database")
         self.assertIn('"dbms": "mssql"', out)
         self.assertIn("--dbms=mssql", out)
+        self.assertEqual(data["engine"], "mssql")
+        self.assertEqual(data["extracted"], {})
 
     def test_engine_schema_accepts_auto(self):
         from tools import TOOL_INDEX
@@ -3452,19 +3480,29 @@ class TestHttpRequestTool(unittest.TestCase):
 
     def test_get_returns_status_headers_snippet(self):
         from tools import _http_request
-        out = _http_request(url=self._url("/product.php?id=1"), method="get")
+        out, data = _http_request(url=self._url("/product.php?id=1"),
+                                  method="get")
         self.assertIn(f"GET {self._url('/product.php?id=1')} → 200", out)
+        # v1.7.0: structured data — url/method/status/headers
+        self.assertEqual(data["url"], self._url("/product.php?id=1"))
+        self.assertEqual(data["method"], "GET")
+        self.assertEqual(data["status"], 200)
+        self.assertEqual(data["headers"]["X-Test-Header"], "yes")
         self.assertIn("X-Test-Header: yes", out)
         self.assertIn("body_snippet:", out)
         self.assertIn("echo path=/product.php?id=1", out)
 
     def test_post_reflects_body(self):
         from tools import _http_request
-        out = _http_request(url=self._url("/login"), method="post",
-                            body="user=admin&pass=123")
+        out, data = _http_request(url=self._url("/login"), method="post",
+                                  body="user=admin&pass=123")
         self.assertIn("POST", out)
         self.assertIn("→ 201", out)
         self.assertIn("posted:user=admin&pass=123", out)
+        # v1.7.0: structured data
+        self.assertEqual(data["url"], self._url("/login"))
+        self.assertEqual(data["method"], "POST")
+        self.assertEqual(data["status"], 201)
 
     def test_invalid_method_rejected(self):
         from tools import _http_request
@@ -3479,8 +3517,9 @@ class TestHttpRequestTool(unittest.TestCase):
         s.bind(("127.0.0.1", 0))
         port = s.getsockname()[1]
         s.close()  # port vừa đóng → connection refused
-        out = _http_request(url=f"http://127.0.0.1:{port}/", method="get")
+        out, data = _http_request(url=f"http://127.0.0.1:{port}/", method="get")
         self.assertTrue(out.startswith("[!] http_request: không kết nối được"))
+        self.assertIsNone(data)  # error path → không có structured data
 
     def test_timeout_capped_at_30(self):
         from tools import _http_request
@@ -3497,9 +3536,10 @@ class TestHttpRequestTool(unittest.TestCase):
             return FakeResp()
 
         with patch("requests.get", side_effect=fake_get):
-            out = _http_request(url="http://127.0.0.1:1/", _timeout=999)
+            out, data = _http_request(url="http://127.0.0.1:1/", _timeout=999)
         self.assertEqual(captured["timeout"], 30)  # cap 30s
         self.assertIn("200", out)
+        self.assertEqual(data["status"], 200)
 
     def test_timeout_floor_at_5(self):
         from tools import _http_request
@@ -3516,9 +3556,10 @@ class TestHttpRequestTool(unittest.TestCase):
             return FakeResp()
 
         with patch("requests.get", side_effect=fake_get):
-            out = _http_request(url="http://127.0.0.1:1/", _timeout=1)
+            out, data = _http_request(url="http://127.0.0.1:1/", _timeout=1)
         self.assertEqual(captured["timeout"], 5)  # floor 5s
         self.assertIn("200", out)
+        self.assertEqual(data["status"], 200)
 
     def test_registered_in_registry_with_scope_and_risk(self):
         from tools import TOOL_INDEX
@@ -3826,10 +3867,15 @@ class TestLlmDownSynthesis(unittest.TestCase):
              patch("tempfile.mkdtemp", return_value=tmp), \
              patch("tools._wapiti_parse_report", side_effect=fake_parse), \
              patch("tools._form_sweep", side_effect=fake_sweep):
-            out = _wapiti_scan(url="https://example.com", _timeout=1200,
-                               max_scan_time=120, modules="sql", scope="domain")
+            out, wdata = _wapiti_scan(url="https://example.com", _timeout=1200,
+                                      max_scan_time=120, modules="sql",
+                                      scope="domain")
         self.assertIn("QUÉT XONG", out)
         self.assertEqual(caught["budget"], 240)      # trần sweep, không phải 1200
+        # v1.7.0: structured wapiti data
+        self.assertEqual(wdata["target"], "https://example.com")
+        self.assertEqual(wdata["scope"], "domain")
+        self.assertEqual(wdata["findings"], [])
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -4168,6 +4214,377 @@ class TestInventoryInjection(unittest.TestCase):
         finally:
             TOOL_INDEX["http_probe"].exec_fn = orig_probe
             TOOL_INDEX["wapiti_scan"].exec_fn = orig_wapiti
+
+
+class TestTestHistory(unittest.TestCase):
+    """v1.7.0 (#12 attack memory — review ChatGPT điểm 4): TestHistory nhớ
+    endpoint×param×vuln_class×tool×outcome ĐÃ THỬ — planner hỏi
+    already_tested() deterministic, model KHÔNG lặp lại tool trên cùng
+    endpoint/param/lớp lỗ hổng."""
+
+    def test_add_and_dedupe(self):
+        from inventory import TestHistory
+        th = TestHistory()
+        self.assertTrue(th.add(endpoint="https://x.com/a.php",
+                               parameter="id", vuln_class="sqli",
+                               tool="sqli_manual_test", outcome="ok"))
+        self.assertFalse(th.add(endpoint="https://x.com/a.php",
+                                parameter="id", vuln_class="sqli",
+                                tool="sqli_manual_test", outcome="ok"))
+        self.assertEqual(th.record_count(), 1)
+
+    def test_add_normalizes_url(self):
+        from inventory import TestHistory
+        th = TestHistory()
+        self.assertTrue(th.add(endpoint="https://x.com/a.php/", tool="t"))
+        self.assertFalse(th.add(endpoint="https://x.com/a.php", tool="t"))
+        self.assertEqual(th.record_count(), 1)
+
+    def test_already_tested_param_semantics(self):
+        from inventory import TestHistory
+        th = TestHistory()
+        th.add(endpoint="https://x.com/a.php", parameter="id",
+               vuln_class="sqli", tool="sqli_manual_test")
+        th.add(endpoint="https://x.com/a.php", parameter="",
+               vuln_class="recon", tool="http_probe")
+        # param rỗng → khớp MỌI record của endpoint
+        self.assertTrue(th.already_tested("https://x.com/a.php"))
+        # lọc theo vuln_class
+        self.assertTrue(th.already_tested("https://x.com/a.php",
+                                          vuln_class="sqli"))
+        self.assertFalse(th.already_tested("https://x.com/a.php",
+                                           vuln_class="xss"))
+        # param có giá trị → chỉ record CÙNG param
+        self.assertTrue(th.already_tested("https://x.com/a.php",
+                                          parameter="id"))
+        self.assertFalse(th.already_tested("https://x.com/a.php",
+                                           parameter="q", vuln_class="sqli"))
+        # endpoint khác chưa test
+        self.assertFalse(th.already_tested("https://x.com/b.php"))
+
+    def test_tested_classes(self):
+        from inventory import TestHistory
+        th = TestHistory()
+        th.add(endpoint="https://x.com/a.php", parameter="id",
+               vuln_class="sqli", tool="sqli_manual_test")
+        th.add(endpoint="https://x.com/a.php", parameter="id",
+               vuln_class="scan", tool="wapiti_scan")
+        self.assertEqual(th.tested_classes("https://x.com/a.php", "id"),
+                         {"sqli", "scan"})
+        self.assertEqual(th.tested_classes("https://x.com/a.php"),
+                         {"sqli", "scan"})
+        self.assertEqual(th.tested_classes("https://x.com/other.php"), set())
+
+    def test_render_block(self):
+        from inventory import TestHistory
+        th = TestHistory()
+        th.add(endpoint="https://x.com/a.php", parameter="id",
+               vuln_class="sqli", tool="sqli_manual_test", outcome="ok")
+        out = th.render()
+        self.assertIn("[TEST HISTORY", out)
+        self.assertIn("a.php", out)
+        self.assertIn("sqli_manual_test", out)
+        self.assertIn("param=id", out)
+        self.assertEqual(TestHistory().render(), "")
+
+
+class TestMultiServiceHost(unittest.TestCase):
+    """v1.7.0 (review điểm 2): một host nhiều service (80/http + 443/https
+    + 8080/http) — không còn model 1 port/service cố định; host.port/
+    .service/.tech/.endpoints là convenience view."""
+
+    def test_ensure_web_creates_services_by_port(self):
+        inv = Inventory()
+        h = inv.ensure_web("https://example.com/", "http_probe")
+        self.assertIsNotNone(h)
+        self.assertEqual(sorted(h.services), ["443"])
+        self.assertEqual(h.services["443"].scheme, "https")
+        h2 = inv.ensure_web("http://example.com/", "http_probe")
+        self.assertIs(h2, h)                # cùng đối tượng host
+        self.assertEqual(sorted(h.services), ["443", "80"])
+        inv.ensure_web("http://example.com:8080/app", "ffuf_dir")
+        self.assertIn("8080", h.services)
+        self.assertEqual(h.services["8080"].scheme, "http")
+
+    def test_primary_lowest_numeric_port(self):
+        inv = Inventory()
+        inv.ensure_web("http://example.com:8080/", "a")
+        h = inv.ensure_web("https://example.com/", "b")
+        self.assertEqual(h.primary().port, "443")   # 443 < 8080
+        self.assertEqual(h.port, "443")
+        self.assertEqual(h.service, "https")
+
+    def test_endpoints_route_to_service(self):
+        inv = Inventory()
+        h = inv.ensure_web("https://example.com/", "a")
+        inv.ensure_web("http://example.com:8080/", "b")
+        inv.add_endpoint(h, "https://example.com/", method="GET", source="a")
+        inv.add_endpoint(h, "http://example.com:8080/health",
+                         method="GET", source="b")
+        self.assertIn("https://example.com", h.services["443"].endpoints)
+        self.assertIn("http://example.com:8080/health",
+                      h.services["8080"].endpoints)
+        self.assertEqual(len(h.endpoints), 2)   # flatten view
+
+    def test_tech_aggregate_across_services(self):
+        inv = Inventory()
+        h = inv.ensure_web("https://example.com/", "a")
+        inv.ensure_web("http://example.com:8080/", "b")
+        inv.add_tech(h, "nginx", "1.20", source="a",
+                     service=h.services["8080"])
+        inv.add_tech(h, "php", "8.1", source="b")   # primary = 443
+        self.assertEqual(h.tech.get("nginx"), "1.20")
+        self.assertEqual(h.tech.get("php"), "8.1")
+        self.assertEqual(h.services["8080"].tech.get("nginx"), "1.20")
+        self.assertEqual(h.services["443"].tech.get("php"), "8.1")
+
+    def test_render_services_lines(self):
+        inv = Inventory()
+        h = inv.ensure_web("http://example.com:8080/", "a")
+        inv.add_tech(h, "nginx", source="a")
+        inv.add_endpoint(h, "http://example.com:8080/health",
+                         method="GET", source="a")
+        out = inv.render()
+        self.assertIn("example.com:8080 (http)", out)
+        self.assertIn("GET http://example.com:8080/health", out)
+        self.assertIn("nginx", out)
+
+
+class TestStructuredDataIngest(unittest.TestCase):
+    """v1.7.0 (review điểm 1): tool trả (output_text, data_dict) — ingest ĐỌC
+    `data` TRƯỚC (không regex trên văn bản dễ vỡ); text parser chỉ là fallback
+    cho binary tool / transcript cũ."""
+
+    def test_http_probe_data_headers(self):
+        inv = Inventory()
+        n = inv.ingest([{
+            "name": "http_probe", "outcome": "ok",
+            "args": {"url": "https://example.com/"},
+            "data": {"url": "https://example.com/", "method": "GET",
+                      "status": 200,
+                      "headers": {"Server": "nginx/1.24.0",
+                                   "Set-Cookie": "PHPSESSID=abc",
+                                   "X-Powered-By": "PHP/8.1.22"}},
+            "output": "dòng text bất kỳ — KHÔNG được dùng khi có data"}])
+        self.assertGreaterEqual(n, 1)
+        h = inv.host("https://example.com/")
+        self.assertEqual(h.services["443"].tech.get("nginx"), "1.24.0")
+        self.assertEqual(h.services["443"].tech.get("php"), "8.1.22")
+        self.assertIn("cookie", h.auth_hints)
+        ep = h.endpoints["https://example.com"]
+        self.assertIn("GET", ep.methods)
+
+    def test_data_precedence_over_text(self):
+        """Khi đã có data → text (kể cả text thù địch / format lạ) bị bỏ qua."""
+        inv = Inventory()
+        inv.ingest([{
+            "name": "http_probe", "outcome": "ok",
+            "args": {"url": "https://example.com/"},
+            "data": {"url": "https://example.com/", "method": "GET",
+                      "status": 200, "headers": {"Server": "nginx"}},
+            "output": "headers: {'Server': 'evil-server/9.9'}"}])
+        h = inv.host("https://example.com/")
+        self.assertEqual(h.tech.get("nginx"), "")
+        self.assertNotIn("evil-server", h.tech)
+
+    def test_wapiti_data_findings(self):
+        inv = Inventory()
+        inv.ingest([{
+            "name": "wapiti_scan", "outcome": "ok",
+            "args": {"url": "https://example.com/"},
+            "data": {"target": "https://example.com/", "scope": "domain",
+                      "findings": [
+                          {"category": "SQL Injection", "level": "HIGH",
+                           "method": "GET", "path": "/product.php",
+                           "parameter": "id", "module": "sql"}]},
+            "output": ""}])
+        h = inv.host("https://example.com/")
+        ep = h.endpoints["https://example.com/product.php"]
+        self.assertIn("GET", ep.methods)
+        self.assertIn("id", ep.params)
+        self.assertIn("wapiti_scan", ep.sources)
+
+    def test_sqli_data_confirmed_gate(self):
+        inv = Inventory()
+        inv.ingest([{
+            "name": "sqli_manual_test", "outcome": "ok",
+            "args": {"url": "https://example.com/TimKiem"},
+            "data": {"url": "https://example.com/TimKiem",
+                      "method": "POST", "param": "keyword",
+                      "confirmed": True}}])
+        h = inv.host("https://example.com/TimKiem")
+        ep = h.endpoints["https://example.com/TimKiem"]
+        self.assertIn("POST", ep.methods)
+        self.assertIn("keyword", ep.params)
+        # confirmed=False → KHÔNG tạo endpoint ảo
+        inv2 = Inventory()
+        inv2.ingest([{
+            "name": "sqli_manual_test", "outcome": "ok",
+            "args": {"url": "https://example.com/TimKiem"},
+            "data": {"url": "https://example.com/TimKiem",
+                      "method": "POST", "param": "keyword",
+                      "confirmed": False}}])
+        self.assertIsNone(inv2.host("https://example.com/TimKiem"))
+
+
+class TestEvidenceProvenance(unittest.TestCase):
+    """v1.7.0 (review điểm 5): TechObservation giữ nguồn + bằng chứng gốc;
+    host.tech là AGGREGATE từ tech_obs — không mất provenance khi gộp."""
+
+    def test_add_tech_keeps_observation(self):
+        inv = Inventory()
+        h = inv.ensure_web("https://example.com/", "detect_cms")
+        inv.add_tech(h, "php", "8.1.22", source="detect_cms",
+                     evidence="whatweb:PHP[8.1.22]")
+        obs = h.tech_obs
+        self.assertEqual(len(obs), 1)
+        self.assertEqual(obs[0].name, "php")
+        self.assertEqual(obs[0].version, "8.1.22")
+        self.assertEqual(obs[0].source, "detect_cms")
+        self.assertEqual(obs[0].evidence, "whatweb:PHP[8.1.22]")
+        self.assertEqual(h.tech.get("php"), "8.1.22")
+
+    def test_header_evidence(self):
+        inv = Inventory()
+        inv.ingest([{
+            "name": "http_probe", "outcome": "ok",
+            "args": {"url": "https://example.com/"},
+            "output": ("GET https://example.com/ → 200 (10 bytes)\n"
+                        "headers: {'X-Powered-By': 'PHP/8.1.22'}\n")}])
+        h = inv.host("https://example.com/")
+        evs = {(o.name, o.evidence) for o in h.tech_obs}
+        self.assertIn(("php", "header:X-Powered-By"), evs)
+
+    def test_obs_dedupe_keeps_distinct_sources(self):
+        inv = Inventory()
+        h = inv.ensure_web("https://example.com/", "a")
+        inv.add_tech(h, "nginx", "1.24", source="a", evidence="header:Server")
+        inv.add_tech(h, "nginx", "1.24", source="a", evidence="header:Server")
+        inv.add_tech(h, "nginx", "1.24", source="b", evidence="header:Server")
+        self.assertEqual(len(h.tech_obs), 2)   # khác source → observation riêng
+
+    def test_save_load_roundtrip_provenance(self):
+        inv = Inventory()
+        tmp = tempfile.mktemp(suffix=".json")
+        try:
+            inv.ingest([{
+                "name": "http_probe", "outcome": "ok",
+                "args": {"url": "http://example.com:8080/"},
+                "data": {"url": "http://example.com:8080/", "method": "GET",
+                          "status": 200,
+                          "headers": {"Server": "nginx/1.24.0"}}}])
+            inv.save(tmp)
+            inv2 = Inventory.load(tmp)
+            h = inv2.host("http://example.com:8080/")
+            self.assertIsNotNone(h)
+            s = h.services["8080"]
+            self.assertEqual(s.tech.get("nginx"), "1.24.0")
+            obs = s.tech_obs[0]
+            self.assertEqual(obs.evidence, "header:Server")
+            self.assertEqual(obs.source, "http_probe")
+            self.assertEqual(obs.version, "1.24.0")
+        finally:
+            os.unlink(tmp)
+
+    def test_load_legacy_v160_flat_schema(self):
+        """v1.6.0 save cũ (flat port/service/tech + auth_hint str) vẫn load được
+        → synthesize 1 service, obs source='legacy'."""
+        inv = Inventory()
+        tmp = tempfile.mktemp(suffix=".json")
+        try:
+            with open(tmp, "w") as f:
+                json.dump({
+                    "version": 1,
+                    "hosts": [{
+                        "host": "example.com", "port": "443",
+                        "service": "https",
+                        "tech": {"nginx": "1.24.0"},
+                        "auth_hints": [], "sources": ["http_probe"],
+                        "endpoints": [{"url": "https://example.com/",
+                                       "methods": ["GET"], "params": [],
+                                       "auth_hint": "cookie",
+                                       "sources": []}]}],
+                    "dns_only": []}, f)
+            inv2 = Inventory.load(tmp)
+            h = inv2.host("https://example.com/")
+            s = h.services["443"]
+            self.assertEqual(s.scheme, "https")
+            self.assertEqual(s.tech.get("nginx"), "1.24.0")
+            self.assertEqual(s.tech_obs[0].source, "legacy")
+            self.assertIn("cookie",
+                          s.endpoints["https://example.com"].auth_hints)
+        finally:
+            os.unlink(tmp)
+
+
+class TestIngestCmsSourceFix(unittest.TestCase):
+    """v1.7.0 (review bug nhỏ): nhánh bracket detect_cms phải truyền
+    source=name — provenance observation nhất quán với nhánh keyword."""
+
+    def test_bracket_branch_sources(self):
+        inv = Inventory()
+        inv.ingest([{
+            "name": "detect_cms", "outcome": "ok",
+            "args": {"url": "https://example.com/"},
+            "output": ("https://example.com [200 OK] "
+                        "HTTPServer[nginx/1.24.0], PHP[8.1.22]")}])
+        h = inv.host("https://example.com/")
+        self.assertGreaterEqual(len(h.tech_obs), 2)
+        for o in h.tech_obs:
+            self.assertEqual(o.source, "detect_cms",
+                             f"observation {o.name} thiếu source")
+        by_name = {o.name: o for o in h.tech_obs}
+        self.assertEqual(by_name["nginx"].version, "1.24.0")
+        self.assertIn("whatweb:", by_name["nginx"].evidence)
+        self.assertEqual(h.tech.get("nginx"), "1.24.0")
+        self.assertEqual(h.tech.get("php"), "8.1.22")
+
+
+class TestAgentTestHistoryWiring(unittest.TestCase):
+    """v1.7.0 (#12): run-loop ghi TestHistory (endpoint/param/vuln_class/tool/
+    outcome) + chèn [TEST HISTORY] vào lượt sau — model không lặp lại tool."""
+
+    def test_loop_records_and_injects_test_history(self):
+        from tools import TOOL_INDEX
+        orig_probe = TOOL_INDEX["http_probe"].exec_fn
+        orig_wapiti = TOOL_INDEX["wapiti_scan"].exec_fn
+        TOOL_INDEX["http_probe"].exec_fn = _probe_test_stub
+        TOOL_INDEX["wapiti_scan"].exec_fn = _wapiti_test_stub
+        try:
+            script = [
+                {"content": "", "tool_calls": [
+                    {"name": "http_probe",
+                     "arguments": {"url": "https://example.com/"}}]},
+                {"content": FINAL_JSON, "tool_calls": []},
+            ]
+            a = WebXAgent(config=cfg(), chat=FakeChat(script=script))
+            res = a.run("test")
+            self.assertEqual(res["calls"], 2)
+            self.assertGreaterEqual(a.test_history.record_count(), 1)
+            rec = a.test_history.records[0]
+            self.assertEqual(rec.tool, "http_probe")
+            self.assertEqual(rec.vuln_class, "recon")
+            self.assertEqual(rec.outcome, "ok")
+            user_msgs = [str(m.get("content", ""))
+                         for m in a.chat.calls[1]["messages"]
+                         if m.get("role") == "user"]
+            self.assertTrue(any("[TEST HISTORY" in u for u in user_msgs))
+        finally:
+            TOOL_INDEX["http_probe"].exec_fn = orig_probe
+            TOOL_INDEX["wapiti_scan"].exec_fn = orig_wapiti
+
+
+class TestPromptHistoryRules(unittest.TestCase):
+    """v1.7.0 (#12): rule adaptive selection ở cả 2 prompt nhắc [TEST HISTORY]
+    — cấm lặp tool trên cùng endpoint+param+vuln class."""
+
+    def test_compact_mentions_test_history(self):
+        self.assertIn("TEST HISTORY", SYSTEM_PROMPT_COMPACT)
+        self.assertIn("DO NOT repeat the same tool", SYSTEM_PROMPT_COMPACT)
+
+    def test_full_mentions_test_history(self):
+        self.assertIn("[TEST HISTORY]", SYSTEM_PROMPT_FULL)
+        self.assertIn("ĐÃ THỬ", SYSTEM_PROMPT_FULL)
 
 
 if __name__ == "__main__":

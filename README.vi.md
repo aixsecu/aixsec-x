@@ -813,6 +813,46 @@ python3 agent.py --recon
 ```
 ## Changelog
 
+### v1.7.0 — Hoàn tất Phase 1 (theo review ChatGPT): structured results + inventory đa-service + bộ nhớ tấn công + evidence provenance
+
+- **Structured ToolResult (`tools.py`)** — mọi tool Python-native giờ trả về
+  `(output_text, data_dict)`: văn bản cho model + dict cấu trúc do chính tool
+  sinh (headers, findings, parameters…). `Inventory.ingest` ưu tiên đọc `data`
+  (không regex trên văn bản với http_probe / http_request / headers_recon /
+  wapiti / tool SQLi); text parser chỉ là fallback cho tool binary (whatweb,
+  wafw00f, ffuf, arjun, subfinder) và transcript cũ. Đổi 1 ký tự trong dòng
+  in KHÔNG còn làm hỏng inventory của tool Python-native.
+- **Host đa-service (`inventory.py`)** — `HostInfo.services` giờ là
+  `{port: ServiceInfo(port, scheme, protocol, tech, tech_obs, endpoints,
+  sources)}`; một host có thể đồng thời có 80/http + 443/https + 8080/http.
+  `primary()` chọn port số nhỏ nhất; view tiện lợi (`port`/`service`/`tech`/
+  `endpoints`) gộp qua các service. File save dạng flat v1.6.0 vẫn load được:
+  synthesize 1 service với observation gắn `source="legacy"` và normalize key
+  URL endpoint.
+- **`auth_hints` là set** — một endpoint có thể cần `cookie` + `csrf` + `bearer`
+  cùng lúc (trước chỉ 1 chuỗi).
+- **TestHistory — bộ nhớ tấn công (`inventory.py` + `agent.py`)** — mọi tổ hợp
+  đã thử `endpoint × parameter × vuln_class × tool × outcome` được ghi lại
+  (`TestRecord`/`TestHistory`); runner cũng ghi nhận recon và lần wapiti tự
+  động. Message lượt sau được chèn block `[TEST HISTORY]` và prompt (compact
+  rule 5d / full rule 6d) cấm lặp tool trên cùng endpoint+param+class. Planner
+  hỏi `already_tested()` deterministic thay vì để LLM đọc lại transcript.
+- **Evidence provenance (`inventory.py`)** — `TechObservation(name, version,
+  source, evidence)` giữ nguồn gốc từng observation (`header:X-Powered-By`,
+  `whatweb:<token>`, …); aggregate `tech` được dựng lại từ observations nên
+  không mất thông tin khi dedupe. Observation dedupe theo (name, version,
+  source, evidence); observation có version đầu tiên thắng trong aggregate.
+- **Sửa bug theo review** — nhánh bracket `_ingest_cms` giờ truyền `source=name`
+  như nhánh keyword (`HTTPServer[x]` lấy tên tech từ VALUE); parser bracket
+  chấp nhận value bắt đầu bằng chữ cái (whatweb in `HTTPServer[nginx/1.24.0]`)
+  — trước chỉ khớp value bắt đầu bằng chữ số; `Inventory.load` normalize key
+  URL endpoint ở cả schema v1.7.0 lẫn flat legacy để khớp model trong bộ nhớ.
+- **Tests** — 23 test hermetic mới (TestHistory add/dedupe/render và chèn
+  vào run-loop, định tuyến host đa-service, ingest dữ liệu cấu trúc và ưu tiên
+  data hơn text, evidence provenance gồm save/load roundtrip và load legacy
+  v1.6.0, source nhánh bracket `_ingest_cms`, rule history trong prompt).
+  Toàn bộ suite: 273 test pass.
+
 ### v1.6.0 — Attack Surface Inventory + Capability Discovery + finding đa-nguồn
 
 - **Attack Surface Inventory (`inventory.py`)** — bản đồ thống nhất `host → port →
