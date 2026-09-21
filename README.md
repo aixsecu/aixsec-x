@@ -433,6 +433,20 @@ better than long prompts. `prompts.py` ships 2 variants with auto-selection:
   `break_long_words=True`, splitting `**ffuf_dir**` across a wrap boundary as
   `**ff` / `uf_dir**`. Now `break_long_words=False, break_on_hyphens=False` —
   long words jump to the next line whole.
+- **v1.5.9 — Hermetic test suite (no SecLists / no internet needed):** the
+  suite previously failed on non-Kali machines — 4 errors in
+  `TestWordlistResolver` because the tests read the real
+  `/usr/share/seclists/Discovery/Web-Content` directory, and real-network
+  `http_probe` calls fired at https://example.com/ inside run-loop tests
+  (failing on offline hosts). Now:
+  - `resolve_wordlist` takes `base_dir: str = None` (resolved at call time),
+    so tests can patch the wordlist location; `TestWordlistResolver` builds
+    its own tempdir fixture with the canonical file names.
+  - `TestAgentLoop` / `TestPlanOnlyGuard` / `TestWapitiGate` stub
+    `TOOL_INDEX["http_probe"].exec_fn` with `_probe_test_stub` (deterministic
+    200, never touches the network).
+  - Verified: full suite **229 OK** both with `/usr/share/seclists` present
+    and with it moved away (offline-machine simulation).
 - **v1.5.8 — LLM-timeout resilience + wapiti form-sweep budget cap:** three
   fixes for the "model times out, ledger stays empty" failure mode seen on
   slow local LLMs (Ollama):

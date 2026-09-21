@@ -406,6 +406,19 @@ Model 7B/9B (vd: `huihui_ai/qwen3.5-abliterated:9b`) tuân theo **ít quy tắc*
   với `break_long_words=True` làm tách `**ffuf_dir**` thành `**ff` + `uf_dir**`.
   Giờ dùng `break_long_words=False, break_on_hyphens=False` — từ dài nhảy
   trọn sang dòng tiếp theo.
+- **v1.5.9 — Test suite hermetic (không cần SecLists / không cần internet):**
+  trước đây suite LỖI trên máy không phải Kali — 4 errors trong
+  `TestWordlistResolver` vì test đọc trực tiếp thư mục
+  `/usr/share/seclists/Discovery/Web-Content`, và test loop gọi `http_probe`
+  THẬT tới https://example.com/ (fail khi máy offline). Giờ:
+  - `resolve_wordlist` nhận `base_dir: str = None` (tính tại lúc gọi) nên test
+    patch được vị trí wordlist; `TestWordlistResolver` tự dựng tempdir fixture
+    với đúng tên file chuẩn.
+  - `TestAgentLoop` / `TestPlanOnlyGuard` / `TestWapitiGate` thay
+    `TOOL_INDEX["http_probe"].exec_fn` bằng `_probe_test_stub` (trả 200 xác
+    định, không bao giờ chạm mạng).
+  - Đã kiểm chứng: full suite **229 OK** cả khi có `/usr/share/seclists` lẫn
+    khi di chuyển nó đi (mô phỏng máy offline).
 - **v1.5.8 — Chống chịu LLM-timeout + trần budget form sweep wapiti:** sửa 3
   lỗi trong chuỗi "model timeout → ledger rỗng" gặp trên LLM local chậm
   (Ollama):

@@ -49,6 +49,16 @@ def _wapiti_test_stub(**kw):
     return "[!] wapiti not found (test stub — không chạy scan thật trong test)"
 
 
+def _probe_test_stub(**kw):
+    """v1.5.8 (hermetic): http_probe KHÔNG gọi mạng thật trong run-loop test
+    (trước đây GET thật https://example.com → fail khi máy không có internet).
+    Trả 200 giả định, outcome vẫn 'ok' cho mọi assert run-loop."""
+    url = kw.get("url", "https://example.com/")
+    return (f"GET {url} → 200 (512 bytes)\n"
+            f"headers: {{'Server': 'nginx', 'Content-Type': 'text/html'}}\n"
+            f"body_snippet: <html><head><title>Example Domain</title></head></html>")
+
+
 # v1.5.8 (Bug B): output wapiti THẬT (định dạng _wapiti_scan) — dòng detail
 # `[SEV] CATEGORY (param=X) — METHOD /path [module=...]` + dòng `    → ` theo
 # sau, dừng ở marker `[✓] TỔNG HỢP LỖ HỔNG` (phần summary có dòng no-param
@@ -146,11 +156,14 @@ class TestAgentLoop(unittest.TestCase):
     def setUp(self):
         from tools import TOOL_INDEX
         self._orig_wapiti_exec = TOOL_INDEX["wapiti_scan"].exec_fn
+        self._orig_probe_exec = TOOL_INDEX["http_probe"].exec_fn
         TOOL_INDEX["wapiti_scan"].exec_fn = _wapiti_test_stub
+        TOOL_INDEX["http_probe"].exec_fn = _probe_test_stub
 
     def tearDown(self):
         from tools import TOOL_INDEX
         TOOL_INDEX["wapiti_scan"].exec_fn = self._orig_wapiti_exec
+        TOOL_INDEX["http_probe"].exec_fn = self._orig_probe_exec
 
     def _agent(self, script=None, always_tools=False, extra=None):
         return WebXAgent(config=cfg(extra), chat=FakeChat(script=script, always_tools=always_tools))
@@ -342,13 +355,17 @@ class TestPlanOnlyGuard(unittest.TestCase):
 
     def setUp(self):
         # v1.5.2: stub wapiti_scan (auto wapiti ở tail phải chạy an toàn)
+        # v1.5.8: stub http_probe — không gọi mạng thật (hermetic)
         from tools import TOOL_INDEX
         self._orig_wapiti_exec = TOOL_INDEX["wapiti_scan"].exec_fn
+        self._orig_probe_exec = TOOL_INDEX["http_probe"].exec_fn
         TOOL_INDEX["wapiti_scan"].exec_fn = _wapiti_test_stub
+        TOOL_INDEX["http_probe"].exec_fn = _probe_test_stub
 
     def tearDown(self):
         from tools import TOOL_INDEX
         TOOL_INDEX["wapiti_scan"].exec_fn = self._orig_wapiti_exec
+        TOOL_INDEX["http_probe"].exec_fn = self._orig_probe_exec
 
     def _agent(self, script=None):
         return WebXAgent(config=cfg(), chat=FakeChat(script=script))
@@ -427,13 +444,17 @@ class TestWapitiGate(unittest.TestCase):
 
     def setUp(self):
         # v1.5.2: stub mặc định; test cần fake riêng sẽ patch.object đè lên
+        # v1.5.8: stub http_probe — không gọi mạng thật (hermetic)
         from tools import TOOL_INDEX
         self._orig_wapiti_exec = TOOL_INDEX["wapiti_scan"].exec_fn
+        self._orig_probe_exec = TOOL_INDEX["http_probe"].exec_fn
         TOOL_INDEX["wapiti_scan"].exec_fn = _wapiti_test_stub
+        TOOL_INDEX["http_probe"].exec_fn = _probe_test_stub
 
     def tearDown(self):
         from tools import TOOL_INDEX
         TOOL_INDEX["wapiti_scan"].exec_fn = self._orig_wapiti_exec
+        TOOL_INDEX["http_probe"].exec_fn = self._orig_probe_exec
 
     def _agent(self, script=None, extra=None):
         return WebXAgent(config=cfg(extra), chat=FakeChat(script=script))
@@ -1448,7 +1469,30 @@ class TestSast(unittest.TestCase):
 
 
 class TestWordlistResolver(unittest.TestCase):
-    """v1.4: resolve_wordlist — alias/basename/tail-match → đường dẫn tồn tại."""
+    """v1.4: resolve_wordlist — alias/basename/tail-match → đường dẫn tồn tại.
+    v1.5.8: HERMETIC — không phụ thuộc /usr/share/seclists (máy không cài
+    SecLists vẫn xanh): fixture thư mục tạm + patch SECLISTS_WEB/_WL_EXTRA_DIRS."""
+
+    _WL_FILES = ("common.txt", "raft-medium-directories.txt",
+                 "raft-small-directories.txt", "raft-large-directories.txt",
+                 "DirBuster-2007_directory-list-2.3-small.txt",
+                 "DirBuster-2007_directory-list-2.3-big.txt",
+                 "big.txt", "combined_words.txt")
+
+    def setUp(self):
+        self._wl_dir = tempfile.mkdtemp(prefix="aixsec-wl-")
+        for f in self._WL_FILES:
+            with open(os.path.join(self._wl_dir, f), "w") as fh:
+                fh.write("admin\n")
+        self._ps = [patch("tools.SECLISTS_WEB", self._wl_dir),
+                    patch("tools._WL_EXTRA_DIRS", [self._wl_dir])]
+        for p in self._ps:
+            p.start()
+
+    def tearDown(self):
+        for p in reversed(self._ps):
+            p.stop()
+        shutil.rmtree(self._wl_dir, ignore_errors=True)
 
     def test_empty_defaults_to_common(self):
         from tools import resolve_wordlist
@@ -1488,9 +1532,8 @@ class TestWordlistResolver(unittest.TestCase):
 
     def test_absolute_path(self):
         from tools import resolve_wordlist
-        real = "/usr/share/seclists/Discovery/Web-Content/raft-large-files.txt"
-        if os.path.isfile(real):
-            self.assertEqual(resolve_wordlist(real), real)
+        real = os.path.join(self._wl_dir, "common.txt")
+        self.assertEqual(resolve_wordlist(real), real)
         with self.assertRaises(ValueError):
             resolve_wordlist("/nonexistent/wl.txt")
 
