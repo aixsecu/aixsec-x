@@ -49,6 +49,24 @@ def _wapiti_test_stub(**kw):
     return "[!] wapiti not found (test stub — không chạy scan thật trong test)"
 
 
+# v1.5.8 (Bug B): output wapiti THẬT (định dạng _wapiti_scan) — dòng detail
+# `[SEV] CATEGORY (param=X) — METHOD /path [module=...]` + dòng `    → ` theo
+# sau, dừng ở marker `[✓] TỔNG HỢP LỖ HỔNG` (phần summary có dòng no-param
+# match regex → duplicate nếu không dừng).
+WAPITI_OUT = (
+    "[✓] wapiti QUÉT XONG (v3.2.1) — https://example.com "
+    "[scope=domain, 12 URL/form, 2 mục, 45s]\n"
+    "[HIGH] SQL Injection (param=id) — GET /product.php [module=sql]\n"
+    "    → Tham số id được nối trực tiếp vào truy vấn SQL\n"
+    "[MEDIUM] XSS (param=q) — GET /search.php [module=xss]\n"
+    "    → Input phản chiếu vào HTML không được encode\n"
+    "[✓] TỔNG HỢP LỖ HỔNG — HƯỚNG KHAI THÁC & KHẮC PHỤC:\n"
+    "[HIGH] SQL Injection — GET /product.php (param=id)\n"
+    "    → khai thác: sqlmap -u ...\n"
+    "    → khắc phục: prepared statements\n"
+)
+
+
 class FakeChat:
     """Scripted: vòng 1 gọi 1 tool, vòng 2 trả JSON cuối."""
     def __init__(self, script=None, always_tools=False):
@@ -3648,6 +3666,126 @@ class TestLedgerHttpRequestEvidence(unittest.TestCase):
         for f in fs:
             self.assertTrue(any("không có tool output OK nào" in g
                                 for g in f.evidence_gaps))
+
+
+class TestLlmDownSynthesis(unittest.TestCase):
+    """v1.5.8 (Bug A + Bug B): chuỗi lỗi LLM (Ollama timeout) KHÔNG còn bị
+    đếm là plan-only; 2 lỗi liên tiếp → model down → BỎ final chat (tiết kiệm
+    300s chắc chắn timeout) và tổng hợp findings từ tool output THẬT của phiên
+    (wapiti_scan đã chạy ok). Final chat lỗi → fallback tổng hợp tương tự."""
+
+    def setUp(self):
+        from tools import TOOL_INDEX
+        self._orig_wapiti_exec = TOOL_INDEX["wapiti_scan"].exec_fn
+        TOOL_INDEX["wapiti_scan"].exec_fn = _wapiti_test_stub
+
+    def tearDown(self):
+        from tools import TOOL_INDEX
+        TOOL_INDEX["wapiti_scan"].exec_fn = self._orig_wapiti_exec
+
+    def _agent(self, script=None, extra=None):
+        return WebXAgent(config=cfg(extra), chat=FakeChat(script=script))
+
+    def test_first_llm_error_retries_not_plan_only(self):
+        # Bug A: lỗi LLM lần 1 → THỬ LẠI (model có thể đang load), KHÔNG đếm
+        # plan_only, KHÔNG forced. Lần 2 phản hồi thật → reset _llm_fail.
+        err = {"content": "[!] Ollama timeout — model may still be loading or too large.",
+               "tool_calls": []}
+        a = self._agent(script=[err, {"content": FINAL_JSON, "tool_calls": []}],
+                        extra={"targets": []})  # src-only → gate wapiti tắt
+        res = a.run("test")
+        self.assertEqual(len(a.chat.calls), 2)      # retry + JSON thật
+        self.assertEqual(a._llm_fail, 0)           # reset sau phản hồi thật
+        self.assertEqual(a._plan_only, 0)          # lỗi LLM KHÔNG tính plan-only
+        self.assertNotIn("llm_down", res)
+        self.assertEqual(res["risk_level"], "HIGH")
+        self.assertEqual(res["calls"], 0)
+        # lượt retry có thông báo lỗi kết nối model
+        user_msgs = [str(m.get("content", "")) for m in a.chat.calls[1]["messages"]
+                     if m.get("role") == "user"]
+        self.assertTrue(any("Lỗi kết nối model" in u for u in user_msgs))
+
+    def test_two_llm_errors_skip_final_chat_and_synthesize(self):
+        # Bug B: 2 lỗi LLM liên tiếp → llm_down → BỎ final chat (không đốt 300s),
+        # auto wapiti vẫn chạy ở tail, findings tổng hợp từ output THẬT.
+        from tools import TOOL_INDEX
+        err = {"content": "[!] Ollama timeout — model may still be loading or too large.",
+               "tool_calls": []}
+
+        def fake_wapiti(**kw):
+            return WAPITI_OUT
+
+        with patch.object(TOOL_INDEX["wapiti_scan"], "exec_fn", fake_wapiti):
+            a = self._agent(script=[err, err])
+            res = a.run("test")
+        self.assertTrue(res["llm_down"])
+        self.assertEqual(len(a.chat.calls), 2)      # KHÔNG có final chat
+        self.assertFalse(any(c["json_mode"] for c in a.chat.calls))
+        self.assertEqual(a._llm_fail, 2)
+        self.assertTrue(a._wapiti_done)             # auto wapiti chạy ok
+        self.assertEqual(res["calls"], 1)          # chỉ auto wapiti
+        self.assertEqual(res["risk_level"], "high")  # top severity từ wapiti
+        self.assertEqual(len(res["findings"]), 2)
+        self.assertEqual(len(a.ledger.all()), 2)
+        names = {f["name"] for f in res["findings"]}
+        self.assertEqual(names, {"SQL Injection", "XSS"})
+        urls = {f["url"] for f in res["findings"]}
+        self.assertEqual(urls, {"https://example.com/product.php",
+                                "https://example.com/search.php"})
+        self.assertIn("Ollama timeout", res["llm_note"])
+
+    def test_final_chat_error_falls_back_to_synthesis(self):
+        # final round (json_mode) vẫn lỗi → fallback tổng hợp từ tool output
+        # thật; ledger = 2 FINAL_JSON (dedup) + 2 synthesized = 4.
+        from tools import TOOL_INDEX
+        err = {"content": "[!] Ollama timeout — model may still be loading or too large.",
+               "tool_calls": []}
+
+        def fake_wapiti(**kw):
+            return WAPITI_OUT
+
+        script = [{"content": FINAL_JSON, "tool_calls": []},
+                  {"content": FINAL_JSON, "tool_calls": []},
+                  err]
+        with patch.object(TOOL_INDEX["wapiti_scan"], "exec_fn", fake_wapiti):
+            a = self._agent(script=script)
+            res = a.run("test")
+        self.assertEqual(len(a.chat.calls), 3)      # 2 JSON bị gate chặn + final lỗi
+        self.assertTrue(a.chat.calls[2]["json_mode"])
+        self.assertTrue(res["llm_down"])
+        self.assertEqual(res["risk_level"], "high")
+        self.assertEqual(len(res["findings"]), 2)
+        self.assertEqual(len(a.ledger.all()), 4)    # 2 dedup FINAL_JSON + 2 synthesized
+        self.assertEqual(res["calls"], 1)          # auto wapiti ở tail
+
+    def test_sweep_budget_capped_and_remaining(self):
+        # Bug C: form sweep nhận budget CÒN LẠI và bị trần 240s — trước đây
+        # sweep ăn nguyên budget (1200s) → wapiti_scan chạy 965.7s dù
+        # max_scan_time=120.
+        from tools import _WAPITI_SWEEP_MAX_BUDGET, _wapiti_scan
+        self.assertEqual(_WAPITI_SWEEP_MAX_BUDGET, 240)
+        tmp = tempfile.mkdtemp(prefix="aixsec-x_test_sweep_")
+        with open(os.path.join(tmp, "report.json"), "w", encoding="utf-8") as f:
+            f.write("{}")
+        caught = {}
+
+        def fake_parse(report_path):
+            return {"target": "https://example.com", "version": "Wapiti 3.2.1",
+                    "scope": "domain", "crawled": 5, "findings": []}
+
+        def fake_sweep(base_url, session_dir, budget, req_timeout, cookie=""):
+            caught["budget"] = budget
+            return [], []
+
+        with patch("tools._need", return_value=None), \
+             patch("tools.run_cmd", return_value="wapiti scan done"), \
+             patch("tempfile.mkdtemp", return_value=tmp), \
+             patch("tools._wapiti_parse_report", side_effect=fake_parse), \
+             patch("tools._form_sweep", side_effect=fake_sweep):
+            out = _wapiti_scan(url="https://example.com", _timeout=1200,
+                               max_scan_time=120, modules="sql", scope="domain")
+        self.assertIn("QUÉT XONG", out)
+        self.assertEqual(caught["budget"], 240)      # trần sweep, không phải 1200
 
 
 if __name__ == "__main__":
