@@ -54,6 +54,13 @@ def load_config() -> dict:
         #   tool output OK thật) sau mỗi vòng và khi thoát. Bỏ trống = không lưu.
         "inventory_file": os.environ.get("WEBX_INVENTORY_FILE", ""),
 
+        # ── HTTP Proxy (v1.8.0 — HTTP Session Engine) ──
+        #   WEBX_HTTP_PROXY / WEBX_HTTPS_PROXY: proxy cho http_request
+        #   (Session Engine) khi cần đi qua MITM proxy (Burp/ZAP) hoặc egress.
+        #   Định dạng vd "http://127.0.0.1:8080". Bỏ trống = kết nối thẳng.
+        "http_proxy": os.environ.get("WEBX_HTTP_PROXY", "").strip(),
+        "https_proxy": os.environ.get("WEBX_HTTPS_PROXY", "").strip(),
+
         # ── DB (bỏ trống = không lưu) ──
         "db": {
             "enabled": os.environ.get("WEBX_DB_ENABLED", "0") == "1",

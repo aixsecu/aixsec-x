@@ -289,6 +289,7 @@ root@aixsec-x:~# q                                          → thoát
 | Tool | Loại | Rủi ro | Ghi chú |
 |---|---|---|---|
 | http_probe / headers_recon / dns_lookup | recon | safe | Python requests |
+| crawler | recon | safe | **v1.9.0:** Crawl BFS nội bộ Python, GET-only, dùng CHUNG Session Engine (cookie jar + proxy + auth header) — không cần wapiti binary. Khám phá: link nội bộ + external, form (action/method/field name), query param, script src, JS endpoint hint (`fetch`/`axios`/`$.ajax`/XHR — ỨNG VIÊN, cần xác minh, nguồn `crawler:js` trong inventory). Bounds: `max_depth` 0–10 (mặc định 3), `max_pages`, `request_timeout`, `time_budget` tự dừng, `trailing_slash`, `max_body_bytes`; redirect ≤5 hop trong scope, ra ngoài scope dừng + ghi `redirect_out`. Form KHÔNG bị submit; script/static/PDF ghi nhận nhưng KHÔNG enqueue. Query chuẩn hoá (sort key, bỏ anchor), canonical `/x?id={value}`, `<base href>` theo đúng urljoin, `same_scope` mặc định true. **Bug fixed (test phát hiện):** `max_depth=0` trước bị `or 3` ép thành crawl depth-3 — giờ tôn trọng 0. Tự đổ inventory qua `_DATA_INGEST["crawler"]` **v1.9.1:** JS hint kèm method ƯỚC LƯỢNG (axios verb / `xhr.open('V')` → verb; `fetch('url')` → GET chỉ khi không có options; `$.ajax`/fetch có options → UNKNOWN — UNKNOWN KHÔNG bị ép thành GET trong inventory); **EvidenceRedactor** che secret trong `evidence_dict()` (headers/cookies/params/form/json/url, `add_sensitive_field`, `pass` đã được thêm vào field mặc định) |
 | sast_scan | sast | safe | Source-code scan: pattern heuristic (PHP/Python/JS/Java) + secret scan; tùy chọn semgrep/gitleaks; scope qua WEBX_SRC_DIRS |
 | waf_detect (wafw00f) / detect_cms (whatweb) | recon | safe | fingerprint |
 | subdomain_enum (subfinder) | recon | safe | |
@@ -812,6 +813,150 @@ python3 agent.py --recon
 # → agent trả JSON findings → xem /findings → /report
 ```
 ## Changelog
+
+### v1.9.1 — EvidenceRedactor tập trung trên evidence + JS hint method thật (UNKNOWN không gán GET)
+
+- **`http_engine.py` — `EvidenceRedactor`** (hoàn thiện chuỗi secret redaction từ
+  1.8.1/1.9.0): lớp redaction tập trung, mask `REDACT_MASK = "<redacted>"`, dùng
+  chung cho mọi phần evidence — `redact_headers`, `redact_cookies`, `redact_params`,
+  `redact_form`, `redact_json` (đệ quy, KHÔNG mutate input), `redact_url`;
+  `add_sensitive_field()` thêm field nhạy cảm tùy instance. Field mặc định
+  `_SENSITIVE_FIELDS` giờ **bao gồm `pass`** (trước thiếu → `pass=` trong form/json
+  lộ ra evidence). `RequestRecord.evidence_dict()` áp redactor lên headers/cookies/
+  params/body/url/final_url/history — bản ghi gốc (`rec.body`) GIỮ giá trị thật
+  cho replay/PoC.
+- **`crawler.py` — `JsHint.method` (`str | None`):** `axios.get/post/put/patch/
+  delete/head/options('url')` và `xhr.open('DELETE','url')` → verb viết hoa;
+  `fetch('url')` → GET chỉ khi KHÔNG có options object (peek ký tự sau quote: gặp
+  `,` → có options → không chắc → `None`); `$.ajax({url})` → `None`. `to_data()`
+  xuất `"method": … or "UNKNOWN"` — lưu UNKNOWN khi không chắc, không gán bừa GET.
+- **`inventory.py` — `_ingest_data_crawler`:** dùng method thật của hint;
+  `""`/`"UNKNOWN"` → endpoint với tập method RỖNG (không ép GET). Hết cảnh
+  `axios.post('/api/login')` biến thành `GET /api/login` trong inventory.
+- **Tests** — mới `TestEvidenceRedactor` (unit: headers/cookies/params/form/json
+  deep no-mutate/url/suffix field/add_sensitive_field isolation) + `TestEvidenceRedactorEngine`
+  (server thật: JSON/FORM body bị che trong evidence nhưng bản ghi giữ nguyên — wire
+  vẫn nhận giá trị thật; apiquery auth che mọi nơi trừ bản ghi); `test_js_hints`
+  chuyển 4-tuple (kind,url,method,in_scope), `TestCrawlerInventoryIngest` /
+  `test_js_hint_scope_filter` / `test_pipeline_ingest` xác nhận UNKNOWN → methods
+  rỗng. Full suite: **339 tests OK** (previously 328).
+
+### v1.9.0 — Crawler Python-native: BFS GET-only trên Session Engine + JS hints + ingest Shadow Inventory
+
+- **`crawler.py` — crawler BFS GET-only thuần Python** (KHÔNG cần wapiti):
+  thay vì gọi binary ngoài, dùng CHUNG `http_engine.session_for(host)` nên kế
+  thừa cookie jar, proxy, auth header và redirect history của Session Engine
+  (không tồn tại implementation HTTP thứ hai trong dự án). Chỉ gửi GET;
+  form KHÔNG bị submit, script/static/PDF được ghi nhận nhưng KHÔNG enqueue.
+- **Khám phá:** link nội bộ + external, form (`action`/`method`/field name —
+  form không `action` quy về URL trang hiện tại), query param, `script src`,
+  và JS endpoint hint (`fetch`/`axios`/`$.ajax`/XHR — JsHint mang cờ
+  `in_scope` + nguồn `crawler:js`; đây là ỨNG VIÊN cần xác minh, không phải
+  endpoint chắc chắn). Hint out-of-scope vẫn được CẢNH BÁO (semantic ngoài
+  scope, có thể là SSRF/redirect targeting) nhưng KHÔNG vào inventory.
+- **Chuẩn hoá/scope:** query key sort (anchor bỏ), canonical shape
+  `/x?id={value}`, `<base href>` xử lý đúng urljoin, `same_scope` mặc định
+  true; redirect follow ≤5 hop trong scope, hop ra ngoài scope dừng + đánh
+  dấu `redirect_out`. `robots.txt` KHÔNG tôn trọng (crawler pentest).
+- **Bounds (schema ToolSpec `crawler`):** `url` (bắt buộc), `max_depth` 0–10
+  mặc định 3 — **bug fix: `max_depth=0` trước bị `int(kw.get(...) or 3)` coi
+  là falsy thành crawl depth-3, giờ tôn trọng 0 đúng nghĩa (chỉ crawl URL
+  gốc)**; `max_pages` 1–500 mặc định 100; `request_timeout` 1–60 mặc định 30;
+  `time_budget`, `trailing_slash`, `max_body_bytes` tùy chọn. `risk="safe"`,
+  `_TOOL_VULN` map sang `recon`; TOOL_TIMEOUTS có entry riêng.
+- **Ingest Shadow Inventory tự động:** `_DATA_INGEST["crawler"]` +
+  `_ingest_data_crawler` (`inventory.py`) — endpoint/method/param/tech đi vào
+  bản đồ attack surface như tool recon khác, tech từ header response có
+  `source="crawler"`; hints `crawler:js` out-of-scope bị loại khỏi inventory.
+- **Tests** — bộ test hermetic `TestCrawlerUrlHelpers` (`norm_url`/
+  `scope_key`/`canon_url`/`query_names`), `TestCrawlerParseHtml` (fixture
+  echo-server đa route `/abs,/rel,/q,/area,/frame`), `TestCrawlerCrawl` (BFS
+  page order, max_depth=0, max_pages, scope, base href, redirect out, form
+  không action, query sort), `TestCrawlerDispatch` (tool adapter+
+  OFFLINE_ASSETS/READ_TIMEOUT), `TestCrawlerInventoryIngest` (endpoint/
+  param/tech/hint ngược lại), `test_js_hints`, `test_main_bfs` (run-loop +
+  ledger probe chứa crawler) và `test_pipeline_ingest`. Toàn bộ suite:
+  **328 test pass** (trước là 304).
+
+### `v1.8.1 — Redaction credential + replay theo spec (RequestSpec) + session key hiểu scheme`
+
+- **Redaction header/cookie (`http_engine.redact_headers` / `redact_cookies`):**
+  giá trị header nhạy cảm (`Authorization`, `Proxy-Authorization`, `Cookie`,
+  `Set-Cookie`, `X-Api-Key`, `Api-Key`) bị che thành `<redacted>` ngay tại ranh
+  giới adapter/output — khớp KHÔNG phân biệt hoa thường, dict đầu vào KHÔNG bị
+  mutate (tái sử dụng an toàn). `Set-Cookie` GIỮ name cookie + thuộc tính không
+  bí mật (`sid=<redacted>; Path=/`) để phát hiện theo cấu trúc (vd auth hint
+  `cookie` của inventory) vẫn chạy; `Cookie` che toàn bộ giá trị.
+  `add_sensitive_header(name)` đăng ký thêm tên header cần che (thread-safe,
+  dùng chung mọi session) cho secret riêng của dự án.
+- **Replay ưu tiên spec (`RequestSpec`):** mỗi `RequestRecord` giờ mang `.spec`
+  — ý định request TRƯỚC auth (method/url/params/body/headers KHÔNG chứa
+  `Authorization` hay credential). `session.replay()` dựng lại request từ spec
+  và chỉ áp auth tại thời điểm gửi, nên credential lên wire ĐÚNG MỘT LẦN mỗi
+  replay và các replay sau của cùng record không bao giờ chèn trùng. Record
+  phiên trước (không có spec) fallback về đường legacy từ rec fields — không vỡ
+  với artifact cũ.
+- **Session key hiểu scheme:** key phiên giờ là `scheme://host:port` với port
+  mặc định theo scheme (`http://example.com:80`, `https://example.com:443`) và
+  host viết thường — `http://example.com:443` và `https://example.com:443` là
+  HAI phiên RIÊNG (phạm vi cookie đúng như browser), thay key `host:port` cũ
+  gộp nhầm hai scheme.
+- **Redaction evidence:** `evidence_dict()` giờ trả `request_headers` và
+  `cookies_received` ĐÃ CHE (value `<redacted>`) và `params` che secret kiểu
+  apiquery, trong khi `body_snippet` GIỮ echo thô của server làm bằng chứng
+  wire — test assert CẢ lớp che lẫn giá trị thật trên wire.
+- **Adapter đã chuyển (`tools.py`):** `_http_request`, `_http_probe` và
+  `_headers_recon` đều chạy qua session engine và trả headers/cookies đã che
+  trong `data` lẫn output; `_headers_recon` giờ gửi HEAD qua engine (echo server
+  test có thêm route `do_HEAD`).
+- **Tests** — 10 test hermetic mới/cập nhật: `TestHeaderRedaction` (5 unit:
+  che giá trị, không phân biệt hoa thường, không mutate input, cookies,
+  `add_sensitive_header` có cleanup), test auth assert lớp che + wire truth qua
+  `body_snippet`, test cookie jar assert giá trị đã che, assert
+  `_session_key`/session_count, replay spec (auth áp đúng 1 lần; fallback legacy
+  khi không có spec), redaction probe/headers_recon, và test end-to-end
+  inventory chứng minh `Set-Cookie` đã che vẫn đăng ký auth hint `cookie`.
+  Toàn bộ suite: **304 test pass** (trước là 294).
+
+### v1.8.0 — Khởi động Phase 2: HTTP Session Engine (tầng HTTP có trạng thái + cookie jar + auth + redirect history + replay + proxy)
+
+- **`http_engine.py` — Session Engine (tầng HTTP có TRẠNG THÁI):** một
+  `requests.Session` cho mỗi host (key `host:port`, port mặc định theo scheme)
+  để cookie của host này KHÔNG rò sang host khác; engine là HTTP implementation
+  DUY NHẤT — `http_request` giờ chỉ là adapter mỏng bên trên, và crawler sắp tới
+  sẽ dùng CHUNG engine này (không tồn tại implementation thứ hai trong dự án).
+  Method hỗ trợ: `get/post/head/put/options/patch/delete`; body theo thứ tự ưu
+  tiên: `params` (query) → `form` (urlencoded) → `json_body` → `body`/`data`
+  (raw) → `files` (multipart); custom headers; auth: `basic:user:pass`,
+  `bearer:token`, `api_key:name:value` (qua header), `apiquery:name:value`
+  (qua query param). Redirect mặc định tự follow; mỗi response trả `history`
+  (toàn bộ chuỗi redirect: status/location/url), `final_url` (URL thật SAU
+  redirect — trước đây báo nhầm URL request), `elapsed` đo thời gian, cookies
+  và raw evidence.
+- **Cookie jar theo host + luồng login-bằng-POST:** `Set-Cookie` từ response bất
+  kỳ được lưu vào jar của host đó và tự gửi trong các lần gọi sau — agent có thể
+  POST form đăng nhập (`form` hoặc `json_body`) rồi gọi ngay endpoint cần xác
+  thực mà không phải copy cookie bằng tay.
+- **Ring buffer + replay:** mọi request được ghi vào ring buffer theo host (tối
+  đa 20 record) kèm đúng headers/params/body/auth/cookies; `replay(rec_id)`
+  gửi lại y hệt (multipart mở lại theo path — file đã bị xóa thì ném
+  `ValueError`).
+- **Proxy:** `config` đọc `WEBX_HTTP_PROXY` / `WEBX_HTTPS_PROXY`; `agent.run()`
+  gọi `reset_sessions()` + `set_proxies()` ngay đầu run để mọi phiên (hiện tại
+  và tương lai) dùng chung cấu hình proxy; test hermetic vì `set_proxies(None)`
+  phục hồi route thẳng.
+- **Tool `http_request` — adapter, GIỮ NGUYÊN interface:** `tools._http_request`
+  giờ ủy quyền cho engine và giữ ĐÚNG interface tool + định dạng output cũ
+  (`url/method/status/headers/body_snippet/final_url/elapsed/history/cookies/
+  evidence`); prompt rule 5d (compact) / 6d (full) mô tả hành vi session để
+  model làm được test có xác thực nhiều bước. Gate AI-NATIVE không đổi —
+  `http_request` vẫn là feature BASE.
+- **Tests** — 21 test hermetic mới: `TestHttpEngineUnit` (methods, các loại
+  body, các loại auth, redirect history + final_url, cookie jar theo host, cô
+  lập, ring buffer + replay, proxy env) + 15 test adapter trong
+  `TestHttpRequestTool` (dùng chung engine, luồng cookie/login, final_url, ánh
+  xạ lỗi) + 2 test timeout cập nhật theo engine mới. Toàn bộ suite:
+  **294 test pass** (trước là 273).
 
 ### v1.7.0 — Hoàn tất Phase 1 (theo review ChatGPT): structured results + inventory đa-service + bộ nhớ tấn công + evidence provenance
 
