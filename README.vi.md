@@ -267,6 +267,7 @@ root@aixsec-x:~# Phân tích https://example.com              → agent tự g�
 root@aixsec-x:~# Quét nuclei severity high                  → tấn công mục tiêu
 root@aixsec-x:~# /findings                                  → xem ledger (candidate/confirmed/ruled_out)
 root@aixsec-x:~# /report                                    → xuất report markdown
+root@aixsec-x:~# /capabilities                              → liệt kê tool/binary/version khả dụng (v1.6.0)
 root@aixsec-x:~# !! nmap -p- 10.0.0.5                       → chạy shell trực tiếp (tự chịu trách nhiệm)
 root@aixsec-x:~# q                                          → thoát
 ```
@@ -406,6 +407,40 @@ Model 7B/9B (vd: `huihui_ai/qwen3.5-abliterated:9b`) tuân theo **ít quy tắc*
   với `break_long_words=True` làm tách `**ffuf_dir**` thành `**ff` + `uf_dir**`.
   Giờ dùng `break_long_words=False, break_on_hyphens=False` — từ dài nhảy
   trọn sang dòng tiếp theo.
+- **v1.5.9 — Test suite hermetic (không cần SecLists / không cần internet):**
+  trước đây suite LỖI trên máy không phải Kali — 4 errors trong
+  `TestWordlistResolver` vì test đọc trực tiếp thư mục
+  `/usr/share/seclists/Discovery/Web-Content`, và test loop gọi `http_probe`
+  THẬT tới https://example.com/ (fail khi máy offline). Giờ:
+  - `resolve_wordlist` nhận `base_dir: str = None` (tính tại lúc gọi) nên test
+    patch được vị trí wordlist; `TestWordlistResolver` tự dựng tempdir fixture
+    với đúng tên file chuẩn.
+  - `TestAgentLoop` / `TestPlanOnlyGuard` / `TestWapitiGate` thay
+    `TOOL_INDEX["http_probe"].exec_fn` bằng `_probe_test_stub` (trả 200 xác
+    định, không bao giờ chạm mạng).
+  - Đã kiểm chứng: full suite **229 OK** cả khi có `/usr/share/seclists` lẫn
+    khi di chuyển nó đi (mô phỏng máy offline).
+- **v1.5.8 — Chống chịu LLM-timeout + trần budget form sweep wapiti:** sửa 3
+  lỗi trong chuỗi "model timeout → ledger rỗng" gặp trên LLM local chậm
+  (Ollama):
+  - **Bug A (lỗi LLM bị đếm là plan-only):** phản hồi `[!] Ollama timeout` /
+    lỗi kết nối KHÔNG còn bị coi là lượt văn bản kế hoạch (trước đây gây
+    forced break sớm rồi đốt thêm 300s chắc chắn timeout ở final round). Lỗi
+    LLM liên tiếp lần 1 → THỬ LẠI một lần kèm gợi ý "model có thể đang load";
+    lỗi lần 2 liên tiếp → coi model down.
+  - **Bug B (model down → ledger rỗng + final chat 300s vô ích):** sau 2 lỗi
+    LLM liên tiếp agent BỎ final chat và tổng hợp findings từ tool output
+    THẬT trong history (auto wapiti vẫn chạy ở tail trước đó). Parse dòng
+    detail `[SEV] CATEGORY (param=X) — METHOD /path [module=...]` + dòng `→ `
+    theo sau (dừng ở marker `[✓] TỔNG HỢP LỖ HỔNG`), dedupe, sắp xếp theo
+    severity, fix lấy từ `_WAPITI_FIX`, commit vào ledger với `source:
+    wapiti_scan (auto — model down)`. Final chat lỗi → fallback tổng hợp
+    tương tự. Kết quả đánh dấu `llm_down: true` kèm `llm_note` trung thực.
+  - **Bug C (form sweep ăn hết budget):** sweep SQLi trên form POST chạy SAU
+    wapiti với NGUYÊN budget còn lại (vd 1200s) — lý do `wapiti_scan` chạy
+    965.7s dù `max_scan_time=120`. Sweep giờ chỉ nhận budget CÒN LẠI và bị
+    trần cứng `_WAPITI_SWEEP_MAX_BUDGET = 240s` (sàn 30s).
+  Test suite v1.5.8: **229 OK** (+4 mới: `TestLlmDownSynthesis`).
 - **v1.5.7 — ĐỒNG BỘ DB ENGINE (engine-consistency):** sửa chuỗi lỗi khi wapiti
   báo SQLi MySQL nhưng các bước sau vẫn cố thử `mssql`. Engine giờ được resolve
   NGAY ở entry-point: `engine='auto'` → đoán từ response headers qua
@@ -776,3 +811,69 @@ python3 agent.py --recon
 # → approval prompt: "[APPROVAL] 'nuclei_scan' risk [active] — run? [y/N] y"
 # → agent trả JSON findings → xem /findings → /report
 ```
+## Changelog
+
+### v1.7.0 — Hoàn tất Phase 1 (theo review ChatGPT): structured results + inventory đa-service + bộ nhớ tấn công + evidence provenance
+
+- **Structured ToolResult (`tools.py`)** — mọi tool Python-native giờ trả về
+  `(output_text, data_dict)`: văn bản cho model + dict cấu trúc do chính tool
+  sinh (headers, findings, parameters…). `Inventory.ingest` ưu tiên đọc `data`
+  (không regex trên văn bản với http_probe / http_request / headers_recon /
+  wapiti / tool SQLi); text parser chỉ là fallback cho tool binary (whatweb,
+  wafw00f, ffuf, arjun, subfinder) và transcript cũ. Đổi 1 ký tự trong dòng
+  in KHÔNG còn làm hỏng inventory của tool Python-native.
+- **Host đa-service (`inventory.py`)** — `HostInfo.services` giờ là
+  `{port: ServiceInfo(port, scheme, protocol, tech, tech_obs, endpoints,
+  sources)}`; một host có thể đồng thời có 80/http + 443/https + 8080/http.
+  `primary()` chọn port số nhỏ nhất; view tiện lợi (`port`/`service`/`tech`/
+  `endpoints`) gộp qua các service. File save dạng flat v1.6.0 vẫn load được:
+  synthesize 1 service với observation gắn `source="legacy"` và normalize key
+  URL endpoint.
+- **`auth_hints` là set** — một endpoint có thể cần `cookie` + `csrf` + `bearer`
+  cùng lúc (trước chỉ 1 chuỗi).
+- **TestHistory — bộ nhớ tấn công (`inventory.py` + `agent.py`)** — mọi tổ hợp
+  đã thử `endpoint × parameter × vuln_class × tool × outcome` được ghi lại
+  (`TestRecord`/`TestHistory`); runner cũng ghi nhận recon và lần wapiti tự
+  động. Message lượt sau được chèn block `[TEST HISTORY]` và prompt (compact
+  rule 5d / full rule 6d) cấm lặp tool trên cùng endpoint+param+class. Planner
+  hỏi `already_tested()` deterministic thay vì để LLM đọc lại transcript.
+- **Evidence provenance (`inventory.py`)** — `TechObservation(name, version,
+  source, evidence)` giữ nguồn gốc từng observation (`header:X-Powered-By`,
+  `whatweb:<token>`, …); aggregate `tech` được dựng lại từ observations nên
+  không mất thông tin khi dedupe. Observation dedupe theo (name, version,
+  source, evidence); observation có version đầu tiên thắng trong aggregate.
+- **Sửa bug theo review** — nhánh bracket `_ingest_cms` giờ truyền `source=name`
+  như nhánh keyword (`HTTPServer[x]` lấy tên tech từ VALUE); parser bracket
+  chấp nhận value bắt đầu bằng chữ cái (whatweb in `HTTPServer[nginx/1.24.0]`)
+  — trước chỉ khớp value bắt đầu bằng chữ số; `Inventory.load` normalize key
+  URL endpoint ở cả schema v1.7.0 lẫn flat legacy để khớp model trong bộ nhớ.
+- **Tests** — 23 test hermetic mới (TestHistory add/dedupe/render và chèn
+  vào run-loop, định tuyến host đa-service, ingest dữ liệu cấu trúc và ưu tiên
+  data hơn text, evidence provenance gồm save/load roundtrip và load legacy
+  v1.6.0, source nhánh bracket `_ingest_cms`, rule history trong prompt).
+  Toàn bộ suite: 273 test pass.
+
+### v1.6.0 — Attack Surface Inventory + Capability Discovery + finding đa-nguồn
+
+- **Attack Surface Inventory (`inventory.py`)** — bản đồ thống nhất `host → port →
+  service → URL → endpoint → method → parameter → auth → technology` tích lũy từ
+  **tool output thật** (http_probe, wapiti_scan, ffuf_dir, detect_cms, waf_detect…).
+  Sau mỗi vòng agent ingest kết quả OK và chèn block `[ATTACK SURFACE — đã biết,
+  KHÔNG rescan]` vào message user lượt sau, để model chọn tool kế tiếp dựa trên
+  điều ĐÃ BIẾT thay vì chạy lại recon. Lưu/đọc JSON qua `WEBX_INVENTORY_FILE`
+  (opt-in; bỏ trống = không lưu). Output tool thù địch được coi là dữ liệu không
+  tin cậy: chỉ dẫn bên trong không bao giờ được ingest.
+- **Capability Discovery (`tools.capability_report`)** — khi khởi động agent kiểm
+  tra binary Kali nào có mặt và version (`--version` / `-version` / `-V`, timeout
+  3 s, có cache). Banner hiện `capability: N/M external binaries present`;
+  `/capabilities` (interactive) và `--capabilities` (CLI) in bảng đầy đủ. Planner
+  chỉ chọn tool thực sự tồn tại.
+- **Finding đa-nguồn (`ledger.py`)** — finding giờ mang `source_tool` / `sources` /
+  `parameter`; `parse_findings_json` đọc cả `source` (cũ) lẫn `source_tool`/`sources`;
+  `Ledger.add` gộp cùng một finding từ nhiều scanner (vd Nuclei + Wapiti + AI) thành
+  MỘT finding với evidence gộp và KHÔNG bao giờ hạ cấp status; `render_markdown` hiện
+  `Nguồn: …` và `Parameter: …`. Cả 2 prompt (compact rule 5d / full rule 6d) giờ bắt
+  buộc chọn tool thích ứng và schema JSON cuối có `source`/`parameter`.
+- **Tests** — 21 test hermetic mới (ingest/dedupe/save-load inventory, capability
+  report + cache, finding sources/merge, an toàn với output thù địch, run-loop chèn
+  `[ATTACK SURFACE]`). Toàn bộ suite: 250 test pass.

@@ -122,6 +122,60 @@ def available_tools() -> tuple[set, dict]:
     return avail, missing
 
 
+# ─────────────────────────────────────────────
+# CAPABILITY DISCOVERY (v1.6.0 — roadmap item #14)
+# Planner chỉ được chọn tool có binary THẬT trên máy; version giúp model tránh
+# flag không tồn tại (vd nikto cũ/new). Probe version là subprocess → LAZY:
+# chỉ chạy khi user gọi /capabilities / --capabilities (hoặc force=True), cache
+# toàn cục — KHÔNG chạy mỗi round / lúc khởi động (giữ test 229-case nhanh).
+# ─────────────────────────────────────────────
+_VERSION_FLAGS: dict[str, tuple] = {
+    "nikto": ("-Version",),   # nikto không có --version
+}
+_DEFAULT_VERSION_FLAGS = ("--version", "-version", "-V")
+_CAP_CACHE: list | None = None
+
+
+def _version_string(binary: str) -> str:
+    """Lấy version binary (thử flags theo thứ tự; timeout 4s/flag).
+    Trả dòng đầu tiên (≤100 ký tự, phải chứa chữ số — tránh chuỗi lỗi như
+    'usage: ...') hoặc '' nếu không lấy được. Không raise — capability chỉ là
+    thông tin, KHÔNG chặn tool."""
+    flags = _VERSION_FLAGS.get(binary, _DEFAULT_VERSION_FLAGS)
+    for flag in flags:
+        try:
+            r = subprocess.run([binary, flag], capture_output=True, text=True,
+                               timeout=4)
+            if r.returncode not in (0, 1):
+                continue
+            out = (r.stdout or r.stderr or "").strip()
+            line = out.splitlines()[0].strip() if out else ""
+            if not line or len(line) > 100:
+                line = line[:100] if line else ""
+            if any(ch.isdigit() for ch in line):
+                return line
+        except (subprocess.TimeoutExpired, OSError, ValueError):
+            continue
+    return ""
+
+
+def capability_report(force: bool = False) -> list[dict]:
+    """Danh sách [{tool, binary, available, version}] theo TOOL_BINS, sort theo
+    tool. Cache toàn cục — probe lại chỉ khi force=True. Tự động reset cache khi
+    danh sách binary thay đổi (test/khởi động lại)."""
+    global _CAP_CACHE
+    if _CAP_CACHE is None or force:
+        rows = []
+        for name in sorted(TOOL_BINS):
+            binary = TOOL_BINS[name]
+            path = shutil.which(binary)
+            rows.append({"tool": name, "binary": binary,
+                         "available": path is not None,
+                         "version": _version_string(binary) if path else ""})
+        _CAP_CACHE = rows
+    return _CAP_CACHE
+
+
 def _url_host(url: str) -> str:
     from urllib.parse import urlparse
     return urlparse(url).hostname or url
@@ -142,14 +196,18 @@ def _http_probe(**kw):
                 "WWW-Authenticate", "Content-Type"]
         h = {k: v for k, v in r.headers.items() if k in keys or k.lower() in [x.lower() for x in keys]}
         body = re.sub(r"\s+", " ", (r.text or "")[:600])
-        return (f"GET {url} → {r.status_code} ({len(r.content)} bytes)\n"
-                f"headers: {h}\nbody_snippet: {body}")
+        # v1.7.0 (structured ToolResult): (output_text, data_dict) — inventory
+        # đọc data trực tiếp (headers THẬT, không cần regex trên text).
+        data = {"url": url, "method": "GET", "status": r.status_code,
+                "headers": {k: v for k, v in r.headers.items()}}
+        return ((f"GET {url} → {r.status_code} ({len(r.content)} bytes)\n"
+                 f"headers: {h}\nbody_snippet: {body}"), data)
     except ImportError:
-        return run_cmd(["curl", "-sS", "-i", "--max-time", "20", url], timeout)
+        return run_cmd(["curl", "-sS", "-i", "--max-time", "20", url], timeout), None
     except requests.exceptions.ConnectionError as e:
-        return f"[!] Không kết nối được: {e}"
+        return f"[!] Không kết nối được: {e}", None
     except requests.exceptions.Timeout:
-        return "[!] Timeout HTTP"
+        return "[!] Timeout HTTP", None
 
 
 def _http_request(**kw):
@@ -190,16 +248,19 @@ def _http_request(**kw):
         dt = round(time.time() - t0, 2)
         hdrs = {k: v for k, v in r.headers.items()}
         body_snip = re.sub(r"\s+", " ", (r.text or ""))[:2000]
-        return (f"{method.upper()} {url} → {r.status_code} "
-                f"({len(r.content)} bytes, {dt}s)\n"
-                f"headers:\n" + "\n".join(f"  {k}: {v}" for k, v in hdrs.items())
-                + f"\nbody_snippet:\n{body_snip}")
+        # v1.7.0 (structured ToolResult): data = response THẬT, không regex
+        data = {"url": url, "method": method.upper(), "status": r.status_code,
+                "headers": hdrs, "body_snippet": body_snip}
+        return ((f"{method.upper()} {url} → {r.status_code} "
+                 f"({len(r.content)} bytes, {dt}s)\n"
+                 f"headers:\n" + "\n".join(f"  {k}: {v}" for k, v in hdrs.items())
+                 + f"\nbody_snippet:\n{body_snip}"), data)
     except requests.exceptions.ConnectionError as e:
-        return f"[!] http_request: không kết nối được: {e}"
+        return f"[!] http_request: không kết nối được: {e}", None
     except requests.exceptions.Timeout:
-        return "[!] http_request: timeout HTTP"
+        return "[!] http_request: timeout HTTP", None
     except requests.exceptions.RequestException as e:
-        return f"[!] http_request: lỗi request: {e}"
+        return f"[!] http_request: lỗi request: {e}", None
 
 
 def _dns_lookup(**kw):
@@ -218,10 +279,13 @@ def _headers_recon(**kw):
         import requests
         r = requests.head(url, timeout=15, allow_redirects=True,
                           headers={"User-Agent": "Mozilla/5.0"})
-        return "HEAD " + url + f" → {r.status_code}\n" + "\n".join(
-            f"{k}: {v}" for k, v in r.headers.items())
+        # v1.7.0 (structured ToolResult): data = headers THẬT
+        data = {"url": url, "method": "HEAD", "status": r.status_code,
+                "headers": {k: v for k, v in r.headers.items()}}
+        return ("HEAD " + url + f" → {r.status_code}\n" + "\n".join(
+            f"{k}: {v}" for k, v in r.headers.items()), data)
     except Exception as e:
-        return f"[!] {e}"
+        return f"[!] {e}", None
 
 
 def _waf_detect(**kw):
@@ -306,7 +370,7 @@ _WL_EXTRA_DIRS = [SECLISTS_WEB, SECLISTS_WEB + "/raft-medium-directories",
 
 
 # fmt: off
-def resolve_wordlist(wl: str = "", base_dir: str = SECLISTS_WEB) -> str:
+def resolve_wordlist(wl: str = "", base_dir: str = None) -> str:
     """Map chuỗi wordlist (alias/basename/đường dẫn) → file tồn tại.
 
     Thứ tự: đường dẫn tuyệt đối (tồn tại) → alias (common→common.txt) →
@@ -315,6 +379,9 @@ def resolve_wordlist(wl: str = "", base_dir: str = SECLISTS_WEB) -> str:
     Không tìm thấy → raise ValueError kèm gợi ý thư mục (để model sửa ngay,
     không đốt 120s rồi mới error làm hỏng URL-gate như v1.3).
     """
+    if base_dir is None:
+        # đánh giá tại call-time để test patch được SECLISTS_WEB
+        base_dir = SECLISTS_WEB
     if not wl:
         wl = "common.txt"
     wl = wl.strip()
@@ -505,6 +572,11 @@ _WAPITI_FORM_SKIP_FIELDS: tuple[str, ...] = (
     "file", "image", "x", "y", "op", "action",
 )
 _WAPITI_MAX_SWEEP_FORMS = 10  # số field form POST tối đa sweep mỗi lượt
+# v1.5.8 (Bug C): trần budget form sweep (giây) — sweep là BỔ TRỢ (wapiti đã
+# chạy module sql), không được ăn hết budget tool sau khi wapiti xong. Trước
+# đây sweep nhận NGUYÊN budget (vd 1200s) nên tổng thời gian wapiti_scan vượt
+# xa max_scan_time + max_attack_time (user thấy 965.7s dù khai báo ~360s).
+_WAPITI_SWEEP_MAX_BUDGET = 240
 
 # v1.5.0: hướng dẫn BƯỚC TIẾP THEO theo category trong report JSON wapiti
 # (category ổn định theo version — không phải tên module). Category chưa có
@@ -1018,7 +1090,13 @@ def _wapiti_scan(**kw):
     # ── v1.5.5: FORM SWEEP — tự tìm SQLi trên form POST từ session DB wapiti
     # (không cần user trỏ tay vào URL form). Chạy NGAY CẢ khi wapiti 0 finding;
     # kết quả merge vào findings TRƯỚC early-return và trước summary/auto-exploit.
-    sweep_findings, sweep_logs = _form_sweep(url, session_dir, budget,
+    # v1.5.8 (Bug C): sweep nhận budget CÒN LẠI (budget - elapsed) thay vì nguyên
+    # budget — trước đây sweep chạy sau wapiti với đầy đủ budget nên có thể ăn
+    # thêm hàng trăm giây, đẩy tổng thời gian vượt xa giới hạn khai báo. Trần
+    # _WAPITI_SWEEP_MAX_BUDGET giữ sweep ở mức bổ trợ; sàn 30s cho ít nhất vài field.
+    elapsed = time.monotonic() - t0
+    sweep_budget = max(30, min(int(budget - elapsed), _WAPITI_SWEEP_MAX_BUDGET))
+    sweep_findings, sweep_logs = _form_sweep(url, session_dir, sweep_budget,
                                              req_timeout, cookie=str(kw.get("cookie") or ""))
     if sweep_findings:
         existing = {(f["category"], f["method"], f["path"], f["parameter"])
@@ -1031,8 +1109,20 @@ def _wapiti_scan(**kw):
         findings.sort(key=lambda x: (_WAPITI_SEV_RANK.get(_WAPITI_SEV.get(x["level"], "info"), 0),
                                      x["category"], x["path"]), reverse=True)
 
+    # v1.7.0 (structured ToolResult): data = findings giảm còn shape khai báo
+    # (hostile-safe: .get, không truyền dict gốc từ report).
+    wdata = {"target": rep.get("target") or url, "scope": rep.get("scope") or scope,
+             "findings": [{"category": str(f.get("category") or ""),
+                            "level": str(f.get("level") or "info"),
+                            "method": str(f.get("method") or "GET"),
+                            "path": str(f.get("path") or ""),
+                            "parameter": str(f.get("parameter") or ""),
+                            "module": str(f.get("module") or "")}
+                           for f in findings]}
+
     lines = [f"[✓] wapiti QUÉT XONG (v{ver}) — {rep['target']} "
-             f"[scope={rep['scope']}, {craw} URL/form, {len(findings)} mục]"]
+             f"[scope={rep['scope']}, {craw} URL/form, {len(findings)} mục, "
+             f"{elapsed:.0f}s]"]
     if sweep_logs:
         lines.append("[i] FORM SWEEP (tự tìm SQLi trên form POST):")
         lines.extend(sweep_logs)
@@ -1041,7 +1131,7 @@ def _wapiti_scan(**kw):
         lines.append("[→] BƯỚC TIẾP THEO: hẹp phạm vi (scope=page/folder, -d sâu hơn), "
                      "bật nhóm module (vd 'sql,xss,exec'), hoặc chạy http_probe tìm "
                      "thêm endpoint/form rồi wapiti_scan lại từng URL cụ thể.")
-        return "\n".join(lines) + f"\n[i] report JSON (bằng chứng): {report_path}"
+        return ("\n".join(lines) + f"\n[i] report JSON (bằng chứng): {report_path}", wdata)
 
     sev_sort = ["critical", "high", "medium", "low", "info"]
     by_sev: dict[str, list[dict]] = {s: [] for s in sev_sort}
@@ -1157,7 +1247,7 @@ def _wapiti_scan(**kw):
             lines.append("[i] Không có SQLi để auto-exploit; các finding khác đã kèm "
                          "payload + hướng dẫn bên trên.")
     lines.append(f"[i] report JSON (bằng chứng đầy đủ): {report_path}")
-    return "\n".join(lines)
+    return "\n".join(lines), wdata
 
 
 def _form_from_payload(payload: str, param: str) -> dict:
@@ -1331,7 +1421,11 @@ def _sqli_manual_test(**kw):
                          + ". Thử sqlmap_check/sqli_blind_extract hoặc param khác trong form "
                            "(tham số từ wapiti_scan/http_probe).")
     lines.append(f"[+] verdict: {verdict}" + (f" — {method_used}" if method_used else ""))
-    return "\n".join(lines)
+    # v1.7.0 (structured ToolResult): data cho inventory — confirmed + param
+    sdata = {"url": url, "method": method, "param": param, "engine": engine,
+             "confirmed": verdict == "CONFIRMED", "verdict": verdict,
+             "method_used": method_used}
+    return "\n".join(lines), sdata
 
 
 def _sqli_blind_extract(**kw):
@@ -1386,7 +1480,7 @@ def _sqli_blind_extract(**kw):
                         limit=int(kw.get("limit", 10)),
                         max_len=int(kw.get("max_len", 60)))
     except Exception as e:  # noqa: BLE001
-        return f"[!] sqli_blind_extract lỗi: {e}"
+        return f"[!] sqli_blind_extract lỗi: {e}", None
     if not res.get("confirmed"):
         err = res.get("error") or "unknown"
         out = (f"[-] SQLi NOT CONFIRMED — {err}\n"
@@ -1398,15 +1492,20 @@ def _sqli_blind_extract(**kw):
             out += (f"\n[!] WAF suspected (probe status-0) — chạy: "
                     f"sqlmap{form} -u {kw['url']} --dbms={dbms} "
                     f"--technique=E --batch")
-        return out
+        # v1.7.0: data kèm confirmed=False → inventory không thêm endpoint ảo
+        return out, {"url": kw["url"],
+                     "method": str(kw.get("method") or "get"),
+                     "param": kw.get("param") or "",
+                     "engine": engine, "confirmed": False,
+                     "error": res.get("error") or ""}
     lines = [f"[✓] SQLi CONFIRMED — {res.get('injection') or ''}",
              f"[i] mode={res.get('mode')} · delay={ex.delay}s · threshold={ex.threshold}s"]
     if ex.known_confirmed:
         # v1.4.6: lỗi đã xác nhận ở phiên trước → bỏ qua lưới 9 probe
         lines.append("[i] known_confirmed: true — bỏ qua lưới 9 probe "
                      "(lỗi đã xác nhận từ trước)")
-    data = res.get("data") or {}
-    has_data = any(v for v in data.values() if v)
+    sdata = res.get("data") or {}
+    has_data = any(v for v in sdata.values() if v)
     # v1.4.7: oracle im lặng (0 byte — quote-parity mock / template CONTAINS thật)
     # → KHÔNG giả vờ đã extract (v1.4.6 in ra '[+] version: ' trống với outcome=ok);
     # trả outcome=error kèm hướng sqlmap → pipeline chuyển sqlmap_runner FIRST.
@@ -1426,15 +1525,24 @@ def _sqli_blind_extract(**kw):
         tip = (f"[i] Chuyển sang sqlmap: gọi sqlmap_runner {{\"url\": \"{kw['url']}\""
                + (f", \"data\": \"{kw['data']}\"" if kw.get("data") else "")
                + f", \"dbms\": \"{dbms}\"}} — hoặc chạy: {smc}")
-        return head + "\n" + tip
-    for k, v in data.items():
+        # v1.7.0: CONFIRMED nhưng extraction im lặng → data vẫn đánh dấu endpoint
+        return (head + "\n" + tip,
+                {"url": kw["url"], "method": str(kw.get("method") or "get"),
+                 "param": kw.get("param") or "", "engine": engine,
+                 "confirmed": True, "injection": res.get("injection") or "",
+                 "extracted": {}})
+    for k, v in sdata.items():
         if v is None:
             continue
         if isinstance(v, list):
             lines.append(f"[+] {k}: " + ", ".join(str(x) for x in v)[:2000])
         else:
             lines.append(f"[+] {k}: {str(v)[:3000]}")
-    return "\n".join(lines)
+    return ("\n".join(lines),
+            {"url": kw["url"], "method": str(kw.get("method") or "get"),
+             "param": kw.get("param") or "", "engine": engine,
+             "confirmed": True, "injection": res.get("injection") or "",
+             "extracted": sdata})
 
 
 def _generate_poc(**kw):

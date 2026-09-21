@@ -169,6 +169,7 @@ python3 agent.py --non-interactive                # run automatically
 | `WEBX_THINK` | `0` | `1`=enable thinking mode (not recommended together with function calling) |
 | `WEBX_AUTO_EXEC` | `ask` | `ask`=prompt operator before noisy/active tools; `safe`=auto-run only safe tools; `all`=auto-run everything (risky) |
 | `WEBX_AI_NATIVE` | `0` | **v1.5.6** `1`=AI-NATIVE mode: the model analyzes vulnerabilities itself via `http_request` (no mandatory wapiti/sqlmap; final JSON requires ≥1 real `http_request` response) |
+| `WEBX_INVENTORY_FILE` | *(empty)* | **v1.6.0** path to save the Attack Surface Inventory JSON (`host→port→service→URL→endpoint→method→param→auth→tech`, accumulated from real tool output) after every round and on exit. Empty = do not save |
 | `WEBX_MAX_ROUNDS` | `8` | Max tool-call rounds per turn (lower = faster/cheaper; a 9B model on a 4 vCPU box can take 20–30 min per round) |
 | `WEBX_TOOL_TIMEOUT` | `90` | Per-tool timeout (seconds) |
 | `WEBX_LLM_TIMEOUT` | `300` | Max time waiting for a model reply per round (seconds); a 9B model on CPU can take 1–3 minutes |
@@ -273,6 +274,7 @@ root@aixsec-x:~# Analyze https://example.com                   → agent calls t
 root@aixsec-x:~# Run nuclei severity high                      → attack the target
 root@aixsec-x:~# /findings                                     → view ledger (candidate/confirmed/ruled_out)
 root@aixsec-x:~# /report                                       → export markdown report
+root@aixsec-x:~# /capabilities                                 → list tool/binary/version availability (v1.6.0)
 root@aixsec-x:~# !! nmap -p- 10.0.0.5                          → run a shell command directly (at your own risk)
 root@aixsec-x:~# q                                             → quit
 ```
@@ -433,6 +435,45 @@ better than long prompts. `prompts.py` ships 2 variants with auto-selection:
   `break_long_words=True`, splitting `**ffuf_dir**` across a wrap boundary as
   `**ff` / `uf_dir**`. Now `break_long_words=False, break_on_hyphens=False` —
   long words jump to the next line whole.
+- **v1.5.9 — Hermetic test suite (no SecLists / no internet needed):** the
+  suite previously failed on non-Kali machines — 4 errors in
+  `TestWordlistResolver` because the tests read the real
+  `/usr/share/seclists/Discovery/Web-Content` directory, and real-network
+  `http_probe` calls fired at https://example.com/ inside run-loop tests
+  (failing on offline hosts). Now:
+  - `resolve_wordlist` takes `base_dir: str = None` (resolved at call time),
+    so tests can patch the wordlist location; `TestWordlistResolver` builds
+    its own tempdir fixture with the canonical file names.
+  - `TestAgentLoop` / `TestPlanOnlyGuard` / `TestWapitiGate` stub
+    `TOOL_INDEX["http_probe"].exec_fn` with `_probe_test_stub` (deterministic
+    200, never touches the network).
+  - Verified: full suite **229 OK** both with `/usr/share/seclists` present
+    and with it moved away (offline-machine simulation).
+- **v1.5.8 — LLM-timeout resilience + wapiti form-sweep budget cap:** three
+  fixes for the "model times out, ledger stays empty" failure mode seen on
+  slow local LLMs (Ollama):
+  - **Bug A (LLM timeout counted as plan-only):** an `[!] Ollama timeout` /
+    connection-error response is no longer treated as a plan-only round
+    (which forced an early break and then burned a guaranteed-300s final
+    round). The first consecutive LLM error now triggers ONE retry with a
+    "model may still be loading" hint; a second consecutive error marks the
+    model down.
+  - **Bug B (model down → empty ledger + 300s wasted final chat):** after two
+    consecutive LLM errors the agent SKIPS the final chat entirely and
+    synthesizes findings from the REAL tool output already in the session
+    history (auto wapiti still runs at the tail first). Detail lines
+    `[SEV] CATEGORY (param=X) — METHOD /path [module=...]` + following
+    `→ ` lines are parsed (stopping at the `[✓] TỔNG HỢP LỖ HỔNG` marker),
+    deduped, sorted by severity, fix text taken from `_WAPITI_FIX`, and
+    committed to the ledger with `source: wapiti_scan (auto — model down)`.
+    If the final chat itself errors, the same fallback synthesis runs. The
+    result is marked `llm_down: true` with an honest `llm_note`.
+  - **Bug C (wapiti form sweep ate the whole budget):** the POST-form SQLi
+    sweep ran after wapiti with the FULL remaining budget (e.g. 1200s), which
+    is why `wapiti_scan` could take 965.7s despite `max_scan_time=120`. The
+    sweep now receives only the REMAINING budget and is hard-capped at
+    `_WAPITI_SWEEP_MAX_BUDGET = 240s` (30s floor).
+  Test suite v1.5.8: **229 OK** (+4 new: `TestLlmDownSynthesis`).
 - **v1.5.7 — DB engine consistency:** fixed the chain where wapiti reported a
   MySQL SQLi but downstream steps still tried `mssql`. The engine is now
   resolved at the entry point: `engine='auto'` → guessed from response headers
@@ -819,3 +860,77 @@ python3 agent.py --recon
 # → approval prompt: "[APPROVAL] 'nuclei_scan' risk [active] — run? [y/N] y"
 # → agent returns JSON findings → /findings → /report
 ```
+
+## Changelog
+
+### v1.7.0 — Phase 1 complete (ChatGPT review): structured results + multi-service inventory + attack memory + evidence provenance
+
+- **Structured ToolResult (`tools.py`)** — every native Python tool now returns
+  `(output_text, data_dict)`: the human-readable text for the model plus a
+  structured dict generated from the tool's own data (headers, findings,
+  parameters…). `Inventory.ingest` prefers `data` (no text regex for
+  http_probe / http_request / headers_recon / wapiti / SQLi tools); text
+  parsers remain only as fallback for binary tools (whatweb, wafw00f, ffuf,
+  arjun, subfinder) and old transcripts. A one-character change in a printed
+  line no longer breaks the inventory for Python-native tools.
+- **Multi-service host (`inventory.py`)** — `HostInfo.services` is now
+  `{port: ServiceInfo(port, scheme, protocol, tech, tech_obs, endpoints,
+  sources)}`; one host can carry 80/http + 443/https + 8080/http at once.
+  `primary()` picks the lowest numeric port; convenience views
+  (`port`/`service`/`tech`/`endpoints`) aggregate over services. v1.6.0 flat
+  save files still load: a service is synthesized with observations tagged
+  `source="legacy"` and endpoint URL keys are normalized.
+- **`auth_hints` is a set** — an endpoint can need `cookie` + `csrf` + `bearer`
+  at the same time (previously a single string).
+- **TestHistory — attack memory (`inventory.py` + `agent.py`)** — every tested
+  combination `endpoint × parameter × vuln_class × tool × outcome` is recorded
+  (`TestRecord`/`TestHistory`); the runner records recon and wapiti attempts
+  too. The next round's user message gets a `[TEST HISTORY]` block and the
+  prompts (compact rule 5d / full rule 6d) forbid repeating the same tool on
+  the same endpoint+param+class. The planner queries deterministic
+  `already_tested()` instead of letting the LLM re-read the transcript.
+- **Evidence provenance (`inventory.py`)** — `TechObservation(name, version,
+  source, evidence)` keeps the origin of every observation (`header:X-Powered-By`,
+  `whatweb:<token>`, …); the `tech` aggregate is rebuilt from observations so
+  no information is lost when deduping. Observations dedupe by (name, version,
+  source, evidence); the first versioned observation wins in the aggregate.
+- **Bug fixes from the review** — `_ingest_cms` bracket branch now passes
+  `source=name` like the keyword branch (`HTTPServer[x]` takes the tech name
+  from the value); the bracket parser accepts values starting with a letter
+  (whatweb emits `HTTPServer[nginx/1.24.0]`) — previously only digit-leading
+  values matched; `Inventory.load` normalizes endpoint URL keys in both the
+  v1.7.0 and legacy flat schemas so keys match the in-memory model.
+- **Tests** — 23 new hermetic tests (TestHistory add/dedupe/render and
+  run-loop injection, multi-service host routing, structured-data ingest and
+  data-over-text precedence, evidence provenance incl. save/load roundtrip
+  and legacy v1.6.0 load, `_ingest_cms` bracket source, prompt history rules).
+  Full suite: 273 tests pass.
+
+### v1.6.0 — Attack Surface Inventory + Capability Discovery + multi-source findings
+
+- **Attack Surface Inventory (`inventory.py`)** — a unified `host → port →
+  service → URL → endpoint → method → parameter → auth → technology` map
+  accumulated from **real tool output** (http_probe, wapiti_scan, ffuf_dir,
+  detect_cms, waf_detect…). After every round the agent ingests OK tool
+  results and prepends a `[ATTACK SURFACE — đã biết, KHÔNG rescan]` block to
+  the next round's user message, so the model picks the next tool from what is
+  already known instead of re-running recon. Save/load JSON via
+  `WEBX_INVENTORY_FILE` (opt-in; empty = not saved). Hostile tool output is
+  treated as untrusted data: instructions inside it are never ingested.
+- **Capability Discovery (`tools.capability_report`)** — on startup the agent
+  checks which Kali binaries are present and their versions (`--version` /
+  `-version` / `-V`, 3 s timeout, cached). Banner shows `capability: N/M
+  external binaries present`; `/capabilities` (interactive) and
+  `--capabilities` (CLI) print the full table. The planner only picks tools
+  that actually exist.
+- **Multi-source findings (`ledger.py`)** — findings now carry
+  `source_tool` / `sources` / `parameter`; `parse_findings_json` reads both
+  `source` (legacy) and `source_tool`/`sources`; `Ledger.add` merges the same
+  finding from several scanners (e.g. Nuclei + Wapiti + AI) into ONE finding
+  with combined evidence and never downgrades status; `render_markdown` shows
+  `Nguồn: …` and `Parameter: …`. Both prompts (compact rule 5d / full rule 6d)
+  now require adaptive tool selection and the final JSON schema includes
+  `source`/`parameter`.
+- **Tests** — 21 new hermetic tests (inventory ingest/dedupe/save-load,
+  capability report + cache, finding sources/merge, hostile-output injection
+  safety, run-loop `[ATTACK SURFACE]` injection). Full suite: 250 tests pass.

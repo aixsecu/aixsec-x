@@ -30,6 +30,11 @@ class Finding:
     evidence: list[str] = field(default_factory=list)
     reproduction_steps: list[str] = field(default_factory=list)
     evidence_gaps: list[str] = field(default_factory=list)
+    # v1.6.0 (roadmap #4/#5/#15): đa-nguồn bằng chứng — cùng finding từ nhiều
+    # scanner (wapiti + nuclei + AI) gộp lại MỘT finding, sources lưu tool nào.
+    source_tool: str = ""                 # scanner chính tạo ra finding
+    sources: list[str] = field(default_factory=list)   # mọi tool xác nhận
+    parameter: str = ""                   # tham số liên quan (vd param SQLi/XSS)
 
     @property
     def has_evidence_gap(self) -> bool:
@@ -52,10 +57,25 @@ class Ledger:
     def __init__(self):
         self.findings: dict[tuple, Finding] = {}
 
+    # trạng thái mạnh hơn sẽ thắng khi merge cùng finding từ nhiều nguồn
+    _STATUS_RANK = {"ruled_out": 0, "candidate": 1, "needs_validation": 2,
+                    "confirmed": 3}
+
     def add(self, f: Finding) -> Finding:
+        """v1.6.0: merge đa-nguồn — cùng key (name,url,service) từ scanner khác
+        → union evidence + sources, bổ sung parameter nếu còn trống, status chỉ
+        nâng cấp (candidate → needs_validation → confirmed) KHÔNG hạ cấp."""
         if f.key in self.findings:
             old = self.findings[f.key]
             old.evidence += [e for e in f.evidence if e not in old.evidence]
+            old.sources += [s for s in (f.sources or [])
+                            if s and s not in old.sources]
+            if not old.source_tool and f.source_tool:
+                old.source_tool = f.source_tool
+            if not old.parameter and f.parameter:
+                old.parameter = f.parameter
+            if self._STATUS_RANK.get(f.status, 1) > self._STATUS_RANK.get(old.status, 1):
+                old.status = f.status
             return old
         self.findings[f.key] = f
         return f
@@ -86,6 +106,7 @@ def parse_findings_json(text: str) -> list[Finding]:
     for item in data.get("findings", []) if isinstance(data, dict) else []:
         if not isinstance(item, dict) or not item.get("name"):
             continue
+        src = str(item.get("source_tool") or item.get("source") or "")
         out.append(Finding(
             name=str(item["name"]),
             severity=str(item.get("severity", "medium")).lower(),
@@ -95,6 +116,10 @@ def parse_findings_json(text: str) -> list[Finding]:
             description=str(item.get("description", "")),
             fix=str(item.get("fix", "")),
             cves=[c for c in item.get("cves", []) if str(c).startswith("CVE-")],
+            source_tool=src,
+            sources=([src] if src else [])
+                      + [s for s in item.get("sources", []) if str(s) and str(s) != src],
+            parameter=str(item.get("parameter", "")),
         ))
     return out
 
@@ -236,6 +261,12 @@ def render_markdown(ledger: Ledger, target: str, plan: list | None = None) -> st
         lines.append(f"## {f.name} [{f.severity.upper()}] — **{f.status}** (conf {f.confidence:.0%})")
         if f.url:
             lines.append(f"- URL: {f.url}")
+        if f.parameter:
+            lines.append(f"- Parameter: {f.parameter}")
+        if f.sources:
+            lines.append(f"- Nguồn: {', '.join(f.sources)}")
+        elif f.source_tool:
+            lines.append(f"- Nguồn: {f.source_tool}")
         lines.append(f"- Mô tả: {f.description}")
         if f.evidence_gaps:
             lines.append("- ⚠ THIẾU BẰNG CHỨNG TRONG PHIÊN (có thể model bịa):")

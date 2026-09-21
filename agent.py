@@ -24,16 +24,43 @@ import time
 
 # ── local imports ──
 from config import load_config
+from inventory import Inventory, TestHistory
 from ledger import (Ledger, parse_findings_json, render_markdown, validation_plan,
                    check_findings_evidence)
 from llm import InjectionGuard, ollama_chat
 from prompts import SYSTEM_PROMPT, build_system_prompt
 from scope import ScopePolicy, normalize_host
 from tools import (TOOL_REGISTRY, TOOL_INDEX, TOOL_BINS, TOOL_TIMEOUTS,
-                   LONG_RUN_TOOLS, available_tools)
+                   LONG_RUN_TOOLS, available_tools, _WAPITI_FIX, capability_report)
 
 # ── terminal colors (AIXSEC-X style) ──
-VERSION = "1.5.7"
+VERSION = "1.7.0"
+
+# v1.7.0 (#12 attack memory): phân loại vuln_class cho TestHistory theo tool
+# (sqli→sqli, scanner→scan, recon→recon, poc→poc; tool không khớp → "").
+_TOOL_VULN = {}
+for _t in ("sqli_manual_test", "sqli_blind_extract", "sqlmap_check", "sqlmap_runner"):
+    _TOOL_VULN[_t] = "sqli"
+for _t in ("wapiti_scan", "nikto_scan", "nuclei_scan", "sast_scan"):
+    _TOOL_VULN[_t] = "scan"
+for _t in ("http_probe", "http_request", "headers_recon", "detect_cms",
+           "waf_detect", "ffuf_dir", "param_discovery", "subdomain_enum",
+           "dns_lookup"):
+    _TOOL_VULN[_t] = "recon"
+for _t in ("generate_poc", "poc_executor"):
+    _TOOL_VULN[_t] = "poc"
+
+# v1.5.8 (Bug A): chuỗi lỗi LLM từ llm.py — nhận diện để KHÔNG đếm là plan-only
+# (trước đây timeout bị coi là "văn bản kế hoạch" → plan_only=2 → forced break →
+# final round cũng timeout → final_text = chuỗi lỗi → ledger rỗng dù wapiti đã
+# chạy thành công). Lần 1: thử lại (model có thể đang load). Lần 2 liên tiếp:
+# coi model down → tổng hợp findings từ tool output thật (Bug B).
+_LLM_FAIL_PREFIXES = ("[!] Ollama timeout", "[!] Cannot reach Ollama",
+                       "[!] Ollama error")
+
+
+def _llm_failure(content: str) -> bool:
+    return (content or "").strip().startswith(_LLM_FAIL_PREFIXES)
 
 # v1.5.2: wapiti-first gate — web scope active mà wapiti_scan CHƯA chạy
 # (chưa có outcome=ok/error) thì final JSON bị từ chối và model bị ép gọi
@@ -173,6 +200,13 @@ class WebXAgent:
                                   src_dirs=self.config.get("src_dirs", []))
         self.ledger = Ledger()
         self.transcript: list[dict] = []
+        # v1.6.0 (roadmap #1/#12/#13): Attack Surface Inventory — host→port→
+        # service→URL→method→param→auth→tech, tích lũy từ tool output OK thật.
+        self.inventory = Inventory()
+        # v1.7.0 (#12): attack memory — cái GÌ ĐÃ THỬ (endpoint×param×vuln_class×
+        # tool×outcome), KHÔNG lặp lại; tách khỏi attack surface (cái ĐÃ BIẾT).
+        self.test_history = TestHistory()
+        self.capabilities = None   # v1.6.0 (#14): lazy — probe version chỉ khi yêu cầu
         self.tools = TOOL_REGISTRY
         self.extra_context = ""
         # v1.4.2: phát hiện binary thiếu lúc khởi động (nuclei/arjun/... không
@@ -259,18 +293,50 @@ class WebXAgent:
             # v1.4.4: chỉ đo thời gian THỰC THI tool — chờ operator duyệt
             # (_risk_ok/input()) nằm ngoài try này nên không bị tính vào duration.
             t0 = time.time()
-            out = spec.exec_fn(**kw)
+            res = spec.exec_fn(**kw)
             dt = round(time.time() - t0, 1)
+            # v1.7.0 (structured ToolResult): tool TIÊN TIẾN trả (output_text,
+            # data_dict); tool cũ/binary vẫn trả plain string → data=None.
+            if (isinstance(res, tuple) and len(res) == 2
+                    and isinstance(res[0], str)):
+                out, data = res
+            else:
+                out, data = res, None
             # v1.4.4: output mở đầu '[!]' = lỗi thực thi (timeout, thiếu binary,
             # connect fail, args sai) → outcome=error để gate/fail-count đúng.
             oc = "error" if isinstance(out, str) and out.startswith("[!]") else "ok"
-            return {"name": name, "outcome": oc, "output": out, "exec_time": dt}
+            r = {"name": name, "outcome": oc, "output": out, "exec_time": dt}
+            if data is not None:
+                r["data"] = data
+            return r
         except TypeError as e:
             return {"name": name, "outcome": "error",
                     "output": f"[!] Invalid arguments for '{name}': {e}", "exec_time": 0.0}
         except Exception as e:  # noqa: BLE001
             return {"name": name, "outcome": "error",
                     "output": f"[!] {name} error: {e}", "exec_time": 0.0}
+
+    def _record_test(self, name: str, args: dict, r: dict) -> None:
+        """v1.7.0 (#12): ghi attack memory — endpoint/param đã THỬ (mọi outcome
+        trừ duplicate). vuln_class theo _TOOL_VULN; evidence_id bỏ trống cho
+        Phase 2 (evidence state machine gắn bằng chứng/kết quả vào record)."""
+        if r.get("outcome") == "duplicate":
+            return
+        url = ""
+        for k in ("url", "target"):
+            v = args.get(k)
+            if v:
+                url = str(v)
+                break
+        if not url:
+            return
+        self.test_history.add(
+            endpoint=url,
+            parameter=str(args.get("param") or ""),
+            vuln_class=_TOOL_VULN.get(name, ""),
+            tool=name,
+            outcome=r.get("outcome") or "ok",
+        )
 
     # ─────────────────────────────────────────
     # MAIN LOOP
@@ -288,6 +354,8 @@ class WebXAgent:
         max_rounds = self.config["max_rounds"]
         result = {"risk_level": "UNKNOWN", "overall_summary": "", "final_text": "", "calls": 0}
         forced = False  # dừng sớm: round thoái hóa → ép trả JSON ngay
+        llm_down = False  # v1.5.8 (Bug A/B): model down (2 lỗi LLM liên tiếp)
+        self._llm_fail = 0  # v1.5.8: bộ đếm lỗi LLM liên tiếp (reset mỗi run)
         self._plan_only = 0  # v1.4.3: reset bộ đếm plan-only mỗi run()
         self._wapiti_done = False  # v1.5.2: reset wapiti-first gate mỗi run()
         self._no_wapiti_json = 0   # v1.5.2: reset bộ đếm JSON-thiếu-wapiti
@@ -300,6 +368,24 @@ class WebXAgent:
             if not calls:
                 disp.done()
                 result["final_text"] = resp.get("content", "")
+                # v1.5.8 (Bug A): chuỗi lỗi LLM (timeout/không kết nối) KHÔNG
+                # phải văn bản kế hoạch — trước đây bị đếm plan_only → forced
+                # break sớm + final round cũng timeout → ledger rỗng dù wapiti
+                # đã chạy ok. Lần 1: thử lại (model có thể đang load). Lần 2
+                # liên tiếp: model down → dừng sớm, tổng hợp từ tool output thật.
+                if _llm_failure(result["final_text"]):
+                    self._llm_fail += 1
+                    if self._llm_fail >= 2:
+                        forced = True
+                        llm_down = True
+                        break
+                    msgs.append({"role": "assistant", "content": result["final_text"]})
+                    msgs.append({"role": "user", "content":
+                                "⚠ Lỗi kết nối model (timeout) — có thể model "
+                                "đang load. Thử lại lượt này: gọi ÍT NHẤT 1 "
+                                "function call NGAY, không cần văn bản dài."})
+                    continue
+                self._llm_fail = 0  # phản hồi thật → reset bộ đếm lỗi LLM
                 if self._looks_like_json(result["final_text"]):
                     self._commit_findings(result)
                     try:
@@ -361,6 +447,7 @@ class WebXAgent:
                     break
                 continue
             self._plan_only = 0  # lượt có tool call thật → reset bộ đếm plan-only
+            self._llm_fail = 0   # v1.5.8: lượt có tool call thật → model OK
 
             # chạy tool tuần tự: in lệnh → dedup/block → dispatch → kết quả kèm thời gian
             results = []
@@ -418,8 +505,14 @@ class WebXAgent:
                       flush=True)
                 r.setdefault("args", args)  # giữ args để đối chiếu bằng chứng
                 results.append(r)
+                # v1.7.0 (#12): attack memory — ghi NGAY sau khi có kết quả
+                # (kể cả error/blocked; duplicate đã ghi ở lần dispatch đầu).
+                if r.get("outcome") != "duplicate":
+                    self._record_test(name, args, r)
             disp.done()
             self.transcript.append({"round": rnd, "type": "tools", "calls": results})
+            # v1.6.0 (#1/#12/#13): gom tool output OK của round vào attack surface
+            self.inventory.ingest(results)
             result["calls"] += len(results)
             # v1.5.2: wapiti-first gate — chỉ wapiti_scan tính là "đã chạy" khi
             # outcome ok (thành công) HOẶC error (đã cố, fail rõ ràng). Các
@@ -448,10 +541,21 @@ class WebXAgent:
                                   "content": f"outcome={r['outcome']}\n{out}{note}"})
             msgs.append({"role": "assistant", "content": resp.get("content", "") or
                         "(calling tools...)"})
+            # v1.6.0 (#1/#13): chèn attack surface đã biết vào lượt sau — model
+            # KHÔNG rescan host/endpoint có sẵn, chỉ chọn bước mới (tech→tool).
+            surf = self.inventory.render()
+            surf_note = ("\n[ATTACK SURFACE — đã biết, KHÔNG rescan các mục này; "
+                         "dùng tech/endpoint để chọn bước TIẾP THEO]:\n" + surf
+                         ) if surf else ""
+            # v1.7.0 (#12): attack memory — những gì ĐÃ THỬ để model KHÔNG lặp
+            # lại tool-call trên cùng endpoint/param/lớp lỗ hổng.
+            th_note = ("\n" + self.test_history.render()) \
+                if self.test_history.record_count() else ""
             msgs.append({"role": "user", "content":
                         "[TOOL RESULTS BEGIN]\n" +
                         json.dumps(tool_msgs, ensure_ascii=False)[:12000] +
-                        "\n[TOOL RESULTS END]\nTiếp tục. Khi đủ dữ liệu trả JSON cuối cùng."})
+                        "\n[TOOL RESULTS END]\nTiếp tục. Khi đủ dữ liệu trả JSON cuối cùng."
+                        + surf_note + th_note})
 
         # v1.5.2 (tail-order 1): AUTO-WAPITI — hết vòng lặp mà web scope active
         # và wapiti_scan chưa từng chạy (model bỏ qua dù prompt/gate bắt buộc)
@@ -506,11 +610,31 @@ class WebXAgent:
                             "nữa — trả final JSON trung thực với dữ liệu đã thu; "
                             "nếu chưa đủ bằng chứng, risk_level=UNKNOWN là kết quả "
                             "trung thực (đừng bịa dữ liệu scan)."})
+        # v1.5.8 (Bug B): model đã down (2 lỗi liên tiếp) → BỎ final chat
+        # (tiết kiệm 300s chắc chắn timeout) và tổng hợp findings từ tool
+        # output THẬT trong history (wapiti đã chạy ok). Nếu final chat vẫn
+        # lỗi → fallback tổng hợp tương tự.
+        if llm_down:
+            result["llm_down"] = True
+            result["llm_note"] = ("[!] Model không phản hồi (Ollama timeout) — "
+                                  "kết quả được tổng hợp từ tool output thật "
+                                  "của phiên (không có phân tích của model).")
+            self._synthesize_findings_json(result)
+            self._commit_findings(result)
+            return result
         disp = _LiveDisplay(0 if forced else max_rounds, max_rounds)
         resp = self.chat(msgs, tools=[t.schema() for t in self.tools], json_mode=True,
                          on_token=disp.on_token, on_reasoning=disp.on_reasoning)
         disp.done()
         result["final_text"] = resp.get("content", "")
+        if _llm_failure(result["final_text"]):
+            result["llm_down"] = True
+            result["llm_note"] = ("[!] Model không phản hồi ở final round — "
+                                  "kết quả được tổng hợp từ tool output thật "
+                                  "của phiên (không có phân tích của model).")
+            self._synthesize_findings_json(result)
+            self._commit_findings(result)
+            return result
         self._commit_findings(result)
         try:
             d = json.loads(result["final_text"]) if result["final_text"].strip().startswith("{") else {}
@@ -530,6 +654,83 @@ class WebXAgent:
     @staticmethod
     def _looks_like_json(t: str) -> bool:
         return t.strip().startswith("{") or "findings" in t[:200]
+
+    def _synthesize_findings_json(self, result: dict) -> None:
+        """v1.5.8 (Bug B): model down → tổng hợp findings từ tool output THẬT
+        trong history (wapiti_scan đã chạy ok). Chỉ parse dòng detail wapiti:
+        `[SEVERITY] CATEGORY (param=X) — METHOD /path [module=...]` + dòng
+        `    → ` theo sau (bỏ wstg:/curl:). Dừng ở marker `[✓] TỔNG HỢP LỖ
+        HỔNG` — phần summary có dòng no-param match regex → duplicate. Không
+        bịa: không có dòng nào → risk UNKNOWN, findings rỗng."""
+        detail_re = re.compile(
+            r"^\[(CRITICAL|HIGH|MEDIUM|LOW|INFO)\]\s+(.+?)(?:\s+\(param=([^)]+)\))?"
+            r"\s+—\s+(\S+)\s+(\S+)(?:\s+\[module=([^\]]+)\])?$")
+        scope_re = re.compile(r"\[✓\] wapiti QUÉT XONG.*—\s+(\S+)\s+\[scope=")
+        stop_marker = "[✓] TỔNG HỢP LỖ HỔNG"
+        seen: set = set()
+        findings: list[dict] = []
+        target = ""
+        for msg in self._history():
+            text = msg.get("output") or ""
+            if not text:
+                continue
+            if not target:
+                m = scope_re.search(text)
+                if m:
+                    target = m.group(1)
+            lines = text.splitlines()
+            for i, line in enumerate(lines):
+                if stop_marker in line:
+                    break
+                m = detail_re.match(line.strip())
+                if not m:
+                    continue
+                sev, cat, param, method, path, module = m.groups()
+                key = (cat, method, path, param)
+                if key in seen:
+                    continue
+                seen.add(key)
+                detail = ""
+                if i + 1 < len(lines):
+                    nxt = lines[i + 1].strip()
+                    if nxt.startswith("→") and not nxt.startswith(("→ wstg:", "→ curl:")):
+                        detail = nxt[1:].strip()
+                desc = f"{cat} phát hiện bởi wapiti (module={module or '?'})"
+                if detail:
+                    desc += f" — {detail}"
+                findings.append({
+                    "name": cat,
+                    "severity": sev.lower(),
+                    "url": f"{target}{path}" if target else path,
+                    "port": "",
+                    "service": "",
+                    "description": desc,
+                    "fix": _WAPITI_FIX.get(cat, _WAPITI_FIX.get("_default", "")),
+                    "cves": [],
+                    # v1.6.0 (#15): source_tool = scanner chính (giữ 'source'
+                    # cho tương thích test/parse cũ)
+                    "source": "wapiti_scan (auto — model down)",
+                    "source_tool": "wapiti_scan",
+                    "parameter": param or "",
+                })
+        rank = {"critical": 4, "high": 3, "medium": 2, "low": 1, "info": 0}
+        findings.sort(key=lambda f: rank.get(f["severity"], 0), reverse=True)
+        result["risk_level"] = findings[0]["severity"] if findings else "UNKNOWN"
+        if findings:
+            result["overall_summary"] = (
+                f"Tổng hợp tự động từ tool output thật (wapiti_scan) — model "
+                f"không phản hồi (Ollama timeout) nên không có phân tích của "
+                f"model. {len(findings)} finding từ wapiti.")
+        else:
+            result["overall_summary"] = (
+                "Model không phản hồi (Ollama timeout) và không có finding nào "
+                "tổng hợp được từ tool output — risk UNKNOWN là kết quả trung thực.")
+        result["findings"] = findings
+        result["final_text"] = json.dumps({
+            "risk_level": result["risk_level"],
+            "overall_summary": result["overall_summary"],
+            "findings": findings,
+        }, ensure_ascii=False, indent=2)
 
     def _mentioned_tools(self, text: str) -> list[str]:
         """Tên tool đăng ký xuất hiện trong văn bản model — để nhắc model gọi
@@ -671,6 +872,8 @@ class WebXAgent:
               flush=True)
         self.transcript.append({"round": 0, "type": "tools", "calls": [r],
                                 "auto": True})
+        self.inventory.ingest([r])   # v1.6.0: wapiti auto cũng vào attack surface
+        self._record_test("wapiti_scan", args, r)
         out = InjectionGuard.sanitize(r.get("output", ""),
                                       self.config["output_cap"])
         msg = {"role": "tool", "name": "wapiti_scan",
@@ -713,16 +916,53 @@ class WebXAgent:
         target = self.config["targets"][0]
         probe = _try_dispatch(self, "http_probe", {"url": target})
         hdrs = _try_dispatch(self, "headers_recon", {"url": target})
+        # v1.6.0: recon bootstrap cũng nuôi attack surface
+        self.inventory.ingest([probe, hdrs])
+        # v1.7.0 (#12): recon bootstrap cũng là attack memory
+        self._record_test("http_probe", {"url": target}, probe)
+        self._record_test("headers_recon", {"url": target}, hdrs)
         self.extra_context = f"TARGET: {target}\nPROBE:\n{probe['output'][:1500]}\nHEADERS:\n{hdrs['output'][:1500]}"
         return self.extra_context
 
     def export_report(self) -> str:
         plan = validation_plan(self.ledger)
         md = render_markdown(self.ledger, ", ".join(self.config["targets"]), plan)
+        # v1.6.0 (#1): report kèm attack surface phiên này (endpoint/tech đã biết)
+        surf = self.inventory.render(limit=60)
+        if surf:
+            md += f"\n## Attack Surface (phiên này)\n```\n{surf}\n```\n"
+        # v1.7.0 (#12): report kèm attack memory (cái đã thử) — phân biệt rõ
+        # với findings (ledger) để operator thấy phần việc đã làm.
+        th = self.test_history.render(limit=60)
+        if th:
+            md += f"\n## Test History (đã thử — attack memory)\n```\n{th}\n```\n"
         path = f"aixsec-x_report_{int(time.time())}.md"
         with open(path, "w") as f:
             f.write(md)
         return path
+
+    def save_inventory(self) -> str:
+        """v1.6.0: lưu attack surface JSON khi config['inventory_file'] set
+        (env WEBX_INVENTORY_FILE). Trả path đã lưu, '' nếu chưa cấu hình."""
+        path = (self.config.get("inventory_file") or "").strip()
+        if not path:
+            return ""
+        try:
+            self.inventory.save(path)
+            return path
+        except OSError as e:
+            print(f"[!] Không lưu được inventory: {e}")
+            return ""
+
+    def capability_rows(self, force: bool = False) -> list[dict]:
+        """v1.6.0 (#14 Capability Discovery): [{tool,binary,available,version}].
+        LAZY — probe version (subprocess) chỉ khi user yêu cầu; cache để không
+        chạy lại mỗi round/lúc khởi động (giữ test nhanh)."""
+        if self.capabilities is None:
+            self.capabilities = capability_report(force=False)
+        elif force:
+            self.capabilities = capability_report(force=True)
+        return self.capabilities
 
 
 def _try_dispatch(agent: WebXAgent, name: str, args: dict) -> dict:
@@ -853,8 +1093,11 @@ def _banner(cfg: dict, scope: str = "", missing=None, mode: str = "interactive",
     lines.append(f"{C}{B}[>]{RS} {D}{'host':<9}{RS} {B}{info['host']}{RS}{D}  kernel {info['kernel']}{RS}")
     lines.append(f"{C}{B}[>]{RS} {D}{'session':<9}{RS} {info['ts']}{D}  pid {info['pid']}{RS}")
     lines.append(f"{C}{B}[>]{RS} {D}{'modules':<9}{RS} {B}{n_tools}{RS}{D} tools loaded{RS}{miss_str}")
+    cap_ok = len(TOOL_BINS) - len(missing)
+    lines.append(f"{C}{B}[>]{RS} {D}{'capability':<9}{RS} {B}{cap_ok}/{len(TOOL_BINS)}{RS}"
+                 f"{D} external binaries present — '/capabilities' xem versions{RS}")
     lines.append("")
-    lines.append(center(f"{D}q quit | !! <cmd> shell | /findings ledger | /report export{RS}"))
+    lines.append(center(f"{D}q quit | !! <cmd> shell | /findings ledger | /report export | /capabilities versions{RS}"))
     lines.append("")
 
     # căn giữa cả khối theo bề rộng terminal thật (nếu rộng hơn khối + 6);
@@ -899,6 +1142,15 @@ def main():
         sys.exit(1)
 
     agent = WebXAgent(config=cfg)
+
+    # v1.6.0 (#14): --capabilities — in bảng tool/binary/version rồi thoát
+    if "--capabilities" in sys.argv:
+        for r in agent.capability_rows():
+            mark = "✔" if r["available"] else "✗"
+            ver = r["version"] or "(chưa cài)"
+            print(f"[{mark}] {r['tool']:<22} {r['binary']:<12} {ver}")
+        return
+
     _mode = "batch" if (non_interactive or one_shot) else "interactive"
     _print_banner(cfg, scope=agent.policy.describe(),
                   missing=agent.missing_tools, mode=_mode)
@@ -916,9 +1168,14 @@ def main():
         prompt_text = one_shot if isinstance(one_shot, str) else \
             "Hãy phân tích và khai thác target trong scope. Bắt đầu bằng recon rồi active check. Khi đủ dữ liệu trả JSON findings."
         result = agent.run(prompt_text)
+        if result.get("llm_down"):
+            print("\n" + result.get("llm_note", ""))
         print("\n" + result.get("final_text", "")[:3000])
         _print_findings(agent)
         print(f"\n[*] Report: {agent.export_report()}")
+        inv_path = agent.save_inventory()   # v1.6.0: WEBX_INVENTORY_FILE
+        if inv_path:
+            print(f"[*] Attack surface: {inv_path}")
         return
 
     # ── interactive ──
@@ -943,11 +1200,20 @@ def main():
         if line == "/report":
             print(f"[*] Saved: {agent.export_report()}")
             continue
+        if line == "/capabilities":
+            for r in agent.capability_rows():
+                mark = "✔" if r["available"] else "✗"
+                ver = r["version"] or "(chưa cài)"
+                print(f"[{mark}] {r['tool']:<22} {r['binary']:<12} {ver}")
+            continue
         result = agent.run(line)
+        if result.get("llm_down"):
+            print("\n" + result.get("llm_note", ""))
         print("\n" + (result.get("final_text", "") or "(no response)")[:4000])
         if result.get("overall_summary"):
             print(f"\n[RISK] {result['risk_level']}\n[SUMMARY] {result['overall_summary']}")
         _print_findings(agent)
+        agent.save_inventory()   # v1.6.0: WEBX_INVENTORY_FILE (nếu set)
 
 
 if __name__ == "__main__":
