@@ -16,7 +16,7 @@ _CIDR_RE = re.compile(r"^[0-9a-f.:]+/\d{1,2}$")
 
 
 def normalize_host(raw: str) -> str:
-    """'https://abc.vn:443/path?x=1' → 'abc.vn'. Giữ CIDR nguyên."""
+    """'https://example.com:443/path?x=1' → 'example.com'. Giữ CIDR nguyên."""
     raw = (raw or "").strip().lower()
     if not raw:
         return ""
