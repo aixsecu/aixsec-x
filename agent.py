@@ -33,7 +33,7 @@ from tools import (TOOL_REGISTRY, TOOL_INDEX, TOOL_BINS, TOOL_TIMEOUTS,
                    LONG_RUN_TOOLS, available_tools, _WAPITI_FIX)
 
 # ── terminal colors (AIXSEC-X style) ──
-VERSION = "1.5.8"
+VERSION = "1.5.9"
 
 # v1.5.8 (Bug A): chuỗi lỗi LLM từ llm.py — nhận diện để KHÔNG đếm là plan-only
 # (trước đây timeout bị coi là "văn bản kế hoạch" → plan_only=2 → forced break →

@@ -306,7 +306,7 @@ _WL_EXTRA_DIRS = [SECLISTS_WEB, SECLISTS_WEB + "/raft-medium-directories",
 
 
 # fmt: off
-def resolve_wordlist(wl: str = "", base_dir: str = SECLISTS_WEB) -> str:
+def resolve_wordlist(wl: str = "", base_dir: str = None) -> str:
     """Map chuỗi wordlist (alias/basename/đường dẫn) → file tồn tại.
 
     Thứ tự: đường dẫn tuyệt đối (tồn tại) → alias (common→common.txt) →
@@ -315,6 +315,9 @@ def resolve_wordlist(wl: str = "", base_dir: str = SECLISTS_WEB) -> str:
     Không tìm thấy → raise ValueError kèm gợi ý thư mục (để model sửa ngay,
     không đốt 120s rồi mới error làm hỏng URL-gate như v1.3).
     """
+    if base_dir is None:
+        # đánh giá tại call-time để test patch được SECLISTS_WEB
+        base_dir = SECLISTS_WEB
     if not wl:
         wl = "common.txt"
     wl = wl.strip()
