@@ -8,12 +8,27 @@ from __future__ import annotations
 
 import json
 import re
+import time
 
 import requests
 
 _MARKER_RE = re.compile(r"\[(?:TOOL|SEARCH|EXEC):\s*.+?\]")
 _ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[a-zA-Z]")
 _CTRL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+
+
+def _set_stream_timeout(response, seconds: int) -> None:
+    """Switch urllib3's socket timeout after the first streamed token.
+
+    Requests exposes only connect/read timeout at request creation. Ollama's
+    first-token and completion phases need different read deadlines, so this
+    best-effort adapter updates the live socket. The monotonic overall checks
+    remain authoritative when a response is actively streaming.
+    """
+    try:
+        response.raw._fp.fp.raw._sock.settimeout(seconds)
+    except (AttributeError, OSError):
+        pass
 
 
 def ollama_headers(cfg: dict) -> dict:
@@ -102,29 +117,46 @@ def ollama_chat(messages: list, tools: list | None = None, config: dict | None =
         payload["tools"] = tools
     if json_mode:
         payload["format"] = "json"
+    started = time.monotonic()
+    legacy = int(cfg.get("llm_timeout") or (int(cfg["tool_timeout"]) * 4 + 30))
+    first_timeout = max(1, int(cfg.get("llm_first_token_timeout") or min(30, legacy)))
+    completion_timeout = max(1, int(cfg.get("llm_completion_timeout") or legacy))
+    overall_timeout = max(first_timeout, int(cfg.get("llm_overall_timeout") or legacy))
     try:
-        tmo = int(cfg.get("llm_timeout") or (int(cfg["tool_timeout"]) * 4 + 30))
+        request_timeout = (min(10, first_timeout), first_timeout) if stream \
+            else (min(10, overall_timeout), overall_timeout)
         r = requests.post(cfg["ollama_url"] + "/api/chat", json=payload,
                           headers=ollama_headers(cfg),
-                          timeout=tmo, stream=stream)
+                          timeout=request_timeout, stream=stream)
         r.raise_for_status()
     except requests.exceptions.ConnectionError:
         return _conn_error(cfg)
     except requests.exceptions.Timeout:
-        return {"content": "[!] Ollama timeout — model may still be loading or too large.", "tool_calls": []}
+        return {"content": "[!] Ollama first-token timeout — model did not start responding.",
+                "tool_calls": [], "metrics": {"llm_latency_ms": round(
+                    (time.monotonic() - started) * 1000, 3)}}
     except Exception as e:
         return {"content": f"[!] Ollama error: {e}", "tool_calls": []}
 
     if not stream:
         msg = r.json().get("message", {})
         return {"content": (msg.get("content") or "").strip(),
-                "tool_calls": _parse_tool_calls(msg)}
+                "tool_calls": _parse_tool_calls(msg),
+                "metrics": {"llm_latency_ms": round(
+                    (time.monotonic() - started) * 1000, 3),
+                    "completion_latency_ms": round(
+                    (time.monotonic() - started) * 1000, 3)}}
 
     # ── streaming NDJSON ──
     parts: list[str] = []
     raw_calls: list[dict] = []
+    first_token_at = None
     try:
         for line in r.iter_lines(decode_unicode=True):
+            now = time.monotonic()
+            if now - started > overall_timeout:
+                return {"content": "[!] Ollama overall timeout.", "tool_calls": [],
+                        "metrics": {"llm_latency_ms": round((now - started) * 1000, 3)}}
             if not line:
                 continue
             try:
@@ -132,6 +164,15 @@ def ollama_chat(messages: list, tools: list | None = None, config: dict | None =
             except (json.JSONDecodeError, TypeError):
                 continue
             msg = obj.get("message") or {}
+            if first_token_at is None and (msg.get("content") or msg.get("reasoning")
+                                           or msg.get("tool_calls") or obj.get("done")):
+                first_token_at = now
+                _set_stream_timeout(r, min(completion_timeout, overall_timeout))
+            if first_token_at is not None and now - first_token_at > completion_timeout:
+                return {"content": "[!] Ollama completion timeout.", "tool_calls": [],
+                        "metrics": {"first_token_latency_ms": round(
+                            (first_token_at - started) * 1000, 3),
+                            "completion_latency_ms": round((now - first_token_at) * 1000, 3)}}
             tok = msg.get("content")
             if tok:
                 parts.append(tok)
@@ -148,11 +189,20 @@ def ollama_chat(messages: list, tools: list | None = None, config: dict | None =
     except requests.exceptions.ConnectionError:
         return _conn_error(cfg)
     except requests.exceptions.Timeout:
-        return {"content": "[!] Ollama timeout — model may still be loading or too large.", "tool_calls": []}
+        label = "first-token" if first_token_at is None else "completion"
+        return {"content": f"[!] Ollama {label} timeout.", "tool_calls": [],
+                "metrics": {"llm_latency_ms": round(
+                    (time.monotonic() - started) * 1000, 3)}}
     except Exception as e:
         return {"content": f"[!] Ollama error: {e}", "tool_calls": []}
+    finished = time.monotonic()
     return {"content": "".join(parts).strip(),
-            "tool_calls": _parse_tool_calls({"tool_calls": raw_calls})}
+            "tool_calls": _parse_tool_calls({"tool_calls": raw_calls}),
+            "metrics": {"llm_latency_ms": round((finished - started) * 1000, 3),
+                        "first_token_latency_ms": round(
+                            ((first_token_at or finished) - started) * 1000, 3),
+                        "completion_latency_ms": round(
+                            (finished - (first_token_at or started)) * 1000, 3)}}
 
 
 def check_ollama(config: dict | None = None) -> str:

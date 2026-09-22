@@ -1,4 +1,6 @@
-> **4.0.0 / Phase 4:** serializable knowledge graph, goal-driven planning,
+> **4.1.0 / Phase 4.1:** deterministic context retrieval, modular prompt
+> composition, token budgets, staged LLM timeouts and runtime metrics. See the
+> [Phase 4.1 guide](docs/PHASE_4_1.md). Phase 4 provides the serializable knowledge graph, goal-driven planning,
 > adaptive memory, workflow inference, cost/risk budgets and a checkpointable
 > autonomous runtime. See the [Phase 4 architecture](docs/PHASE_4.md),
 > [Phase 3 guide](docs/PHASE_3.md), [Phase 2 guide](docs/PHASE_2.md) and
@@ -182,6 +184,16 @@ python3 agent.py --non-interactive                # run automatically
 | `WEBX_AUTONOMY_MAX_REQUESTS` | `500` | Estimated request budget |
 | `WEBX_AUTONOMY_MAX_SECONDS` | `3600` | Runtime budget in seconds |
 | `WEBX_AUTONOMY_MAX_RISK` | `20` | Accumulated planner risk budget |
+| `WEBX_CONTEXT_OPTIMIZATION` | `1` | Enable deterministic Phase 4.1 context selection |
+| `WEBX_MAX_PROMPT_TOKENS` | `12000` | Total estimated prompt budget, including selected tool schemas |
+| `WEBX_RESERVED_COMPLETION_TOKENS` | `2048` | Tokens reserved for model completion |
+| `WEBX_CONTEXT_MAX_GRAPH_NODES` | `40` | Maximum retrieved relevant graph nodes |
+| `WEBX_CONTEXT_MAX_OBSERVATIONS` | `12` | Maximum direct observations in planner context |
+| `WEBX_CONTEXT_MAX_HISTORY` | `12` | Maximum recent history items before deterministic summarization |
+| `WEBX_CONTEXT_MAX_TOOLS` | `14` | Maximum action-relevant tool schemas sent per request |
+| `WEBX_LLM_FIRST_TOKEN_TIMEOUT` | `30` | Abort when Ollama does not start responding within this many seconds |
+| `WEBX_LLM_COMPLETION_TIMEOUT` | `180` | Completion phase timeout in seconds |
+| `WEBX_LLM_OVERALL_TIMEOUT` | `210` | Overall LLM request deadline in seconds |
 | `WEBX_INVENTORY_FILE` | *(empty)* | **v1.6.0** path to save the Attack Surface Inventory JSON (`host→port→service→URL→endpoint→method→param→auth→tech`, accumulated from real tool output) after every round and on exit. Empty = do not save |
 | `WEBX_MAX_ROUNDS` | `8` | Max tool-call rounds per turn (lower = faster/cheaper; a 9B model on a 4 vCPU box can take 20–30 min per round) |
 | `WEBX_TOOL_TIMEOUT` | `90` | Per-tool timeout (seconds) |

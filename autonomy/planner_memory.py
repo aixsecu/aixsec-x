@@ -30,7 +30,10 @@ class PlannerMemory:
         record = self.records.setdefault(key, {"strategy_id": key,
             "tool": action.get("tool", ""), "attempts": 0, "successes": 0,
             "failures": 0, "information_gain": 0.0, "cost": 0.0,
-            "last_failure_reason": ""})
+            "last_failure_reason": "",
+            "endpoint": str((action.get("arguments") or {}).get("url") or
+                            ((action.get("arguments") or {}).get("request") or {}).get("url") or ""),
+            "workflow": str(action.get("workflow") or "")})
         record["attempts"] += 1
         record["successes" if success else "failures"] += 1
         record["information_gain"] += max(0.0, float(information_gain))

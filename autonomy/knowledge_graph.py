@@ -205,8 +205,17 @@ class KnowledgeGraph:
                                {"workflow": workflow, **copy.deepcopy(rule)})
         for group in ("authorization_hypotheses", "business_hypotheses"):
             for hypothesis in analysis.get(group) or []:
-                graph.add_node(NodeKind.HYPOTHESIS, copy.deepcopy(hypothesis),
-                               hypothesis.get("hypothesis_id"))
+                hypothesis_node = graph.add_node(
+                    NodeKind.HYPOTHESIS, copy.deepcopy(hypothesis),
+                    hypothesis.get("hypothesis_id"))
+                for index, evidence_value in enumerate(hypothesis.get("evidence") or []):
+                    evidence_node = graph.add_node(NodeKind.EVIDENCE, {
+                        "value": copy.deepcopy(evidence_value),
+                        "source": group, "url": hypothesis.get("url", "")},
+                        _stable_id("hypothesis_evidence", [hypothesis_node.node_id,
+                                                           index, evidence_value]))
+                    graph.add_edge(hypothesis_node.node_id, "supported_by",
+                                   evidence_node.node_id)
         for finding in analysis.get("sast_findings") or []:
             graph.add_node(NodeKind.SAST_FINDING, copy.deepcopy(finding))
         records = getattr(test_history, "records", []) if test_history else []
