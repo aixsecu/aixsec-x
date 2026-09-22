@@ -1,4 +1,6 @@
-> **4.0.0 / Phase 4:** knowledge graph có thể lưu, goal-driven planner, bộ nhớ
+> **4.1.0 / Phase 4.1:** context retrieval xác định, prompt tách lớp, token
+> budget, timeout LLM theo giai đoạn và runtime metrics. Xem
+> [hướng dẫn Phase 4.1](docs/PHASE_4_1.md). Phase 4 gồm knowledge graph có thể lưu, goal-driven planner, bộ nhớ
 > thích nghi, suy luận workflow, cost/risk budget và autonomous runtime có
 > checkpoint. Xem [kiến trúc Phase 4](docs/PHASE_4.md),
 > [hướng dẫn Phase 3](docs/PHASE_3.md), [Phase 2](docs/PHASE_2.md) và

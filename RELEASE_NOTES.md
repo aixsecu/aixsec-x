@@ -1,3 +1,12 @@
+# AIXSEC-X 4.1.0 — Context optimization
+
+- Added bounded, ranked subgraph, evidence and planner-memory retrieval.
+- Added modular system/planner/tool/policy/reasoning prompt composition and a
+  deterministic token budget with protected current-action fields.
+- Added fact-only history summarization and action-relevant tool schema selection.
+- Added first-token, completion and overall Ollama timeout policies.
+- Added prompt/retrieval/build/latency runtime metrics and comprehensive tests.
+
 # AIXSEC-X 4.0.0 — Phase 4 autonomous intelligence
 
 - Added a typed, serializable knowledge graph covering all required Phase 4

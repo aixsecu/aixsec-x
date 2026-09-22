@@ -28,7 +28,10 @@ from inventory import Inventory, TestHistory
 from ledger import (Ledger, parse_findings_json, render_markdown, validation_plan,
                    check_findings_evidence)
 from llm import InjectionGuard, ollama_chat
-from prompts import SYSTEM_PROMPT, build_system_prompt
+from context_optimization import (ContextBuilder, ContextLimits, ContextRequest,
+                                  PromptComposer, PromptParts, RuntimeMetrics,
+                                  TokenBudgetManager)
+from prompts import SYSTEM_PROMPT, build_orchestration_prompt, build_system_prompt
 from scope import ScopePolicy, normalize_host
 from tools import (TOOL_REGISTRY, TOOL_INDEX, TOOL_BINS, TOOL_TIMEOUTS,
                    LONG_RUN_TOOLS, available_tools, _WAPITI_FIX, capability_report)
@@ -37,7 +40,7 @@ from tools import (TOOL_REGISTRY, TOOL_INDEX, TOOL_BINS, TOOL_TIMEOUTS,
 # v1.8.0: HTTP Session Engine (http_engine.py) — http_request là adapter trên
 # engine (cookie jar theo host, auth, redirect history, timing, evidence, replay,
 # proxy WEBX_HTTP_PROXY/WEBX_HTTPS_PROXY).
-VERSION = "4.0.0"
+VERSION = "4.1.0"
 
 # v1.7.0 (#12 attack memory): phân loại vuln_class cho TestHistory theo tool
 # (sqli→sqli, scanner→scan, recon→recon, poc→poc; tool không khớp → "").
@@ -69,8 +72,9 @@ for _t in ("dynamic_plan", "phase3_status"):
 # final round cũng timeout → final_text = chuỗi lỗi → ledger rỗng dù wapiti đã
 # chạy thành công). Lần 1: thử lại (model có thể đang load). Lần 2 liên tiếp:
 # coi model down → tổng hợp findings từ tool output thật (Bug B).
-_LLM_FAIL_PREFIXES = ("[!] Ollama timeout", "[!] Cannot reach Ollama",
-                       "[!] Ollama error")
+_LLM_FAIL_PREFIXES = ("[!] Ollama timeout", "[!] Ollama first-token timeout",
+                       "[!] Ollama completion timeout", "[!] Ollama overall timeout",
+                       "[!] Cannot reach Ollama", "[!] Ollama error")
 
 
 def _llm_failure(content: str) -> bool:
@@ -261,6 +265,162 @@ class WebXAgent:
         # (response THẬT) trong transcript. _no_http_json đếm lượt JSON bị chặn.
         self.ai_native = bool(self.config.get("ai_native", False))
         self._no_http_json = 0
+        self.context_metrics = RuntimeMetrics()
+        self.context_metrics_history: list[dict] = []
+
+    def _context_history(self) -> list[dict]:
+        values = []
+        for turn in self.transcript:
+            for call in turn.get("calls") or []:
+                args = call.get("args") or {}
+                values.append({"tool": call.get("name", ""),
+                    "outcome": call.get("outcome", ""),
+                    "url": args.get("url") or args.get("target") or "",
+                    "parameter": args.get("param") or ""})
+        return values
+
+    def _current_endpoint(self) -> str:
+        for turn in reversed(self.transcript):
+            for call in reversed(turn.get("calls") or []):
+                args = call.get("args") or {}
+                value = args.get("url") or args.get("target")
+                if not value and isinstance(args.get("request"), dict):
+                    value = args["request"].get("url")
+                if value:
+                    return str(value)
+        return str((self.config.get("targets") or [""])[0])
+
+    def _current_context_selectors(self) -> dict:
+        values = {"auth_context": "", "workflow": "", "hypothesis_id": "",
+                  "parameter": ""}
+        for turn in reversed(self.transcript):
+            for call in reversed(turn.get("calls") or []):
+                args = call.get("args") or {}
+                values["auth_context"] = str(args.get("context") or
+                    ((args.get("contexts") or [""])[0] if isinstance(
+                        args.get("contexts"), list) else "") or values["auth_context"])
+                for key in ("workflow", "hypothesis_id"):
+                    values[key] = str(args.get(key) or values[key])
+                values["parameter"] = str(args.get("param") or values["parameter"])
+                if any(values.values()):
+                    return values
+        return values
+
+    def _recent_tool_context(self) -> str:
+        if not self.transcript:
+            return ""
+        values = []
+        for call in self.transcript[-1].get("calls") or []:
+            args = call.get("args") or {}
+            values.append({"name": call.get("name"), "outcome": call.get("outcome"),
+                "arguments": {key: args[key] for key in ("url", "target", "param", "method")
+                              if key in args},
+                "output": InjectionGuard.sanitize(str(call.get("output") or ""), 1600)})
+        prefix = "[WAPITI TỰ CHẠY]\n" if self.transcript[-1].get("auto") else ""
+        return prefix + json.dumps(values, ensure_ascii=False, sort_keys=True)
+
+    def _context_tool_schemas(self) -> list[dict]:
+        if not self.config.get("context_optimization", True):
+            return [item.schema() for item in self.tools]
+        names = {"dynamic_plan", "phase3_status"}
+        if not self.transcript:
+            names.update({"http_probe", "headers_recon", "crawler", "api_discovery"})
+            if self.config.get("src_dirs"):
+                names.add("sast_scan")
+        if self._web_scope_active():
+            names.add("http_request")
+            if self.ai_native:
+                names.update({"authorization_reason", "auth_compare"})
+            elif not self._wapiti_done:
+                names.add("wapiti_scan")
+        try:
+            import security_analysis as _security_analysis
+            plan = _security_analysis.manager().plan("coverage", max_actions=10)
+            names.update(item["tool"] for item in plan.get("actions") or []
+                         if item.get("state") in {"planned", "blocked"})
+        except (ValueError, TypeError):
+            pass
+        maximum = max(4, int(self.config.get("context_max_tools", 14)))
+        ordered = [item for item in self.tools if item.name in names]
+        return [item.schema() for item in ordered[:maximum]]
+
+    def _prepare_llm_messages(self, messages: list[dict], goal: str,
+                              tool_schemas: list[dict] | None = None) -> list[dict]:
+        if not self.config.get("context_optimization", True):
+            return messages
+        import auth_context as _auth_context
+        import security_analysis as _security_analysis
+        from autonomy import KnowledgeGraph
+        graph = KnowledgeGraph.from_phase_state(
+            self.inventory, self.test_history, _auth_context.manager().list())
+        state = _security_analysis.manager()
+        limits = ContextLimits(
+            max_graph_nodes=int(self.config.get("context_max_graph_nodes", 40)),
+            max_observations=int(self.config.get("context_max_observations", 12)),
+            max_hypotheses=int(self.config.get("context_max_hypotheses", 6)),
+            max_history=int(self.config.get("context_max_history", 12)),
+            max_evidence=int(self.config.get("context_max_evidence", 8)))
+        self.context_metrics = RuntimeMetrics()
+        selectors = self._current_context_selectors()
+        context = ContextBuilder(graph, state.planner_memory, limits).build(
+            ContextRequest(goal=goal, endpoint=self._current_endpoint(), **selectors),
+            self._context_history(), self.context_metrics)
+        from context_optimization import estimate_tokens
+        reserved = int(self.config.get("reserved_completion_tokens", 2048))
+        tool_tokens = estimate_tokens(tool_schemas or [])
+        configured_max = int(self.config.get("max_prompt_tokens", 12000))
+        message_max = max(reserved + 256, configured_max - tool_tokens)
+        manager = TokenBudgetManager(message_max, reserved)
+        last_instruction = ""
+        for message in reversed(messages):
+            if message.get("role") == "user":
+                last_instruction = str(message.get("content") or "")
+                break
+        # The original task is protected; transient gate instructions are kept
+        # only when they differ from it and are bounded independently.
+        reasoning = goal
+        if last_instruction and last_instruction != goal:
+            reasoning += "\n\nCurrent instruction:\n" + last_instruction[:1800]
+        policy = ("Authorized scope: " + self.policy.describe() +
+                  ". Existing dispatcher scope checks and operator risk approval are mandatory.")
+        if self._web_scope_active():
+            if self.ai_native and not self._http_evidence_ok():
+                policy += (" Before final JSON, call http_request and obtain at least one "
+                           "successful real HTTP response.")
+            elif not self.ai_native and not self._wapiti_done:
+                policy += (" Before final JSON, call wapiti_scan for the authorized web "
+                           "target; an explicit tool error also satisfies the attempt gate.")
+        prepared = PromptComposer(manager).compose(PromptParts(
+            system=build_orchestration_prompt(self.config),
+            policy=policy,
+            planner=context, tool=self._recent_tool_context(), reasoning=reasoning),
+            self.context_metrics)
+        self.context_metrics.prompt_chars += len(json.dumps(
+            tool_schemas or [], ensure_ascii=False, separators=(",", ":")))
+        self.context_metrics.estimated_tokens += tool_tokens
+        self.context_metrics_history.append(self.context_metrics.to_dict())
+        self.context_metrics_history = self.context_metrics_history[-100:]
+        return prepared
+
+    def context_runtime_metrics(self) -> dict:
+        return self.context_metrics.to_dict()
+
+    def _chat_contextual(self, messages: list[dict], goal: str, **kwargs) -> dict:
+        schemas = self._context_tool_schemas()
+        kwargs["tools"] = schemas
+        prepared = self._prepare_llm_messages(messages, goal, schemas)
+        started = time.perf_counter()
+        response = self.chat(prepared, config=self.config, **kwargs)
+        elapsed = (time.perf_counter() - started) * 1000
+        llm_metrics = response.get("metrics") or {}
+        self.context_metrics.llm_latency_ms = round(elapsed, 3)
+        self.context_metrics.first_token_latency_ms = float(
+            llm_metrics.get("first_token_latency_ms") or 0)
+        self.context_metrics.completion_latency_ms = float(
+            llm_metrics.get("completion_latency_ms") or elapsed)
+        if self.context_metrics_history:
+            self.context_metrics_history[-1] = self.context_metrics.to_dict()
+        return response
 
     # ─────────────────────────────────────────
     # TOOL DISPATCH (+ scope check + risk approval)
@@ -444,8 +604,9 @@ class WebXAgent:
         self._no_http_json = 0     # v1.5.6: reset bộ đếm JSON-thiếu-http_request (AI-native)
         for rnd in range(1, max_rounds + 1):
             disp = _LiveDisplay(rnd, max_rounds)
-            resp = self.chat(msgs, tools=[t.schema() for t in self.tools],
-                             on_token=disp.on_token, on_reasoning=disp.on_reasoning)
+            resp = self._chat_contextual(
+                msgs, user_text, tools=[t.schema() for t in self.tools],
+                on_token=disp.on_token, on_reasoning=disp.on_reasoning)
             calls = resp.get("tool_calls") or []
             if not calls:
                 disp.done()
@@ -719,8 +880,9 @@ class WebXAgent:
             self._commit_findings(result)
             return result
         disp = _LiveDisplay(0 if forced else max_rounds, max_rounds)
-        resp = self.chat(msgs, tools=[t.schema() for t in self.tools], json_mode=True,
-                         on_token=disp.on_token, on_reasoning=disp.on_reasoning)
+        resp = self._chat_contextual(
+            msgs, user_text, tools=[t.schema() for t in self.tools], json_mode=True,
+            on_token=disp.on_token, on_reasoning=disp.on_reasoning)
         disp.done()
         result["final_text"] = resp.get("content", "")
         if _llm_failure(result["final_text"]):
@@ -1297,7 +1459,8 @@ def main():
     # ── interactive ──
     print(f"{DIM}[>]{RESET} {DIM}Type{RESET} {GREEN}'q'{RESET} {DIM}quit |{RESET} {GREEN}'!! <cmd>'{RESET} {DIM}shell |{RESET} "
           f"{GREEN}'/findings'{RESET} {DIM}ledger |{RESET} {GREEN}'/report'{RESET} {DIM}export |{RESET} "
-          f"{GREEN}'/autonomy [goal]'{RESET}{DIM}.{RESET}", flush=True)
+          f"{GREEN}'/autonomy [goal]'{RESET} {DIM}|{RESET} "
+          f"{GREEN}'/context-metrics'{RESET}{DIM}.{RESET}", flush=True)
     while True:
         try:
             line = input(f"\n{BOLD}{GREEN}root@aixsec-x{RESET}{DIM}:~#{RESET} ").strip()
@@ -1322,6 +1485,9 @@ def main():
                 mark = "✔" if r["available"] else "✗"
                 ver = r["version"] or "(chưa cài)"
                 print(f"[{mark}] {r['tool']:<22} {r['binary']:<12} {ver}")
+            continue
+        if line == "/context-metrics":
+            print(json.dumps(agent.context_runtime_metrics(), ensure_ascii=False, indent=2))
             continue
         if line == "/autonomy" or line.startswith("/autonomy "):
             goal = line.partition(" ")[2].strip() or "coverage"
