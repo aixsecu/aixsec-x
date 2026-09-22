@@ -4938,7 +4938,7 @@ class TestInventoryInjection(unittest.TestCase):
 
 
 class TestTestHistory(unittest.TestCase):
-    """v1.7.0 (#12 attack memory — review ChatGPT điểm 4): TestHistory nhớ
+    """v1.7.0 (#12 attack memory — Phase 1): TestHistory nhớ
     endpoint×param×vuln_class×tool×outcome ĐÃ THỬ — planner hỏi
     already_tested() deterministic, model KHÔNG lặp lại tool trên cùng
     endpoint/param/lớp lỗ hổng."""
