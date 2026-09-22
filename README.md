@@ -1,3 +1,9 @@
+> **4.0.0 / Phase 4:** serializable knowledge graph, goal-driven planning,
+> adaptive memory, workflow inference, cost/risk budgets and a checkpointable
+> autonomous runtime. See the [Phase 4 architecture](docs/PHASE_4.md),
+> [Phase 3 guide](docs/PHASE_3.md), [Phase 2 guide](docs/PHASE_2.md) and
+> [API discovery details](docs/PHASE_2_1.md).
+
 # AIXSEC-X — AI Web Exploitation Assistant (local LLM, Kali Linux)
 
 | Language | File |
@@ -169,6 +175,13 @@ python3 agent.py --non-interactive                # run automatically
 | `WEBX_THINK` | `0` | `1`=enable thinking mode (not recommended together with function calling) |
 | `WEBX_AUTO_EXEC` | `ask` | `ask`=prompt operator before noisy/active tools; `safe`=auto-run only safe tools; `all`=auto-run everything (risky) |
 | `WEBX_AI_NATIVE` | `0` | **v1.5.6** `1`=AI-NATIVE mode: the model analyzes vulnerabilities itself via `http_request` (no mandatory wapiti/sqlmap; final JSON requires ≥1 real `http_request` response) |
+| `WEBX_AUTONOMY` | `0` | Enable the opt-in Phase 4 autonomous runtime integration |
+| `WEBX_AUTONOMY_CHECKPOINT` | *(empty)* | Atomic checkpoint path for long-running autonomous sessions |
+| `WEBX_AUTONOMY_RESUME` | `0` | Resume the configured checkpoint when `1` |
+| `WEBX_AUTONOMY_MAX_ACTIONS` | `100` | Maximum autonomous actions |
+| `WEBX_AUTONOMY_MAX_REQUESTS` | `500` | Estimated request budget |
+| `WEBX_AUTONOMY_MAX_SECONDS` | `3600` | Runtime budget in seconds |
+| `WEBX_AUTONOMY_MAX_RISK` | `20` | Accumulated planner risk budget |
 | `WEBX_INVENTORY_FILE` | *(empty)* | **v1.6.0** path to save the Attack Surface Inventory JSON (`host→port→service→URL→endpoint→method→param→auth→tech`, accumulated from real tool output) after every round and on exit. Empty = do not save |
 | `WEBX_MAX_ROUNDS` | `8` | Max tool-call rounds per turn (lower = faster/cheaper; a 9B model on a 4 vCPU box can take 20–30 min per round) |
 | `WEBX_TOOL_TIMEOUT` | `90` | Per-tool timeout (seconds) |
@@ -304,6 +317,13 @@ root@aixsec-x:~# q                                             → quit
 |---|---|---|---|
 | http_probe / headers_recon / dns_lookup | recon | safe | Python requests |
 | crawler | recon | safe | **v1.9.0:** Python-native BFS crawl GET-only (dùng CHUNG Session Engine — cookie jar + proxy + auth header) — NO wapiti binary needed. Khám phá: link nội bộ + external, form (action/method/field name), query param, script src, JS endpoint hint (`fetch`/`axios`/`$.ajax`/XHR — ỨNG VIÊN, cần xác minh, nguồn `crawler:js` trong inventory). Bounds: `max_depth` 0–10 (mặc định 3), `max_pages`, `request_timeout`, `time_budget` tự dừng, `trailing_slash`, `max_body_bytes`; redirect theo ≤5 hop trong scope, ra ngoài scope dừng + ghi `redirect_out`. Form KHÔNG bị submit; script/static/PDF ghi nhận nhưng KHÔNG enqueue. Query chuẩn hoá (sort key, strip anchor), canonical `/x?id={value}`, `<base href>` đúng chuẩn urljoin, `same_scope` mặc định true. **Bug fixed (test phát hiện):** `max_depth=0` trước bị `or 3` ép thành depth-3 crawl — giờ tôn trọng 0. Tự đổ inventory qua `_DATA_INGEST["crawler"]` **v1.9.1:** JS hint kèm method ƯỚC LƯỢNG (axios verb / `xhr.open('V')` → verb; `fetch('url')` → GET chỉ khi không có options; `$.ajax`/fetch có options → UNKNOWN — UNKNOWN KHÔNG bị ép thành GET trong inventory); **EvidenceRedactor** che secret trong `evidence_dict()` (headers/cookies/params/form/json/url, `add_sensitive_field`, `pass` đã được thêm vào field mặc định) |
+| api_discovery / api_import | recon | safe | OpenAPI/Swagger/Postman discovery/import, operation metadata, JSON shapes and GraphQL hints; no declared operation execution |
+| auth_context_set/list/login/logout/remove | auth | safe/active | Isolated per-origin sessions, static auth, multi-step login extraction and lifecycle; `${ENV:NAME}` secrets |
+| auth_compare | auth | active | Executes one request under 2–8 contexts and records facts-only status/redirect/shape/hash/similarity observations |
+| dynamic_plan / phase3_status | reasoning | safe | Live-state prioritized plan with planned/blocked/completed actions and prerequisites |
+| authorization_reason | reasoning | safe | Evidence-bound authorization hypotheses; declared owner/policy; never an automatic verdict |
+| business_rule_set / business_workflow_test / business_reason | reasoning | safe/active | Declare invariants, execute bounded real workflows, reason over response evidence |
+| sast_dast_correlate | reasoning | safe | Route/parameter/category correlation producing validation leads, not findings |
 | sast_scan | sast | safe | Source-code scan: pattern heuristics (PHP/Python/JS/Java) + secret scan; optional semgrep/gitleaks; scoped via WEBX_SRC_DIRS |
 | waf_detect (wafw00f) / detect_cms (whatweb) | recon | safe | fingerprint |
 | subdomain_enum (subfinder) | recon | safe | |
@@ -1008,7 +1028,7 @@ python3 agent.py --recon
   (engine reuse, cookie/login flow, final_url, error mapping) and the 2 timeout
   tests updated to the new engine. Full suite: **294 tests pass** (was 273).
 
-### v1.7.0 — Phase 1 complete (ChatGPT review): structured results + multi-service inventory + attack memory + evidence provenance
+### v1.7.0 — Phase 1 complete: structured results + multi-service inventory + attack memory + evidence provenance
 
 - **Structured ToolResult (`tools.py`)** — every native Python tool now returns
   `(output_text, data_dict)`: the human-readable text for the model plus a

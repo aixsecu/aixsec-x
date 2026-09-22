@@ -42,6 +42,16 @@ def load_config() -> dict:
         # WEBX_AUTO_EXEC=all để hoàn toàn hands-free (không hỏi approval).
         "ai_native": os.environ.get("WEBX_AI_NATIVE", "0") == "1",
 
+        # Phase 4 autonomous runtime is opt-in. It reuses the same scope and
+        # approval boundary as interactive dispatch and checkpoints atomically.
+        "autonomy_enabled": os.environ.get("WEBX_AUTONOMY", "0") == "1",
+        "autonomy_checkpoint": os.environ.get("WEBX_AUTONOMY_CHECKPOINT", "").strip(),
+        "autonomy_resume": os.environ.get("WEBX_AUTONOMY_RESUME", "0") == "1",
+        "autonomy_max_actions": int(os.environ.get("WEBX_AUTONOMY_MAX_ACTIONS", "100")),
+        "autonomy_max_requests": int(os.environ.get("WEBX_AUTONOMY_MAX_REQUESTS", "500")),
+        "autonomy_max_seconds": float(os.environ.get("WEBX_AUTONOMY_MAX_SECONDS", "3600")),
+        "autonomy_max_risk": float(os.environ.get("WEBX_AUTONOMY_MAX_RISK", "20")),
+
         # ── Scope (bắt buộc — comma separated) ──
         "targets": [t.strip() for t in os.environ.get("WEBX_TARGETS", "").split(",") if t.strip()],
 

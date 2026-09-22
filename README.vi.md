@@ -1,3 +1,9 @@
+> **4.0.0 / Phase 4:** knowledge graph có thể lưu, goal-driven planner, bộ nhớ
+> thích nghi, suy luận workflow, cost/risk budget và autonomous runtime có
+> checkpoint. Xem [kiến trúc Phase 4](docs/PHASE_4.md),
+> [hướng dẫn Phase 3](docs/PHASE_3.md), [Phase 2](docs/PHASE_2.md) và
+> [chi tiết API discovery](docs/PHASE_2_1.md).
+
 # AIXSEC-X — AI Web Exploitation Assistant (local LLM, Kali Linux)
 
 | Ngôn ngữ | Tệp |
@@ -290,6 +296,13 @@ root@aixsec-x:~# q                                          → thoát
 |---|---|---|---|
 | http_probe / headers_recon / dns_lookup | recon | safe | Python requests |
 | crawler | recon | safe | **v1.9.0:** Crawl BFS nội bộ Python, GET-only, dùng CHUNG Session Engine (cookie jar + proxy + auth header) — không cần wapiti binary. Khám phá: link nội bộ + external, form (action/method/field name), query param, script src, JS endpoint hint (`fetch`/`axios`/`$.ajax`/XHR — ỨNG VIÊN, cần xác minh, nguồn `crawler:js` trong inventory). Bounds: `max_depth` 0–10 (mặc định 3), `max_pages`, `request_timeout`, `time_budget` tự dừng, `trailing_slash`, `max_body_bytes`; redirect ≤5 hop trong scope, ra ngoài scope dừng + ghi `redirect_out`. Form KHÔNG bị submit; script/static/PDF ghi nhận nhưng KHÔNG enqueue. Query chuẩn hoá (sort key, bỏ anchor), canonical `/x?id={value}`, `<base href>` theo đúng urljoin, `same_scope` mặc định true. **Bug fixed (test phát hiện):** `max_depth=0` trước bị `or 3` ép thành crawl depth-3 — giờ tôn trọng 0. Tự đổ inventory qua `_DATA_INGEST["crawler"]` **v1.9.1:** JS hint kèm method ƯỚC LƯỢNG (axios verb / `xhr.open('V')` → verb; `fetch('url')` → GET chỉ khi không có options; `$.ajax`/fetch có options → UNKNOWN — UNKNOWN KHÔNG bị ép thành GET trong inventory); **EvidenceRedactor** che secret trong `evidence_dict()` (headers/cookies/params/form/json/url, `add_sensitive_field`, `pass` đã được thêm vào field mặc định) |
+| api_discovery / api_import | recon | safe | Discovery/import OpenAPI/Swagger/Postman, metadata operation, JSON shape và GraphQL hints; không thực thi operation khai báo |
+| auth_context_set/list/login/logout/remove | auth | safe/active | Session riêng theo origin, static auth, login nhiều bước và lifecycle; secret `${ENV:NAME}` |
+| auth_compare | auth | active | Chạy cùng request qua 2–8 context và ghi facts-only status/redirect/shape/hash/similarity |
+| dynamic_plan / phase3_status | reasoning | safe | Plan ưu tiên từ live state với action planned/blocked/completed và prerequisite |
+| authorization_reason | reasoning | safe | Authorization hypothesis gắn evidence và owner/policy khai báo; không tự kết luận |
+| business_rule_set / business_workflow_test / business_reason | reasoning | safe/active | Khai báo invariant, chạy workflow thật có giới hạn, reasoning từ response evidence |
+| sast_dast_correlate | reasoning | safe | Correlation route/parameter/category tạo validation lead, không tạo finding |
 | sast_scan | sast | safe | Source-code scan: pattern heuristic (PHP/Python/JS/Java) + secret scan; tùy chọn semgrep/gitleaks; scope qua WEBX_SRC_DIRS |
 | waf_detect (wafw00f) / detect_cms (whatweb) | recon | safe | fingerprint |
 | subdomain_enum (subfinder) | recon | safe | |
@@ -958,7 +971,7 @@ python3 agent.py --recon
   xạ lỗi) + 2 test timeout cập nhật theo engine mới. Toàn bộ suite:
   **294 test pass** (trước là 273).
 
-### v1.7.0 — Hoàn tất Phase 1 (theo review ChatGPT): structured results + inventory đa-service + bộ nhớ tấn công + evidence provenance
+### v1.7.0 — Hoàn tất Phase 1: structured results + inventory đa-service + bộ nhớ tấn công + evidence provenance
 
 - **Structured ToolResult (`tools.py`)** — mọi tool Python-native giờ trả về
   `(output_text, data_dict)`: văn bản cho model + dict cấu trúc do chính tool

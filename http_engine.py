@@ -7,7 +7,7 @@ form-urlencoded/JSON/raw/multipart body, custom headers, basic/bearer/API-key
 auth, redirect history, request/response timing, raw evidence, request replay,
 proxy.
 
-Kiến trúc (ChatGPT Phase 2 roadmap — "Làm HTTP Session Engine trước"):
+Kiến trúc (AIXSEC-X Phase 2 roadmap — HTTP Session Engine được xây dựng trước):
     AI → http_request tool → HTTP Session Engine → requests.Session
 Crawler (bước tiếp theo của Phase 2) sẽ REUSE engine này — KHÔNG tồn tại HTTP
 implementation thứ hai trong dự án.
@@ -512,7 +512,7 @@ class HttpSession:
     def request(self, method: str, url: str, *, params=None, headers=None,
                 body=None, data=None, json_body=None, form=None, files=None,
                 auth=None, cookies=None, follow_redirects=True, timeout=30.0,
-                record: bool = True) -> tuple[HttpResponse, RequestRecord]:
+                record: bool = True, max_response_bytes: int | None = None) -> tuple[HttpResponse, RequestRecord]:
         """Thực thi 1 request qua requests.Session (cookie jar + proxy + UA mặc
         định). Body precedence: files→multipart, json_body→JSON, form→
         form-urlencoded, body/data→raw — đúng thứ tự Phase 2 roadmap.
@@ -521,6 +521,8 @@ class HttpSession:
         Timeout/RequestException...) NÉM RA cho adapter xử lý — giữ nguyên
         thông điệp lỗi chuẩn của tool http_request (output format v1.5.6+).
         ValueError (method/auth/files sai) cũng ném ra để adapter báo "[!] ..."."""
+        if max_response_bytes is not None and max_response_bytes < 1:
+            raise ValueError("max_response_bytes must be positive")
         method = str(method or "get").lower().strip()
         if method not in METHODS:
             raise ValueError(
@@ -562,10 +564,24 @@ class HttpSession:
                     send["data"] = str(raw)
 
             t0 = time.time()
+            if max_response_bytes is not None:
+                send["stream"] = True
             r = self.s.request(
                 method.upper(), url, headers=hdrs, params=p,
                 cookies=dict(cookies or {}), allow_redirects=follow_redirects,
                 timeout=timeout, **send)
+            if max_response_bytes is not None:
+                try:
+                    chunks, received = [], 0
+                    for chunk in r.iter_content(chunk_size=65536):
+                        received += len(chunk)
+                        if received > max_response_bytes:
+                            raise ValueError("Response exceeds byte limit")
+                        chunks.append(chunk)
+                    r._content = b"".join(chunks)
+                    r._content_consumed = True
+                finally:
+                    r.close()
             elapsed = round(time.time() - t0, 3)
             resp = HttpResponse.from_response(r, url, method.upper())
         finally:

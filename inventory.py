@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 """aixsec-x — inventory.py
-Attack Surface Inventory (v1.7.0) — ChatGPT roadmap Phase 1 hoàn chỉnh:
+Attack Surface Inventory (v1.7.0) — AIXSEC-X roadmap Phase 1 hoàn chỉnh:
 #1 Attack Surface, #12 attack memory (TestHistory), #13 adaptive selection,
-kèm structured ToolResult + evidence provenance (theo review ChatGPT).
+kèm structured ToolResult + evidence provenance.
 
 Ý tưởng: sau mỗi round, agent gom kết quả THẬT của phiên vào MỘT inventory
 thống nhất: host → service(port/scheme) → endpoint → method → parameter →
 auth → tech, kèm provenance (source + evidence CHO TỪNG observation).
 
-v1.7.0 (theo review ChatGPT — 5 điểm):
+v1.7.0 (Phase 1 — 5 điểm chính):
 1. STRUCTURED TOOLRESULT — tool tự sinh (output_text, data_dict); ingest ưu
    tiên đọc `data` (không regex trên văn bản). Text parser chỉ là FALLBACK
    cho binary tool (whatweb/wafw00f/ffuf/arjun/subfinder/...) và transcript
@@ -71,11 +71,21 @@ class Endpoint:
     auth_hints: set[str] = field(default_factory=set)  # v1.7.0: set (cookie/bearer/...)
     sources: set[str] = field(default_factory=set)     # tên tool xác nhận
 
+    api_operations: dict = field(default_factory=dict)  # method -> provenance + metadata
+    auth_observations: list[dict] = field(default_factory=list)
+
     def merge(self, other: "Endpoint") -> None:
         self.methods |= other.methods
         self.params |= other.params
         self.auth_hints |= other.auth_hints
         self.sources |= other.sources
+        from api_discovery.inventory import merge_operation
+        for method, op in other.api_operations.items():
+            for obs in op.get("observations", []):
+                merge_operation(self, {**obs, "method": method})
+        for observation in other.auth_observations:
+            if observation not in self.auth_observations:
+                self.auth_observations.append(observation)
 
 
 @dataclass
@@ -184,6 +194,7 @@ class Inventory:
     def __init__(self):
         self.hosts: dict[str, HostInfo] = {}
         self.dns_only: set[str] = set()      # subdomain từ subfinder — chưa probe
+        self.analysis: dict = {}             # Phase 3 plans/hypotheses/correlations
 
     # ── ingest ──
     def ingest(self, calls: list[dict]) -> int:
@@ -203,6 +214,8 @@ class Inventory:
                 fn = _DATA_INGEST.get(name)
                 if fn is not None:
                     n_new += fn(self, name, args, data)
+                    from api_discovery.inventory import ingest_existing
+                    ingest_existing(self, name, data)
                     continue
             out = str(c.get("output") or "")
             if out.lstrip().startswith("[!]"):
@@ -300,7 +313,9 @@ class Inventory:
                          if ep.auth_hints else "")
                     s_ = (f" [{','.join(sorted(ep.sources)) or '-'}]"
                           if ep.sources else "")
-                    out.append(f"    {m} {url}{p}{a}{s_}")
+                    out.append(f"    {m} {url}{p}{a}{s_}" +
+                               (f" api={','.join(sorted(ep.api_operations))}" if ep.api_operations else "") +
+                               (f" auth_obs={len(ep.auth_observations)}" if ep.auth_observations else ""))
                     if len(out) >= limit:
                         break
                 if len(out) >= limit:
@@ -340,7 +355,9 @@ class Inventory:
                                 {"url": e.url, "methods": sorted(e.methods),
                                  "params": sorted(e.params),
                                  "auth_hints": sorted(e.auth_hints),
-                                 "sources": sorted(e.sources)}
+                                 "sources": sorted(e.sources),
+                                 "api_operations": e.api_operations,
+                                 "auth_observations": e.auth_observations}
                                 for e in sorted(s.endpoints.values(),
                                                 key=lambda e: e.url)
                             ],
@@ -356,7 +373,22 @@ class Inventory:
                 for h in sorted(self.hosts.values(), key=lambda h: h.host)
             ],
             "dns_only": sorted(self.dns_only),
+            "analysis": self.analysis,
         }
+
+    def api_inventory(self) -> list[dict]:
+        """Canonical operation view for planners; legacy URL/query view is retained."""
+        return [{"url": e.url, "method": method, **operation}
+                for h in sorted(self.hosts.values(), key=lambda h: h.host)
+                for e in sorted(h.endpoints.values(), key=lambda e: e.url)
+                for method, operation in sorted(e.api_operations.items())]
+
+    def auth_inventory(self) -> list[dict]:
+        """Factual auth comparisons for Phase 3 authorization reasoning."""
+        return [{"url": e.url, **observation}
+                for h in sorted(self.hosts.values(), key=lambda h: h.host)
+                for e in sorted(h.endpoints.values(), key=lambda e: e.url)
+                for observation in e.auth_observations]
 
     def save(self, path: str) -> None:
         with open(path, "w") as f:
@@ -390,7 +422,7 @@ class Inventory:
                             svc.add_tech_obs(TechObservation(
                                 name=t, version=v, source="legacy", evidence=""))
                     for ed in sd.get("endpoints", []):
-                        url = _norm_url(ed["url"])
+                        url = ed["url"] if ed.get("api_operations") else _norm_url(ed["url"])
                         svc.endpoints[url] = Endpoint(
                             url=url,
                             methods=set(ed.get("methods") or []),
@@ -398,7 +430,9 @@ class Inventory:
                             auth_hints=set(ed.get("auth_hints")
                                            or ([ed["auth_hint"]]
                                                if ed.get("auth_hint") else [])),
-                            sources=set(ed.get("sources") or []))
+                            sources=set(ed.get("sources") or []),
+                            api_operations=ed.get("api_operations") or {},
+                            auth_observations=ed.get("auth_observations") or [])
                     if svc.port:
                         host.services[svc.port] = svc
                         _recompute_tech(svc)
@@ -414,17 +448,20 @@ class Inventory:
                                                      source="legacy", evidence=""))
                 ends = hd.get("endpoints") or []
                 for ed in ends:
-                    url = _norm_url(ed["url"])
+                    url = ed["url"] if ed.get("api_operations") else _norm_url(ed["url"])
                     svc.endpoints[url] = Endpoint(
                         url=url, methods=set(ed.get("methods") or []),
                         params=set(ed.get("params") or []),
                         auth_hints=set(ed.get("auth_hints")
                                        or ([ed["auth_hint"]]
                                            if ed.get("auth_hint") else [])),
-                        sources=set(ed.get("sources") or []))
+                        sources=set(ed.get("sources") or []),
+                        api_operations=ed.get("api_operations") or {},
+                        auth_observations=ed.get("auth_observations") or [])
                 host.services[port] = svc
             inv.hosts[host.host] = host
         inv.dns_only = set(data.get("dns_only") or [])
+        inv.analysis = data.get("analysis") if isinstance(data.get("analysis"), dict) else {}
         return inv
 
 
@@ -747,7 +784,32 @@ def _ingest_data_sqli(inv: Inventory, name: str, args: dict, data: dict) -> int:
     return 1
 
 
+from api_discovery.inventory import ingest as _ingest_api_discovery
+
+
+def _ingest_auth_compare(inv: Inventory, name: str, args: dict, data: dict) -> int:
+    """Store factual per-context responses. No IDOR/BOLA classification here."""
+    url = str(data.get("url") or "")
+    method = str(data.get("method") or "GET").upper()
+    host = inv.ensure_web(url, name)
+    if host is None:
+        return 0
+    ep = inv.add_endpoint(host, url, method=method, source=name)
+    observation = {
+        "method": method,
+        "contexts": list(data.get("contexts") or []),
+        "observations": list(data.get("observations") or []),
+        "comparisons": list(data.get("comparisons") or []),
+        "interpretation": "facts_only",
+    }
+    if observation not in ep.auth_observations:
+        ep.auth_observations.append(observation)
+    return 1
+
 _DATA_INGEST = {
+    "api_discovery": _ingest_api_discovery,
+    "api_import": _ingest_api_discovery,
+    "auth_compare": _ingest_auth_compare,
     "http_probe": _ingest_data_http,
     "http_request": _ingest_data_http,
     "headers_recon": _ingest_data_http,

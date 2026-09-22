@@ -37,7 +37,7 @@ from tools import (TOOL_REGISTRY, TOOL_INDEX, TOOL_BINS, TOOL_TIMEOUTS,
 # v1.8.0: HTTP Session Engine (http_engine.py) — http_request là adapter trên
 # engine (cookie jar theo host, auth, redirect history, timing, evidence, replay,
 # proxy WEBX_HTTP_PROXY/WEBX_HTTPS_PROXY).
-VERSION = "1.9.1"
+VERSION = "4.0.0"
 
 # v1.7.0 (#12 attack memory): phân loại vuln_class cho TestHistory theo tool
 # (sqli→sqli, scanner→scan, recon→recon, poc→poc; tool không khớp → "").
@@ -48,10 +48,21 @@ for _t in ("wapiti_scan", "nikto_scan", "nuclei_scan", "sast_scan"):
     _TOOL_VULN[_t] = "scan"
 for _t in ("http_probe", "http_request", "headers_recon", "detect_cms",
            "waf_detect", "ffuf_dir", "param_discovery", "subdomain_enum",
-           "dns_lookup", "crawler"):
+           "dns_lookup", "crawler", "api_discovery", "api_import"):
     _TOOL_VULN[_t] = "recon"
 for _t in ("generate_poc", "poc_executor"):
     _TOOL_VULN[_t] = "poc"
+for _t in ("auth_context_set", "auth_context_list", "auth_login",
+           "auth_logout", "auth_context_remove"):
+    _TOOL_VULN[_t] = "auth"
+for _t in ("auth_compare", "authorization_reason"):
+    _TOOL_VULN[_t] = "authorization"
+for _t in ("business_rule_set", "business_workflow_test", "business_reason"):
+    _TOOL_VULN[_t] = "business_logic"
+for _t in ("sast_dast_correlate",):
+    _TOOL_VULN[_t] = "correlation"
+for _t in ("dynamic_plan", "phase3_status"):
+    _TOOL_VULN[_t] = "planning"
 
 # v1.5.8 (Bug A): chuỗi lỗi LLM từ llm.py — nhận diện để KHÔNG đếm là plan-only
 # (trước đây timeout bị coi là "văn bản kế hoạch" → plan_only=2 → forced break →
@@ -331,6 +342,8 @@ class WebXAgent:
             if v:
                 url = str(v)
                 break
+        if not url and isinstance(args.get("request"), dict):
+            url = str(args["request"].get("url") or "")
         if not url:
             return
         self.test_history.add(
@@ -341,6 +354,58 @@ class WebXAgent:
             outcome=r.get("outcome") or "ok",
         )
 
+    def run_autonomous(self, goal: str = "coverage", max_cycles: int | None = None,
+                       checkpoint_path: str | None = None) -> dict:
+        """Run the Phase 4 loop through the normal policy-aware dispatcher.
+
+        This is an additive API: ``run`` and all Phase 1-3 tool APIs retain
+        their existing behavior. The operator controls risk through auto_exec.
+        """
+        import auth_context as _auth_context
+        import security_analysis as _security_analysis
+        from autonomy import (AutonomousRuntime, ExecutionBudget, Goal,
+                              KnowledgeGraph, PlannerMemory, WorkflowModel)
+
+        _security_analysis.manager().bind(
+            self.inventory, self.test_history, self.ledger, self.available)
+        checkpoint = checkpoint_path or self.config.get("autonomy_checkpoint", "")
+
+        def execute(action: dict) -> dict:
+            name, arguments = action["tool"], action.get("arguments") or {}
+            result = self._dispatch(name, arguments)
+            self._record_test(name, arguments, result)
+            event = {**result, "args": arguments}
+            self.inventory.ingest([event])
+            _security_analysis.manager().ingest_tool_result(event)
+            return result
+
+        if checkpoint and self.config.get("autonomy_resume") and os.path.exists(checkpoint):
+            runtime = AutonomousRuntime.resume(checkpoint, execute)
+        else:
+            budget = ExecutionBudget(
+                max_actions=int(self.config.get("autonomy_max_actions", 100)),
+                max_requests=int(self.config.get("autonomy_max_requests", 500)),
+                max_seconds=float(self.config.get("autonomy_max_seconds", 3600)),
+                max_risk=float(self.config.get("autonomy_max_risk", 20)),
+            )
+            graph = KnowledgeGraph.from_phase_state(
+                self.inventory, self.test_history, _auth_context.manager().list())
+            for target in self.config.get("targets") or []:
+                if str(target).startswith(("http://", "https://")) and not graph.query(
+                        "endpoint", url=str(target)):
+                    graph.add_node("endpoint", {"url": str(target), "methods": ["GET"],
+                                                "auth_hints": [],
+                                                "sources": ["configured_target"]})
+            workflow = WorkflowModel()
+            workflow.infer_from_runs(self.inventory.analysis.get("workflow_runs") or [])
+            runtime = AutonomousRuntime(graph, PlannerMemory(), workflow, budget,
+                                        capabilities=set(self.available), executor=execute)
+        result = runtime.run(Goal(goal), max_cycles=max_cycles,
+                             checkpoint_path=checkpoint or None)
+        self.inventory.analysis["autonomy_status"] = result
+        self.inventory.analysis["knowledge_graph"] = runtime.graph.to_dict()
+        return result
+
     # ─────────────────────────────────────────
     # MAIN LOOP
     # ─────────────────────────────────────────
@@ -350,6 +415,12 @@ class WebXAgent:
         # (WEBX_HTTP_PROXY/WEBX_HTTPS_PROXY) — http_request dùng CHUNG engine này.
         import http_engine as _he
         _he.reset_sessions()
+        import auth_context as _auth_context
+        _auth_context.reset_contexts()
+        import security_analysis as _security_analysis
+        _security_analysis.reset()
+        _security_analysis.manager().bind(
+            self.inventory, self.test_history, self.ledger, self.available)
         _px = {k: v for k, v in (("http", self.config.get("http_proxy")),
                                  ("https", self.config.get("https_proxy"))) if v}
         _he.set_proxies(_px or None)
@@ -524,6 +595,8 @@ class WebXAgent:
             self.transcript.append({"round": rnd, "type": "tools", "calls": results})
             # v1.6.0 (#1/#12/#13): gom tool output OK của round vào attack surface
             self.inventory.ingest(results)
+            for _analysis_result in results:
+                _security_analysis.manager().ingest_tool_result(_analysis_result)
             result["calls"] += len(results)
             # v1.5.2: wapiti-first gate — chỉ wapiti_scan tính là "đã chạy" khi
             # outcome ok (thành công) HOẶC error (đã cố, fail rõ ràng). Các
@@ -562,11 +635,23 @@ class WebXAgent:
             # lại tool-call trên cùng endpoint/param/lớp lỗ hổng.
             th_note = ("\n" + self.test_history.render()) \
                 if self.test_history.record_count() else ""
+            try:
+                live_plan = _security_analysis.manager().plan("coverage", max_actions=8)
+                plan_rows = [
+                    f"- {a['state']} P{a['priority']} {a['tool']} "
+                    f"reason={a['reason']}"
+                    + (f" blocked_by={','.join(a['blocked_by'])}" if a["blocked_by"] else "")
+                    for a in live_plan["actions"]]
+                plan_note = ("\n[DYNAMIC PLAN — live state, ưu tiên action planned; "
+                             "giải quyết blocked_by trước]:\n" + "\n".join(plan_rows)) \
+                    if plan_rows else ""
+            except (ValueError, TypeError):
+                plan_note = ""
             msgs.append({"role": "user", "content":
                         "[TOOL RESULTS BEGIN]\n" +
                         json.dumps(tool_msgs, ensure_ascii=False)[:12000] +
                         "\n[TOOL RESULTS END]\nTiếp tục. Khi đủ dữ liệu trả JSON cuối cùng."
-                        + surf_note + th_note})
+                        + surf_note + th_note + plan_note})
 
         # v1.5.2 (tail-order 1): AUTO-WAPITI — hết vòng lặp mà web scope active
         # và wapiti_scan chưa từng chạy (model bỏ qua dù prompt/gate bắt buộc)
@@ -884,6 +969,8 @@ class WebXAgent:
         self.transcript.append({"round": 0, "type": "tools", "calls": [r],
                                 "auto": True})
         self.inventory.ingest([r])   # v1.6.0: wapiti auto cũng vào attack surface
+        import security_analysis as _security_analysis
+        _security_analysis.manager().ingest_tool_result(r)
         self._record_test("wapiti_scan", args, r)
         out = InjectionGuard.sanitize(r.get("output", ""),
                                       self.config["output_cap"])
@@ -947,6 +1034,19 @@ class WebXAgent:
         th = self.test_history.render(limit=60)
         if th:
             md += f"\n## Test History (đã thử — attack memory)\n```\n{th}\n```\n"
+        if self.inventory.analysis:
+            summary = {
+                "latest_plan": self.inventory.analysis.get("latest_plan", {}),
+                "authorization_hypotheses": self.inventory.analysis.get(
+                    "authorization_hypotheses", []),
+                "business_hypotheses": self.inventory.analysis.get(
+                    "business_hypotheses", []),
+                "sast_dast_correlations": self.inventory.analysis.get(
+                    "sast_dast_correlations", [])[:20],
+            }
+            md += ("\n## Phase 3 Analysis (hypotheses, chưa phải verdict)\n```json\n" +
+                   json.dumps(summary, ensure_ascii=False, indent=2)[:20000] +
+                   "\n```\n")
         path = f"aixsec-x_report_{int(time.time())}.md"
         with open(path, "w") as f:
             f.write(md)
@@ -1178,6 +1278,11 @@ def main():
     if non_interactive or one_shot:
         prompt_text = one_shot if isinstance(one_shot, str) else \
             "Hãy phân tích và khai thác target trong scope. Bắt đầu bằng recon rồi active check. Khi đủ dữ liệu trả JSON findings."
+        if cfg.get("autonomy_enabled"):
+            result = agent.run_autonomous("coverage")
+            print("\n" + json.dumps(result, ensure_ascii=False, indent=2)[:3000])
+            agent.save_inventory()
+            return
         result = agent.run(prompt_text)
         if result.get("llm_down"):
             print("\n" + result.get("llm_note", ""))
@@ -1191,7 +1296,8 @@ def main():
 
     # ── interactive ──
     print(f"{DIM}[>]{RESET} {DIM}Type{RESET} {GREEN}'q'{RESET} {DIM}quit |{RESET} {GREEN}'!! <cmd>'{RESET} {DIM}shell |{RESET} "
-          f"{GREEN}'/findings'{RESET} {DIM}ledger |{RESET} {GREEN}'/report'{RESET} {DIM}export.{RESET}", flush=True)
+          f"{GREEN}'/findings'{RESET} {DIM}ledger |{RESET} {GREEN}'/report'{RESET} {DIM}export |{RESET} "
+          f"{GREEN}'/autonomy [goal]'{RESET}{DIM}.{RESET}", flush=True)
     while True:
         try:
             line = input(f"\n{BOLD}{GREEN}root@aixsec-x{RESET}{DIM}:~#{RESET} ").strip()
@@ -1216,6 +1322,11 @@ def main():
                 mark = "✔" if r["available"] else "✗"
                 ver = r["version"] or "(chưa cài)"
                 print(f"[{mark}] {r['tool']:<22} {r['binary']:<12} {ver}")
+            continue
+        if line == "/autonomy" or line.startswith("/autonomy "):
+            goal = line.partition(" ")[2].strip() or "coverage"
+            print(json.dumps(agent.run_autonomous(goal), ensure_ascii=False, indent=2))
+            agent.save_inventory()
             continue
         result = agent.run(line)
         if result.get("llm_down"):
