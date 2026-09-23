@@ -109,7 +109,7 @@ TOOL_TIMEOUTS: dict[str, int] = {
 LONG_RUN_TOOLS: frozenset = frozenset({"wapiti_scan"})
 
 
-def available_tools() -> tuple[set, dict]:
+def available_tools(config=None) -> tuple[set, dict]:
     """(set tool khả dụng, dict {tool_name: binary thiếu}) — gọi 1 lần lúc khởi động.
     Chỉ các tool cần binary NGOÀI mới được liệt kê; tool thuần Python
     (http_probe, headers_recon, dns_lookup, sqli_manual_test, ...) luôn khả dụng."""
@@ -121,6 +121,9 @@ def available_tools() -> tuple[set, dict]:
             avail.add(name)
         else:
             missing[name] = binary
+    from zap_adapter import executable
+    if not executable(config or {}):
+        avail.difference_update({"zap_baseline", "zap_active_scan"})
     return avail, missing
 
 
@@ -639,7 +642,8 @@ def _ffuf_dir(**kw):
         # tránh URL-gate nuốt hết ffuf_dir chỉ vì đường dẫn sai
         raise ValueError(str(e))
     args = ["ffuf", "-u", kw["url"].rstrip("/") + "/FUZZ",
-            "-w", wl, "-mc", "200,204,301,302,307,401,403", "-t", "30",
+            "-w", wl, "-mc", "200,204,301,302,307,401,403", "-t", str(kw.get("_threads", 30)),
+            "-rate", str(kw.get("_rate", 0)),
             "-timeout", "10", "-maxtime", str(int(kw.get("maxtime") or 90)),
             "-s"]
     if kw.get("extensions"):
@@ -2175,7 +2179,51 @@ def _gitleaks_scan(src: str) -> str:
 # TOOL REGISTRY
 # ─────────────────────────────────────────────
 
+def _zap_baseline(**kw):
+    from zap_adapter import run_scan
+    return run_scan(kw["_config"], kw["url"], timeout=kw.get("_timeout"),
+                    auth_context=kw.get("auth_context", "anonymous"), ajax=bool(kw.get("ajax", False)))
+
+
+def _zap_active_scan(**kw):
+    from zap_adapter import run_scan
+    return run_scan(kw["_config"], kw["url"], active=True, rule_ids=kw.get("rule_ids", []),
+                    timeout=kw.get("_timeout"), auth_context=kw.get("auth_context", "anonymous"))
+
+
+def _evidence_validate(**kw):
+    value = kw["_evidence_store"].validate(kw["evidence_id"])
+    return json.dumps(value), value
+
+
+def _evidence_replay(**kw):
+    value = kw["_evidence_store"].replay(kw["evidence_id"], kw["_scope_policy"], kw.get("_timeout", 15))
+    return json.dumps(value), value
+
+
+def _evidence_status(**kw):
+    value = kw["_evidence_store"].summary()
+    return json.dumps(value, ensure_ascii=False), value
+
+
 TOOL_REGISTRY: list[ToolSpec] = [
+    ToolSpec("zap_baseline", "Isolated ZAP spider/OpenAPI/passive scan. Alerts are candidates, not confirmed findings.",
+             {"type": "object", "properties": {"url": {"type": "string"},
+               "auth_context": {"type": "string", "description": "Operator-configured ZAP auth profile; anonymous by default"},
+               "ajax": {"type": "boolean"}}, "required": ["url"]}, _zap_baseline, risk="noisy"),
+    ToolSpec("zap_active_scan", "Targeted ZAP active scan with explicit operator-allowed rule IDs and time budget.",
+             {"type": "object", "properties": {"url": {"type": "string"},
+               "auth_context": {"type": "string"},
+               "rule_ids": {"type": "array", "items": {"type": "integer"}}},
+               "required": ["url", "rule_ids"]}, _zap_active_scan, risk="active"),
+    ToolSpec("evidence_validate", "Validate stored evidence with deterministic rules. Unsupported checks remain needs_validation.",
+             {"type": "object", "properties": {"evidence_id": {"type": "string"}},
+               "required": ["evidence_id"]}, _evidence_validate, scope_params=(), risk="safe"),
+    ToolSpec("evidence_replay", "Replay a captured request under the same isolated auth identity; compare facts, never auto-confirm exploitability.",
+             {"type": "object", "properties": {"evidence_id": {"type": "string"}},
+               "required": ["evidence_id"]}, _evidence_replay, scope_params=(), risk="active"),
+    ToolSpec("evidence_status", "Read stored scanner evidence, coverage and validation states.",
+             {"type": "object", "properties": {}}, _evidence_status, scope_params=(), risk="safe"),
     # ── Recon ──
     ToolSpec("http_probe", "GET một URL: trả status code, headers chọn lọc, snippet body.",
              {"type": "object", "properties": {"url": {"type": "string", "pattern": "^https?://"}},

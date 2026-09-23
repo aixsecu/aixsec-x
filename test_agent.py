@@ -101,7 +101,7 @@ class FakeChat:
 
 
 def cfg(extra=None):
-    base = {"ollama_url": "http://x", "model": "m", "max_rounds": 9,
+    base = {"scan_backend": "legacy", "ollama_url": "http://x", "model": "m", "max_rounds": 9,
             "tool_timeout": 10, "output_cap": 5000,
             "targets": ["https://example.com", "10.0.0.0/8"],
             "src_dirs": [],

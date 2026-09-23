@@ -1,3 +1,5 @@
+> **4.2.0 — ZAP + Evidence pipeline:** baseline runs before AI; findings/risk come from evidence and validators. Default `WEBX_SCAN_BACKEND=auto` selects ZAP when available, otherwise HTTP-only partial coverage. The old Wapiti gate is opt-in `legacy`. See [setup, authentication, policy and limitations](docs/ZAP_PIPELINE.md). Wapiti-first examples below describe legacy mode.
+
 > **4.1.0 / Phase 4.1:** deterministic context retrieval, modular prompt
 > composition, token budgets, staged LLM timeouts and runtime metrics. See the
 > [Phase 4.1 guide](docs/PHASE_4_1.md). Phase 4 provides the serializable knowledge graph, goal-driven planning,
@@ -158,6 +160,8 @@ All 3 scenarios work: **web only** (empty src), **SAST only** (empty target), **
 ```bash
 cd aixsec-x
 source .venv/bin/activate
+export WEBX_SCAN_BACKEND=zap
+export WEBX_ZAP_EXECUTABLE=zaproxy
 export WEBX_TARGETS="https://example.com"        # web target (empty if SAST-only)
 export WEBX_SRC_DIRS="/path/to/source"           # source dirs (empty if no SAST)
 python3 agent.py                                  # interactive
@@ -212,6 +216,8 @@ is zsh; use `~/.bashrc` if you are on bash):
 
 ```bash
 # ~/.zshrc
+export WEBX_SCAN_BACKEND=zap
+export WEBX_ZAP_EXECUTABLE=zaproxy
 export WEBX_MODEL="huihui_ai/qwen3.5-abliterated:9b"
 export WEBX_THINK=1
 export WEBX_TARGETS="https://example.com"

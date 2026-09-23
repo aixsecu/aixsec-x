@@ -20,6 +20,30 @@ def load_config() -> dict:
         # WEBX_NUM_PREDICT: cap số token sinh ra (opt-in; "0" = không giới hạn)
         "num_predict": int(os.environ.get("WEBX_NUM_PREDICT", "0") or "0"),
 
+        # Baseline-first evidence pipeline. Legacy remains explicitly opt-in.
+        "scan_backend": os.environ.get("WEBX_SCAN_BACKEND", "auto").lower(),
+        "planner_enabled": os.environ.get("WEBX_PLANNER_ENABLED", "1") == "1",
+        "pipeline_max_seconds": int(os.environ.get("WEBX_PIPELINE_MAX_SECONDS", "900")),
+        "pipeline_max_requests": int(os.environ.get("WEBX_PIPELINE_MAX_REQUESTS", "5000")),
+        "pipeline_max_actions": int(os.environ.get("WEBX_PIPELINE_MAX_ACTIONS", "30")),
+        "evidence_dir": os.environ.get("WEBX_EVIDENCE_DIR", ".aixsec-evidence"),
+        "zap_executable": os.environ.get("WEBX_ZAP_EXECUTABLE", "zap.sh"),
+        "zap_timeout": int(os.environ.get("WEBX_ZAP_TIMEOUT", "300")),
+        "zap_phase_minutes": int(os.environ.get("WEBX_ZAP_PHASE_MINUTES", "2")),
+        "zap_max_urls": int(os.environ.get("WEBX_ZAP_MAX_URLS", "200")),
+        "zap_delay_ms": int(os.environ.get("WEBX_ZAP_DELAY_MS", "200")),
+        "zap_ajax": os.environ.get("WEBX_ZAP_AJAX", "0") == "1",
+        "zap_auth_context": os.environ.get("WEBX_ZAP_AUTH_CONTEXT", "anonymous"),
+        "zap_auth_file": os.environ.get("WEBX_ZAP_AUTH_FILE", ""),
+        "zap_openapi_file": os.environ.get("WEBX_ZAP_OPENAPI_FILE", ""),
+        "zap_allowed_rules": [int(x.strip()) for x in os.environ.get("WEBX_ZAP_ALLOWED_RULES", "").split(",") if x.strip()],
+        "allow_active_scan": os.environ.get("WEBX_ALLOW_ACTIVE_SCAN", "0") == "1",
+        "allow_sqlmap": os.environ.get("WEBX_ALLOW_SQLMAP", "0") == "1",
+        "allow_content_discovery": os.environ.get("WEBX_ALLOW_CONTENT_DISCOVERY", "1") == "1",
+        "allow_extraction": os.environ.get("WEBX_ALLOW_EXTRACTION", "0") == "1",
+        "ffuf_rate": int(os.environ.get("WEBX_FFUF_RATE", "5")),
+        "ffuf_threads": int(os.environ.get("WEBX_FFUF_THREADS", "2")),
+
         # ── Agent loop ──
         # 8 vòng mặc định: cân bằng độ sâu khai thác vs thời gian/chi phí LLM
         # (12 vòng trên máy 4 vCPU có thể chạy 20-30 phút/vòng model 9B).

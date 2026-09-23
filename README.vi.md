@@ -1,3 +1,5 @@
+> **4.2.0 — ZAP + Evidence pipeline:** baseline chạy trước AI; finding/risk lấy từ evidence và validator. Mặc định `WEBX_SCAN_BACKEND=auto` chọn ZAP nếu có, nếu không chỉ thu HTTP observation (coverage chưa đầy đủ). Wapiti gate cũ chỉ còn trong `legacy`. Xem [cấu hình, auth, policy và giới hạn](docs/ZAP_PIPELINE.md). Các ví dụ Wapiti-first bên dưới mô tả chế độ legacy.
+
 > **4.1.0 / Phase 4.1:** context retrieval xác định, prompt tách lớp, token
 > budget, timeout LLM theo giai đoạn và runtime metrics. Xem
 > [hướng dẫn Phase 4.1](docs/PHASE_4_1.md). Phase 4 gồm knowledge graph có thể lưu, goal-driven planner, bộ nhớ
@@ -160,6 +162,8 @@ thực tế.)
 ```bash
 cd aixsec-x
 source .venv/bin/activate
+export WEBX_SCAN_BACKEND=zap
+export WEBX_ZAP_EXECUTABLE=zaproxy
 export WEBX_TARGETS="https://example.com"        # target web (để trống nếu chỉ SAST)
 export WEBX_SRC_DIRS="/path/to/source"           # thư mục source (để trống nếu không dùng SAST)
 python3 agent.py                                  # interactive
@@ -199,6 +203,8 @@ dùng `~/.bashrc` nếu bạn ở bash):
 
 ```bash
 # ~/.zshrc
+export WEBX_SCAN_BACKEND=zap
+export WEBX_ZAP_EXECUTABLE=zaproxy
 export WEBX_MODEL="huihui_ai/qwen3.5-abliterated:9b"
 export WEBX_THINK=1
 export WEBX_TARGETS="https://example.com"

@@ -121,6 +121,17 @@ class SecurityAnalysisState:
             action["action_id"] = _id("act", action)
             actions.append(action)
 
+        for evidence in self.inventory.analysis.get("scanner_evidence") or []:
+            eid = evidence.get("evidence_id")
+            if not eid or (evidence.get("validation") or {}).get("status") == "confirmed":
+                continue
+            if not evidence.get("validation"):
+                add(90, "evidence_validate", {"evidence_id": eid},
+                    "Scanner candidate needs deterministic validation", eid)
+            elif not evidence.get("replays"):
+                add(65, "evidence_replay", {"evidence_id": eid},
+                    "Collect replay facts for scanner candidate; replay alone does not confirm exploitability", eid)
+
         for operation in self.inventory.api_inventory():
             url, method = operation["url"], operation["method"]
             observations = operation.get("observations") or []

@@ -19,6 +19,13 @@ class CostModel:
     """Estimates existing tools; it never introduces tools or payloads."""
 
     DEFAULTS = {
+        "zap_baseline": ActionCost(400, 300, .5),
+        "zap_active_scan": ActionCost(2000, 300, 2),
+        "evidence_validate": ActionCost(0, .01, 0),
+        "evidence_status": ActionCost(0, .01, 0),
+        "evidence_replay": ActionCost(1, 15, .5),
+        "ffuf_dir": ActionCost(450, 90, .5),
+        "sqlmap_runner": ActionCost(300, 240, 1),
         "phase3_status": ActionCost(0, .01, 0),
         "authorization_reason": ActionCost(0, .05, 0),
         "business_reason": ActionCost(0, .05, 0),
