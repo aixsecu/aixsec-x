@@ -21,6 +21,7 @@ import os
 import re
 import sys
 import time
+from urllib.parse import urljoin
 
 # ── local imports ──
 from config import load_config
@@ -867,11 +868,11 @@ class WebXAgent:
                             "nữa — trả final JSON trung thực với dữ liệu đã thu; "
                             "nếu chưa đủ bằng chứng, risk_level=UNKNOWN là kết quả "
                             "trung thực (đừng bịa dữ liệu scan)."})
-        # v1.5.8 (Bug B): model đã down (2 lỗi liên tiếp) → BỎ final chat
-        # (tiết kiệm 300s chắc chắn timeout) và tổng hợp findings từ tool
-        # output THẬT trong history (wapiti đã chạy ok). Nếu final chat vẫn
-        # lỗi → fallback tổng hợp tương tự.
-        if llm_down:
+        # Nếu hai lượt đầu timeout nhưng auto-wapiti vừa bổ sung bằng chứng mới,
+        # cho model đúng một cơ hội tổng hợp cuối. Đây là một tác vụ khác với
+        # hai lượt plan trước và thường thành công sau khi model đã load xong.
+        # Không có dữ liệu mới thì giữ fail-fast và tổng hợp tại chỗ.
+        if llm_down and not dispatched:
             result["llm_down"] = True
             result["llm_note"] = ("[!] Model không phản hồi (Ollama timeout) — "
                                   "kết quả được tổng hợp từ tool output thật "
@@ -893,6 +894,7 @@ class WebXAgent:
             self._synthesize_findings_json(result)
             self._commit_findings(result)
             return result
+        self._llm_fail = 0
         self._commit_findings(result)
         try:
             d = json.loads(result["final_text"]) if result["final_text"].strip().startswith("{") else {}
@@ -914,8 +916,10 @@ class WebXAgent:
         return t.strip().startswith("{") or "findings" in t[:200]
 
     def _synthesize_findings_json(self, result: dict) -> None:
-        """v1.5.8 (Bug B): model down → tổng hợp findings từ tool output THẬT
-        trong history (wapiti_scan đã chạy ok). Chỉ parse dòng detail wapiti:
+        """Model down → tổng hợp findings từ dữ liệu Wapiti thật trong history.
+
+        Ưu tiên ``ToolResult.data.findings`` vì đây là contract có cấu trúc,
+        sau đó mới parse output chữ để tương thích các adapter/release cũ:
         `[SEVERITY] CATEGORY (param=X) — METHOD /path [module=...]` + dòng
         `    → ` theo sau (bỏ wstg:/curl:). Dừng ở marker `[✓] TỔNG HỢP LỖ
         HỔNG` — phần summary có dòng no-param match regex → duplicate. Không
@@ -928,7 +932,49 @@ class WebXAgent:
         seen: set = set()
         findings: list[dict] = []
         target = ""
-        for msg in self._history():
+        severity = {"0": "info", "1": "low", "2": "medium", "3": "high",
+                    "4": "critical", "info": "info", "low": "low",
+                    "medium": "medium", "high": "high", "critical": "critical"}
+        history = self._history()
+
+        # New structured result path. It remains usable even when display text
+        # is truncated, localized, or reformatted.
+        for msg in history:
+            if msg.get("name") != "wapiti_scan" or msg.get("outcome") != "ok":
+                continue
+            data = msg.get("data")
+            if not isinstance(data, dict) or not isinstance(data.get("findings"), list):
+                continue
+            base = str(data.get("target") or "")
+            target = target or base
+            for item in data["findings"]:
+                if not isinstance(item, dict):
+                    continue
+                cat = str(item.get("category") or "").strip()
+                if not cat:
+                    continue
+                method = str(item.get("method") or "GET").upper()
+                path = str(item.get("path") or "")
+                param = str(item.get("parameter") or "")
+                module = str(item.get("module") or "")
+                key = (cat, method, path, param)
+                if key in seen:
+                    continue
+                seen.add(key)
+                raw_level = str(item.get("level") or "info").lower()
+                findings.append({
+                    "name": cat,
+                    "severity": severity.get(raw_level, "info"),
+                    "url": urljoin(base.rstrip("/") + "/", path.lstrip("/"))
+                           if base else path,
+                    "port": "", "service": "",
+                    "description": (f"{cat} phát hiện bởi wapiti "
+                                    f"(module={module or '?'})"),
+                    "fix": _WAPITI_FIX.get(cat, _WAPITI_FIX.get("_default", "")),
+                    "cves": [], "source": "wapiti_scan (auto — model down)",
+                    "source_tool": "wapiti_scan", "parameter": param,
+                })
+        for msg in history:
             text = msg.get("output") or ""
             if not text:
                 continue

@@ -182,6 +182,9 @@ Chế độ `--non-interactive`/`--oneshot` chỉ đọc env (không hỏi) — 
 | `WEBX_MAX_ROUNDS` | `8` | Số vòng tool-call tối đa mỗi lượt (thấp hơn = nhanh/rẻ hơn; model 9B trên máy 4 vCPU có thể mất 20–30 phút/vòng) |
 | `WEBX_TOOL_TIMEOUT` | `90` | Timeout mỗi tool (giây) |
 | `WEBX_LLM_TIMEOUT` | `300` | Timeout tối đa chờ model trả lời mỗi lượt (giây); model 9B trên CPU có thể mất 1–3 phút |
+| `WEBX_LLM_FIRST_TOKEN_TIMEOUT` | `90` | Dừng nếu Ollama chưa bắt đầu phản hồi sau số giây này; giá trị mặc định cho phép thinking model và model vừa cold-load có thời gian bắt đầu stream |
+| `WEBX_LLM_COMPLETION_TIMEOUT` | `180` | Timeout cho giai đoạn model sinh nội dung sau token đầu tiên (giây) |
+| `WEBX_LLM_OVERALL_TIMEOUT` | `210` | Timeout tổng cho một request gửi tới model (giây) |
 | `WEBX_STREAM` | `1` | `1`=stream NDJSON từ Ollama, agent hiển thị live reasoning + nội dung đang sinh + thời gian mỗi lượt; `0`=tắt (chờ response đầy đủ, không có hiển thị live) |
 | `WEBX_OLLAMA_URL` | `http://localhost:11434` | Endpoint Ollama (local / máy khác / tunnel) |
 | `WEBX_OLLAMA_AUTH` | *(trống)* | Header Authorization gửi tới Ollama: ghi đủ `Bearer xyz`/`Basic abc` hoặc chỉ token (tự thêm `Bearer `) — dùng cho tunnel/proxy có xác thực |
@@ -202,6 +205,9 @@ export WEBX_TARGETS="https://example.com"
 export WEBX_SRC_DIRS="/var/www/html"
 export WEBX_STREAM=1
 export WEBX_LLM_TIMEOUT=300
+export WEBX_LLM_FIRST_TOKEN_TIMEOUT=90
+export WEBX_LLM_COMPLETION_TIMEOUT=180
+export WEBX_LLM_OVERALL_TIMEOUT=210
 
 # sau đó: source ~/.zshrc   (hoặc mở terminal mới)
 ```
