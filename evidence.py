@@ -40,6 +40,7 @@ class EvidenceStore:
         self.candidates = {}
         self.coverage = []
         self.observations = []
+        self.discovery = []
         self.directory = None
         if directory:
             root = Path(directory).resolve()
@@ -62,6 +63,8 @@ class EvidenceStore:
         coverage = data.get('coverage')
         if isinstance(coverage, dict):
             self.coverage.append(public(coverage))
+        if isinstance(data.get('discovery'), dict):
+            self.discovery.append({'scan_id': data.get('scan_id', ''), **public(data['discovery'])})
         self.observations.append({'tool': name, 'outcome': result.get('outcome'),
             'url': EvidenceRedactor().redact_url(str(args.get('url') or '')),
             'data_sha256': stable_id('data', public(data)), 'artifact_ref': raw_artifact, 'time': time.time()})
@@ -219,6 +222,7 @@ class EvidenceStore:
 
     def summary(self):
         return {'coverage': self.coverage,
+                'discovery': self.discovery,
                 'evidence': [public(v) for v in self.records.values()],
                 'findings': [asdict(f) for f in self.candidates.values()],
                 'observations': self.observations}
@@ -243,6 +247,7 @@ class EvidenceStore:
             summary += ' Model không phản hồi; kết quả được dựng trực tiếp từ evidence.'
         result = {'risk_level': risk, 'candidate_risk_level': candidate_risk,
                   'overall_summary': summary, 'findings': findings, 'coverage': self.coverage,
+                  'discovery': self.discovery,
                   'llm_down': llm_down}
         if self.directory:
             result['evidence_path'] = str(self.directory / 'evidence.json')

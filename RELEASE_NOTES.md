@@ -1,3 +1,16 @@
+## Form/API discovery and browser coverage
+
+- Enable bounded AJAX Spider by default, with configurable browser, clickable tags,
+  depth and crawl states; raise the default process timeout to 600 seconds.
+- Export HAR plus an independent form/input/API inventory, retaining parameter names
+  and separate discovered/requested/tested states even without scanner alerts.
+- Feed discovery gaps to the planner and retain matching captured POST bodies for
+  endpoint-scoped active scans across methods.
+- Attribute active requests with an executor-owned HTTP sender observer because
+  HAR export may omit active scanner traffic; no finding is confirmed by this alone.
+- Detect browser startup failures from the engine log even when ZAP exits zero.
+- Add an opt-in localhost browser/form/POST integration test (`test_zap_live`).
+
 # AIXSEC-X 4.2.0 — ZAP and evidence pipeline
 
 - Baseline-before-LLM execution with ZAP AF, optional Wapiti or HTTP observation.

@@ -16,6 +16,11 @@ for replay and differential tests, business_workflow_test for ordered requests a
 sast_dast_correlate for validation leads. Do not invent owners, business rules, credentials or IDs.
 Scanner alerts are candidates. Scan completion, technologies and URL counts are observations.
 Only evidence_validate can run deterministic validators; never supply verdicts yourself.
+Discovery contains forms, input controls and API hints, independent of alerts.
+Discovered is not requested, and requested is not tested. Prioritize uncovered parameterized
+endpoints. A static JS literal is only a hint: never invent its values or method. For active
+tests choose a captured parameterized endpoint and allowed rules; a homepage alone may send
+zero test requests. A tested endpoint only means attributed requests, not a confirmed bug.
 Use sqlmap only for an existing SQLi candidate and within policy. Content discovery and data
 extraction have separate permissions; no credential brute-force tool is provided.
 Call tools when more evidence is needed. If finished, return {"done":true}.
@@ -28,6 +33,7 @@ def sync_graph(agent):
     snapshot = agent.evidence_store.summary()
     agent.inventory.analysis['scanner_evidence'] = snapshot['evidence']
     agent.inventory.analysis['scan_coverage'] = snapshot['coverage']
+    agent.inventory.analysis['web_discovery'] = snapshot['discovery']
     agent.inventory.analysis['validated_findings'] = snapshot['findings']
     graph = KnowledgeGraph.from_phase_state(agent.inventory, agent.test_history, auth_context.manager().list())
     agent.inventory.analysis['knowledge_graph'] = graph.to_dict()
@@ -168,6 +174,11 @@ def run(agent, user_text):
         schemas = [TOOL_INDEX[n].schema() for n in sorted(requested_tools) if n in agent.available]
         snapshot = agent.evidence_store.summary()
         context = {'coverage': snapshot['coverage'], 'evidence': snapshot['evidence'][:30],
+                   'discovery': [{'scan_id': d['scan_id'], 'summary': d.get('summary', {}),
+                       'endpoints': sorted(d.get('endpoints', []),
+                           key=lambda e: (not bool(e.get('parameters')), e.get('tested', False)))[:40],
+                       'forms': d.get('forms', [])[:10], 'inputs': d.get('inputs', [])[:10]}
+                       for d in snapshot['discovery'][-2:]],
                    'findings': snapshot['findings'][:20], 'plan': plan,
                    'recent_results': [public(t['calls'][0]) for t in agent.transcript[-3:]],
                    'policy': {k: cfg.get(k) for k in ('allow_active_scan', 'zap_allowed_rules',

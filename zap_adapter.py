@@ -13,7 +13,7 @@ import subprocess
 import sys
 import tempfile
 import time
-from urllib.parse import urlsplit
+from urllib.parse import urlsplit, parse_qsl
 
 from http_engine import EvidenceRedactor
 
@@ -157,9 +157,41 @@ def _openapi_file(config, target, workdir):
 def build_plan(config, target, workdir, *, active=False, rule_ids=(), auth_context='anonymous', ajax=False):
     target = canonical_url(target)
     context, user = _operator_context(config, target, auth_context)
+    if active:
+        # URL-only active jobs can select just the GET node and miss POST nodes.
+        # Scan the context instead, constrained to exactly this endpoint path.
+        context['includePaths'] = [re.escape(origin(target) + (urlsplit(target).path or '/')) + r'(?:\?.*)?$']
     minutes = max(1, int(config.get('zap_phase_minutes', 2)))
     common = {'context': 'aixsec', **({'user': user} if user else {})}
+    depth = max(1, int(config.get('zap_spider_depth', 10)))
     jobs = [{'type': 'passiveScan-config', 'parameters': {'scanOnlyInScope': True}}]
+    # Executor-owned capture only; the model cannot supply a filesystem path.
+    # Import requests/responses without replay, retaining POST bodies for the
+    # selected endpoint so active scans are not limited to a fresh GET crawl.
+    seed = config.get('_zap_seed_har') if active else None
+    if seed:
+        capture = json.loads(Path(seed).read_text())
+        target_path = urlsplit(target).path or '/'
+        target_params = {k for k, _ in parse_qsl(urlsplit(target).query, keep_blank_values=True)}
+        entries = []
+        for entry in capture.get('log', {}).get('entries', []):
+            request = entry.get('request') or {}
+            u = request.get('url', '')
+            if not within(u, target) or (urlsplit(u).path or '/') != target_path:
+                continue
+            if not target_params <= {k for k, _ in parse_qsl(urlsplit(u).query, keep_blank_values=True)}:
+                continue
+            entry = copy.deepcopy(entry)
+            entry['request']['headers'] = [h for h in request.get('headers', [])
+                if h.get('name', '').lower() != 'x-zap-scan-id']
+            entries.append(entry)
+        if entries:
+            seed_path = Path(workdir) / 'seed.har'
+            seed_path.write_text(json.dumps({'log': {'version': '1.2',
+                'creator': {'name': 'AIXSEC-X', 'version': '1'}, 'entries': entries}}))
+            seed_path.chmod(0o600)
+            jobs.append({'type': 'import', 'parameters': {'type': 'har',
+                         'fileName': str(seed_path)}})  # default: import only; older add-ons lack sendRequests
     spec = _openapi_file(config, target, workdir)
     if spec:
         # Older bundled OpenAPI add-ons reject maxMessages. Keep the plan
@@ -167,26 +199,42 @@ def build_plan(config, target, workdir, *, active=False, rule_ids=(), auth_conte
         jobs.append({'type': 'openapi', 'parameters': {**common, 'apiFile': spec,
                      'targetUrl': origin(target)}})
     jobs.append({'type': 'spider', 'parameters': {**common, 'url': target,
-        'maxDuration': minutes, 'maxDepth': 5, 'maxChildren': 20, 'logoutAvoidance': True}})
+        'maxDuration': minutes, 'maxDepth': depth,
+        'maxChildren': max(1, int(config.get('zap_spider_children', 50))), 'logoutAvoidance': True}})
     if ajax:
         jobs.append({'type': 'spiderAjax', 'parameters': {**common, 'url': target,
-            'maxDuration': minutes, 'maxCrawlDepth': 5, 'numberOfBrowsers': 1,
-            'inScopeOnly': True, 'browserId': 'firefox-headless'}})
+            'maxDuration': minutes, 'maxCrawlDepth': depth, 'numberOfBrowsers': 1,
+            'inScopeOnly': True, 'scopeCheck': 'Strict',
+            'browserId': config.get('zap_browser', 'firefox-headless'),
+            'clickDefaultElems': False,
+            'elements': [v.strip() for v in config.get('zap_ajax_elements', ['a', 'button', 'input']) if v.strip()],
+            'randomInputs': True, 'clickElemsOnce': True, 'logoutAvoidance': True,
+            'eventWait': 1500, 'reloadWait': 1500,
+            'maxCrawlStates': max(1, int(config.get('zap_ajax_states', 100)))}})
     jobs.append({'type': 'passiveScan-wait', 'parameters': {'maxDuration': minutes}})
     if active:
         allowed = {int(x) for x in config.get('zap_allowed_rules', [])}
         selected = {int(x) for x in rule_ids}
         if not selected or not selected <= allowed:
             raise ValueError('Active scan requires explicit rule_ids within WEBX_ZAP_ALLOWED_RULES')
+        observer = Path(workdir) / 'active-observer.js'
+        observer.write_text((Path(__file__).parent / 'examples/zap/active-observer.js').read_text().replace(
+            '__AIXSEC_OUTPUT__', json.dumps(str(Path(workdir) / 'active-requests.jsonl'))))
+        observer.chmod(0o600)
+        jobs.append({'type': 'script', 'parameters': {'action': 'add', 'type': 'httpsender',
+            'engine': 'ECMAScript : Graal.js', 'name': 'aixsec-active-observer', 'source': str(observer)}})
         jobs.append({'type': 'activeScan-policy', 'parameters': {'name': 'aixsec-targeted'},
             'policyDefinition': {'defaultStrength': 'Low', 'defaultThreshold': 'Off',
                 'rules': [{'id': i, 'strength': 'Low', 'threshold': 'Medium'} for i in sorted(selected)]}})
-        jobs.append({'type': 'activeScan', 'parameters': {**common, 'url': target,
+        jobs.append({'type': 'activeScan', 'parameters': {**common,
             'policy': 'aixsec-targeted', 'maxScanDurationInMins': minutes,
             'maxRuleDurationInMins': minutes, 'threadPerHost': 1,
+            'injectPluginIdInHeader': True,
             'delayInMs': int(config.get('zap_delay_ms', 200))}})
         jobs.append({'type': 'passiveScan-wait', 'parameters': {'maxDuration': minutes}})
     jobs.extend([
+        {'type': 'export', 'alwaysRun': True, 'parameters': {'context': 'aixsec',
+            'type': 'har', 'source': 'all', 'fileName': str(Path(workdir) / 'traffic.har')}},
         {'type': 'export', 'alwaysRun': True, 'parameters': {'context': 'aixsec',
             'type': 'url', 'source': 'all', 'fileName': str(Path(workdir) / 'urls.txt')}},
         {'type': 'report', 'alwaysRun': True, 'parameters': {
@@ -329,6 +377,62 @@ def run_scan(config, url, *, active=False, rule_ids=(), auth_context='anonymous'
             state = 'partial'
     for row in rows:
         row['auth_state'] = auth_state
+    from zap_discovery import Discovery
+    discovery = Discovery(url, auth_context, rule_ids if active else ())
+    har_path = directory / 'traffic.har'
+    inventory_error = ''
+    if har_path.exists():
+        har_path.chmod(0o600)
+        try:
+            discovery.har(har_path)
+        except (ValueError, TypeError, KeyError, OSError) as exc:
+            inventory_error = 'Cannot parse HAR: ' + str(exc)
+    else:
+        inventory_error = 'HAR unavailable; inventory based on alert samples and exported URLs only'
+    if report_path.exists() and not parse_error:
+        discovery.report(report_path)
+    active_path = directory / 'active-requests.jsonl'
+    if active and active_path.exists():
+        active_path.chmod(0o600)
+        try:
+            discovery.active_records(active_path)
+        except (ValueError, TypeError, KeyError, OSError) as exc:
+            inventory_error = 'Cannot parse active request evidence: ' + str(exc)
+    for endpoint in urls:
+        discovery.add(endpoint, 'UNKNOWN', [], 'url_export')
+    inventory = discovery.result()
+    inventory_path = directory / 'inventory.json'
+    inventory_path.write_text(json.dumps(inventory, ensure_ascii=False, indent=2))
+    inventory_path.chmod(0o600)
+    log_text = log_path.read_text(errors='replace')
+    phases = {job: ('completed' if f'Job {job} finished' in log_text else
+                    'started' if f'Job {job} started' in log_text else 'not_run')
+              for job in ('spider', 'spiderAjax', 'activeScan', 'passiveScan-wait')}
+    engine_log = home / 'zap.log'
+    engine_text = engine_log.read_text(errors='replace') if engine_log.exists() else ''
+    browser_failed = ajax and any(marker in engine_text for marker in (
+        'Failed to start browser', 'Unable to start browser', 'SessionNotCreatedException'))
+    if browser_failed:
+        phases['spiderAjax'] = 'failed'
+        if state == 'complete':
+            state = 'partial'
+    gaps = []
+    if not ajax:
+        gaps.append('AJAX Spider disabled; browser interactions not covered')
+    elif phases['spiderAjax'] != 'completed':
+        gaps.append('AJAX Spider did not complete; check browser/add-on and time budget')
+    if inventory_error:
+        gaps.append(inventory_error)
+        if state == 'complete':
+            state = 'partial'
+    if inventory['summary']['discovered_only']:
+        gaps.append('Some discovered endpoints have no captured request')
+    if not active:
+        gaps.append('Active testing not run')
+    elif not inventory['test_request_count']:
+        gaps.append('No captured request attributed to the selected active rules')
+        if state == 'complete':
+            state = 'partial'
     coverage = {'scan_id': scan_id, 'tool': 'zap_active_scan' if active else 'zap_baseline',
         'target': EvidenceRedactor().redact_url(canonical_url(url)), 'status': state,
         'auth_context': auth_context, 'auth_state': auth_state,
@@ -337,7 +441,18 @@ def run_scan(config, url, *, active=False, rule_ids=(), auth_context='anonymous'
         'openapi_requested': bool(config.get('zap_openapi_file')), 'returncode': code,
         'duration': round(time.monotonic() - started, 2), 'report_path': str(report_path),
         'log_path': str(log_path), 'error': parse_error, **metadata}
+    coverage.update(status_meaning='execution_only_not_full_coverage', phases=phases, gaps=gaps,
+                    inventory_path=str(inventory_path), har_path=str(har_path),
+                    active_requests_path=str(active_path),
+                    inventory_summary=inventory['summary'],
+                    captured_requests=inventory['request_count'], active_test_requests=inventory['test_request_count'])
+    summary = inventory['summary']
     return (f"ZAP {state}: {len(urls)} URLs, {len(rows)} alert instances; "
-            f"auth={auth_state}; report={report_path}",
+            f"{summary['forms']} forms, {summary['inputs']} inputs; "
+            f"endpoints discovered-only/requested/tested="
+            f"{summary['discovered_only']}/{summary['requested']}/{summary['tested']}; "
+            f"active requests={inventory['test_request_count']}; AJAX={phases['spiderAjax']}; "
+            f"auth={auth_state}; inventory={inventory_path}; report={report_path}",
             {'target': canonical_url(url), 'scan_id': scan_id, 'coverage': coverage,
-             'endpoints': [EvidenceRedactor().redact_url(u) for u in urls], 'alerts': rows})
+             'endpoints': [EvidenceRedactor().redact_url(u) for u in urls], 'alerts': rows,
+             'discovery': inventory})

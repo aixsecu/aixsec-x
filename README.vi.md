@@ -1,5 +1,13 @@
 > **4.2.0 — ZAP + Evidence pipeline:** baseline chạy trước AI; finding/risk lấy từ evidence và validator. Mặc định `WEBX_SCAN_BACKEND=auto` chọn ZAP nếu có, nếu không chỉ thu HTTP observation (coverage chưa đầy đủ). Wapiti gate cũ chỉ còn trong `legacy`. Xem [cấu hình, auth, policy và giới hạn](docs/ZAP_PIPELINE.md). Các ví dụ Wapiti-first bên dưới mô tả chế độ legacy.
 
+Với website có form hoặc AJAX, baseline hiện bật AJAX Spider mặc định
+(`WEBX_ZAP_AJAX=1`), dùng `firefox-headless`. Cần trình duyệt và add-on
+WebDriver/Selenium tương thích; đặt `WEBX_ZAP_BROWSER=chrome-headless` để dùng Chrome.
+`WEBX_ZAP_AJAX=0` tắt tương tác trình duyệt. Timeout ZAP mặc định là 600 giây.
+Báo cáo cuối có inventory `discovery` riêng cho form, ô nhập và API, phân biệt
+“phát hiện”, “đã gửi request” và “đã kiểm thử”. Xem
+[cấu hình form/AJAX và giới hạn coverage](docs/ZAP_PIPELINE.md#form-and-ajax-discovery).
+
 > **4.1.0 / Phase 4.1:** context retrieval xác định, prompt tách lớp, token
 > budget, timeout LLM theo giai đoạn và runtime metrics. Xem
 > [hướng dẫn Phase 4.1](docs/PHASE_4_1.md). Phase 4 gồm knowledge graph có thể lưu, goal-driven planner, bộ nhớ
