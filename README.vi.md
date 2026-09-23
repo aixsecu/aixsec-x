@@ -605,10 +605,10 @@ Model 7B/9B (vd: `huihui_ai/qwen3.5-abliterated:9b`) tuân theo **ít quy tắc*
   `min(tool_timeout, TOOL_TIMEOUTS[name])` — `WEBX_TOOL_TIMEOUT` toàn cục
   thấp (vd 90 s) co run_cmd của `wapiti_scan` xuống 90 s và scanner bị giết
   giữa chừng (live v1.5.0: "wapiti không chạy gì cả"). Giờ dùng `max(...)`:
-  hằng số riêng của tool đóng vai trò SÀN, timeout toàn cục thấp không giết
-  được quét dài; sàn wapiti_scan = 600 s, và `_wapiti_scan` truyền TRỌN
-  budget cho run_cmd (bỏ `min(budget, scan_time+60)`), wapiti tự kết thúc
-  trước khi bị giết.
+  Dispatcher hiện tính budget ngoài của Wapiti bằng
+  `max_scan_time + 90 giây` cho cleanup/ghi report, mặc định bị chặn ở 600
+  giây; có thể tăng rõ ràng bằng `WEBX_TOOL_TIMEOUT` cho target lớn. Nhờ vậy
+  scan yêu cầu 120–300 giây không còn âm thầm chiếm đủ 600 giây.
   Test suite v1.5.1: **179 OK** (4 mới: TestActiveCheckGate ×3 +
   test_wapiti_long_run_gets_cap_floor; test_plan_only_does_not_terminate
   viết lại theo cổng; TestWapitiScan.test_scan_time_budget_clamps cập nhật

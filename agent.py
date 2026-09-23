@@ -81,6 +81,15 @@ _LLM_FAIL_PREFIXES = ("[!] Ollama timeout", "[!] Ollama first-token timeout",
 def _llm_failure(content: str) -> bool:
     return (content or "").strip().startswith(_LLM_FAIL_PREFIXES)
 
+
+def _retryable_wapiti_error(result: dict) -> bool:
+    """True when Wapiti produced no report because its execution budget expired."""
+    if result.get("name") != "wapiti_scan" or result.get("outcome") != "error":
+        return False
+    text = str(result.get("output") or "").lower()
+    return any(marker in text for marker in
+               ("timed out", "timeout", "time limit", "không hoàn tất"))
+
 # v1.5.2: wapiti-first gate — web scope active mà wapiti_scan CHƯA chạy
 # (chưa có outcome=ok/error) thì final JSON bị từ chối và model bị ép gọi
 # wapiti_scan; nếu model bỏ qua tới hết budget, agent TỰ gọi wapiti_scan
@@ -308,17 +317,56 @@ class WebXAgent:
         return values
 
     def _recent_tool_context(self) -> str:
-        if not self.transcript:
+        """Bounded evidence from several recent tool calls.
+
+        Phase 4.1 previously exposed only the last round. A duplicate call in
+        that round could therefore hide every successful HTTP response and the
+        Wapiti result from final synthesis. Keep the latest six calls, while
+        prioritising Wapiti and successful calls, and include bounded structured
+        data so HTTP status codes do not have to be inferred from ``outcome``.
+        """
+        calls: list[tuple[bool, dict]] = []
+        for turn in reversed(self.transcript):
+            is_auto = bool(turn.get("auto"))
+            for call in reversed(turn.get("calls") or []):
+                calls.append((is_auto, call))
+        if not calls:
             return ""
+        selected: list[tuple[bool, dict]] = []
+        # Evidence-bearing calls first; duplicate/blocked calls remain useful
+        # only when room is left.
+        for wanted in (lambda c: c.get("name") == "wapiti_scan",
+                       lambda c: c.get("outcome") == "ok",
+                       lambda c: c.get("outcome") == "error",
+                       lambda c: True):
+            for pair in calls:
+                if pair in selected or not wanted(pair[1]):
+                    continue
+                selected.append(pair)
+                if len(selected) >= 6:
+                    break
+            if len(selected) >= 6:
+                break
         values = []
-        for call in self.transcript[-1].get("calls") or []:
+        for is_auto, call in selected:
             args = call.get("args") or {}
-            values.append({"name": call.get("name"), "outcome": call.get("outcome"),
-                "arguments": {key: args[key] for key in ("url", "target", "param", "method")
-                              if key in args},
-                "output": InjectionGuard.sanitize(str(call.get("output") or ""), 1600)})
-        prefix = "[WAPITI TỰ CHẠY]\n" if self.transcript[-1].get("auto") else ""
-        return prefix + json.dumps(values, ensure_ascii=False, sort_keys=True)
+            row = {"name": call.get("name"), "outcome": call.get("outcome"),
+                   "auto": is_auto,
+                   "arguments": {key: args[key] for key in
+                                 ("url", "target", "param", "method", "scope")
+                                 if key in args},
+                   "output": InjectionGuard.sanitize(
+                       str(call.get("output") or ""), 1400)}
+            data = call.get("data")
+            if isinstance(data, dict):
+                # Structured result is authoritative but still target-derived;
+                # serialize it inside the same untrusted-data boundary.
+                raw = json.dumps(data, ensure_ascii=False, sort_keys=True,
+                                 default=str)[:1800]
+                row["structured_data"] = InjectionGuard.sanitize(raw, 1800)
+            values.append(row)
+        prefix = "[WAPITI TỰ CHẠY]\n" if any(flag for flag, _ in selected) else ""
+        return prefix + json.dumps(values, ensure_ascii=False, sort_keys=True)[:9000]
 
     def _context_tool_schemas(self) -> list[dict]:
         if not self.config.get("context_optimization", True):
@@ -461,7 +509,15 @@ class WebXAgent:
             # max(tool_timeout, cap) — cap từng tool là MỨC TỐI THIỂU để wapiti
             # không bị giết ở tool_timeout mặc định 90s giữa chừng scan.
             cap = TOOL_TIMEOUTS.get(name, self.config["tool_timeout"])
-            if name in LONG_RUN_TOOLS:
+            if name == "wapiti_scan":
+                # max_scan_time bounds Wapiti's scan phase. Allow a small
+                # cleanup/report window instead of always granting the old
+                # fixed 600-second floor. Operators can explicitly raise
+                # WEBX_TOOL_TIMEOUT for unusually large targets.
+                requested = max(30, int(arguments.get("max_scan_time") or 300))
+                bounded = min(cap, requested + 90)
+                kw["_timeout"] = max(self.config["tool_timeout"], bounded)
+            elif name in LONG_RUN_TOOLS:
                 kw["_timeout"] = max(self.config["tool_timeout"], cap)
             else:
                 kw["_timeout"] = min(self.config["tool_timeout"], cap)
@@ -608,9 +664,12 @@ class WebXAgent:
             resp = self._chat_contextual(
                 msgs, user_text, tools=[t.schema() for t in self.tools],
                 on_token=disp.on_token, on_reasoning=disp.on_reasoning)
+            # Chốt đồng hồ model ngay khi Ollama trả về. Thời gian thực thi
+            # tool được in riêng bởi dispatcher và không được cộng vào nhãn
+            # "model finished".
+            disp.done()
             calls = resp.get("tool_calls") or []
             if not calls:
-                disp.done()
                 result["final_text"] = resp.get("content", "")
                 # v1.5.8 (Bug A): chuỗi lỗi LLM (timeout/không kết nối) KHÔNG
                 # phải văn bản kế hoạch — trước đây bị đếm plan_only → forced
@@ -631,13 +690,7 @@ class WebXAgent:
                     continue
                 self._llm_fail = 0  # phản hồi thật → reset bộ đếm lỗi LLM
                 if self._looks_like_json(result["final_text"]):
-                    self._commit_findings(result)
-                    try:
-                        d = json.loads(self._strip_fence(result["final_text"]))
-                        result["risk_level"] = d.get("risk_level", "UNKNOWN")
-                        result["overall_summary"] = d.get("overall_summary", "")
-                    except json.JSONDecodeError:
-                        pass
+                    self._apply_final_contract(result)
                     # v1.5.2: wapiti-first gate (Bug 3 — user: "wapiti vẫn chưa
                     # được chạy") — web scope active nhưng wapiti_scan CHƯA
                     # chạy (ok/error) → JSON bị từ chối dù các active check khác
@@ -753,7 +806,6 @@ class WebXAgent:
                 # (kể cả error/blocked; duplicate đã ghi ở lần dispatch đầu).
                 if r.get("outcome") != "duplicate":
                     self._record_test(name, args, r)
-            disp.done()
             self.transcript.append({"round": rnd, "type": "tools", "calls": results})
             # v1.6.0 (#1/#12/#13): gom tool output OK của round vào attack surface
             self.inventory.ingest(results)
@@ -765,7 +817,9 @@ class WebXAgent:
             # outcome khác (duplicate/blocked/denied/scope_rejected) KHÔNG tính.
             for r in results:
                 if (r.get("name") == "wapiti_scan"
-                        and r.get("outcome") in ("ok", "error")):
+                        and (r.get("outcome") == "ok"
+                             or (r.get("outcome") == "error"
+                                 and not _retryable_wapiti_error(r)))):
                     self._wapiti_done = True
 
             if all(r.get("outcome") in ("duplicate", "blocked") for r in results):
@@ -895,13 +949,7 @@ class WebXAgent:
             self._commit_findings(result)
             return result
         self._llm_fail = 0
-        self._commit_findings(result)
-        try:
-            d = json.loads(result["final_text"]) if result["final_text"].strip().startswith("{") else {}
-            result["risk_level"] = d.get("risk_level", "UNKNOWN")
-            result["overall_summary"] = d.get("overall_summary", "")
-        except json.JSONDecodeError:
-            pass
+        self._apply_final_contract(result)
         return result
 
     @staticmethod
@@ -1168,7 +1216,8 @@ class WebXAgent:
         key = "wapiti_scan|" + json.dumps(args, sort_keys=True,
                                           default=str, ensure_ascii=False)
         self._call_cache[key] = r
-        if r.get("outcome") in ("ok", "error"):
+        if (r.get("outcome") == "ok"
+                or (r.get("outcome") == "error" and not _retryable_wapiti_error(r))):
             self._wapiti_done = True
         tag = f"{GREEN}[✔]{RESET}" if r.get("outcome") == "ok" \
             else f"{RED}[✗]{RESET}"
@@ -1211,6 +1260,49 @@ class WebXAgent:
             result["evidence_flagged"] = flagged
         for f in findings:
             self.ledger.add(f)
+
+    def _apply_final_contract(self, result: dict) -> None:
+        """Validate final JSON before accepting its risk or ledger entries.
+
+        Legacy findings that contain ``name`` remain accepted for backward
+        compatibility. Malformed items are removed. A model cannot assign a
+        non-UNKNOWN risk when no valid finding survives validation.
+        """
+        raw = self._strip_fence(str(result.get("final_text") or ""))
+        try:
+            data = json.loads(raw)
+        except (json.JSONDecodeError, TypeError):
+            return
+        if not isinstance(data, dict):
+            return
+        items = data.get("findings")
+        if not isinstance(items, list):
+            items = []
+        valid_items = [item for item in items
+                       if isinstance(item, dict) and str(item.get("name") or "").strip()]
+        invalid_count = len(items) - len(valid_items)
+        risk = str(data.get("risk_level") or "UNKNOWN").upper()
+        if risk not in {"CRITICAL", "HIGH", "MEDIUM", "LOW", "UNKNOWN"}:
+            risk = "UNKNOWN"
+        summary = str(data.get("overall_summary") or "")
+        if not valid_items:
+            risk = "UNKNOWN"
+            if invalid_count:
+                note = (f"Đã loại {invalid_count} finding không đúng schema "
+                        "(thiếu trường name); không còn finding hợp lệ nên risk UNKNOWN.")
+                summary = (summary.rstrip() + " " + note).strip()
+        data["findings"] = valid_items
+        data["risk_level"] = risk
+        data["overall_summary"] = summary
+        # Always emit the validated object so terminal output, ledger and API
+        # consumers observe the same result.
+        result["final_text"] = json.dumps(data, ensure_ascii=False, indent=2)
+        result["risk_level"] = risk
+        result["overall_summary"] = summary
+        result["findings"] = valid_items
+        if invalid_count:
+            result["invalid_findings"] = invalid_count
+        self._commit_findings(result)
 
     # ─────────────────────────────────────────
     # SESSION MGMT

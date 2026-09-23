@@ -486,7 +486,7 @@ class TestWapitiGate(unittest.TestCase):
         # gate chặn đúng 1 lần; sau khi wapiti ok JSON được chấp nhận
         self.assertEqual(a._no_wapiti_json, 1)
         self.assertTrue(a._wapiti_done)
-        self.assertEqual(caught["t"], TOOL_TIMEOUTS["wapiti_scan"])  # sàn 600s
+        self.assertEqual(caught["t"], 210)  # scan 120s + cleanup/report 90s
         self.assertEqual(len(a.chat.calls), 4)
         self.assertFalse(a.chat.calls[3]["json_mode"])   # không forced
         gate = [m for m in a.chat.calls[1]["messages"] if m.get("role") == "user"]
@@ -968,9 +968,8 @@ class TestToolTimeoutCap(unittest.TestCase):
         self.assertEqual(r["outcome"], "ok")
         self.assertEqual(caught["t"], 300)  # không nằm trong cap → giữ nguyên
 
-    def test_wapiti_long_run_gets_cap_floor(self):
-        # v1.5.1 (Bug 2): LONG_RUN_TOOLS dùng SÀN max(tool_timeout, cap) —
-        # wapiti_scan tool_timeout=90s vẫn được 600s, không bị giết giữa scan
+    def test_wapiti_budget_follows_requested_scan_time(self):
+        # Wapiti nhận max_scan_time + 90s cleanup thay vì sàn cố định 600s.
         from tools import TOOL_INDEX, TOOL_TIMEOUTS
         caught = {}
 
@@ -984,9 +983,22 @@ class TestToolTimeoutCap(unittest.TestCase):
                           chat=FakeChat(script=[]))
             r = a._dispatch("wapiti_scan", {"url": "https://example.com/"})
         self.assertEqual(r["outcome"], "ok")
-        # cấu hình 90s nhưng sàn wapiti 600s phải thắng (không còn min())
-        self.assertEqual(caught["t"], TOOL_TIMEOUTS["wapiti_scan"])
-        self.assertGreater(TOOL_TIMEOUTS["wapiti_scan"], 90)
+        self.assertEqual(caught["t"], 390)  # default scan 300 + cleanup 90
+        self.assertLess(caught["t"], TOOL_TIMEOUTS["wapiti_scan"])
+
+    def test_wapiti_short_scan_gets_bounded_cleanup_window(self):
+        from tools import TOOL_INDEX
+        caught = {}
+
+        def fake_wapiti(**kw):
+            caught["t"] = kw.get("_timeout")
+            return "scan done"
+
+        with patch.object(TOOL_INDEX["wapiti_scan"], "exec_fn", fake_wapiti):
+            a = WebXAgent(config=cfg({"tool_timeout": 90}), chat=FakeChat())
+            a._dispatch("wapiti_scan", {"url": "https://example.com/",
+                                         "max_scan_time": 120})
+        self.assertEqual(caught["t"], 210)
 
 
 class TestScopePrompt(unittest.TestCase):
@@ -3055,7 +3067,7 @@ class TestWapitiScan(unittest.TestCase):
         self.assertEqual(r["outcome"], "ok")
         self.assertEqual(c["argv"][c["argv"].index("--max-scan-time") + 1], "300")
         self.assertEqual(c["argv"][c["argv"].index("--max-attack-time") + 1], "150")
-        self.assertEqual(c["timeout"], 600)
+        self.assertEqual(c["timeout"], 390)
         # max_scan_time=5000 bị clamp theo budget 600 → 580, run_cmd 600
         r2, c2, sm2, _ = self._dispatch({"url": "https://example.com/",
                                          "max_scan_time": 5000})
@@ -4556,6 +4568,38 @@ class TestLlmDownSynthesis(unittest.TestCase):
         self.assertEqual(res["findings"][0]["url"],
                          "https://example.com/items?id=1")
         self.assertEqual(len(a.ledger.all()), 1)
+
+    def test_malformed_model_finding_cannot_raise_risk_or_enter_ledger(self):
+        a = self._agent(extra={"targets": []})
+        malformed = {"findings": [{"id": "recon-1", "vuln_class": "recon",
+                                    "description": "reachable endpoint"}],
+                     "risk_level": "MEDIUM", "overall_summary": "reachable"}
+        result = {"final_text": json.dumps(malformed), "risk_level": "UNKNOWN",
+                  "overall_summary": ""}
+        a._apply_final_contract(result)
+        self.assertEqual(result["risk_level"], "UNKNOWN")
+        self.assertEqual(result["findings"], [])
+        self.assertEqual(result["invalid_findings"], 1)
+        self.assertEqual(a.ledger.all(), [])
+        self.assertIn("không đúng schema", result["overall_summary"])
+
+    def test_context_keeps_older_success_when_latest_call_is_duplicate(self):
+        a = self._agent(extra={"targets": []})
+        a.transcript = [
+            {"round": 1, "type": "tools", "calls": [{
+                "name": "http_request", "outcome": "ok",
+                "args": {"url": "https://example.com/", "method": "get"},
+                "output": "GET https://example.com/ → 404",
+                "data": {"status": 404, "url": "https://example.com/"}}]},
+            {"round": 2, "type": "tools", "calls": [{
+                "name": "http_request", "outcome": "duplicate",
+                "args": {"url": "https://example.com/", "method": "get"},
+                "output": "duplicate"}]},
+        ]
+        context = a._recent_tool_context()
+        self.assertIn('\\"status\\": 404', context)
+        self.assertIn('"outcome": "ok"', context)
+        self.assertIn('"outcome": "duplicate"', context)
 
     def test_final_chat_error_falls_back_to_synthesis(self):
         # final round (json_mode) vẫn lỗi → fallback tổng hợp từ tool output
