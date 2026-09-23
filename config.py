@@ -29,7 +29,9 @@ def load_config() -> dict:
         #   (mặc định 300s — model 9B trên CPU có thể mất 1-3 phút/lượt)
         "llm_timeout": int(os.environ.get("WEBX_LLM_TIMEOUT", "300")),
         # Phase 4.1 separates an unresponsive model from a slow completion.
-        "llm_first_token_timeout": int(os.environ.get("WEBX_LLM_FIRST_TOKEN_TIMEOUT", "30")),
+        # Thinking models can spend well over 30 seconds before emitting their
+        # first streamed chunk, especially on CPU or during a cold model load.
+        "llm_first_token_timeout": int(os.environ.get("WEBX_LLM_FIRST_TOKEN_TIMEOUT", "90")),
         "llm_completion_timeout": int(os.environ.get("WEBX_LLM_COMPLETION_TIMEOUT", "180")),
         "llm_overall_timeout": int(os.environ.get("WEBX_LLM_OVERALL_TIMEOUT", "210")),
         "output_cap": int(os.environ.get("WEBX_OUTPUT_CAP", "5000")),

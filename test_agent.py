@@ -1359,15 +1359,15 @@ class TestOllamaRemote(unittest.TestCase):
             [json.dumps(x, ensure_ascii=False) for x in lines])
         return r
 
-    def test_ollama_chat_stream_reasoning_tokens_tool_calls(self):
-        """Stream bật: gom NDJSON → content gộp + on_reasoning/on_token + parse tool_calls."""
+    def test_ollama_chat_stream_thinking_tokens_tool_calls(self):
+        """Ollama message.thinking được stream qua callback cùng content/tool calls."""
         from llm import ollama_chat
         cfg_s = {"ollama_url": "http://x", "model": "m", "stream": True,
                  "think": True, "temperature": 0.1, "num_ctx": 4096,
                  "tool_timeout": 30}
         lines = [
             {"message": {"role": "assistant",
-                          "reasoning": "Phân tích endpoint /login..."}},
+                          "thinking": "Phân tích endpoint /login..."}},
             {"message": {"role": "assistant", "content": "He"}},
             {"message": {"role": "assistant", "content": "llo"}},
             {"message": {"role": "assistant", "tool_calls": [
@@ -4475,10 +4475,8 @@ class TestLedgerHttpRequestEvidence(unittest.TestCase):
 
 
 class TestLlmDownSynthesis(unittest.TestCase):
-    """v1.5.8 (Bug A + Bug B): chuỗi lỗi LLM (Ollama timeout) KHÔNG còn bị
-    đếm là plan-only; 2 lỗi liên tiếp → model down → BỎ final chat (tiết kiệm
-    300s chắc chắn timeout) và tổng hợp findings từ tool output THẬT của phiên
-    (wapiti_scan đã chạy ok). Final chat lỗi → fallback tổng hợp tương tự."""
+    """Timeout không bị tính là plan-only; khi Wapiti bổ sung bằng chứng mới,
+    agent thử một final chat rồi mới fallback sang ToolResult có cấu trúc."""
 
     def setUp(self):
         from tools import TOOL_INDEX
@@ -4511,9 +4509,9 @@ class TestLlmDownSynthesis(unittest.TestCase):
                      if m.get("role") == "user"]
         self.assertTrue(any("Lỗi kết nối model" in u for u in user_msgs))
 
-    def test_two_llm_errors_skip_final_chat_and_synthesize(self):
-        # Bug B: 2 lỗi LLM liên tiếp → llm_down → BỎ final chat (không đốt 300s),
-        # auto wapiti vẫn chạy ở tail, findings tổng hợp từ output THẬT.
+    def test_two_llm_errors_retry_final_after_auto_wapiti(self):
+        # Hai lỗi planning liên tiếp nhưng auto-wapiti vừa tạo bằng chứng mới:
+        # thử đúng một final chat để model tổng hợp dữ liệu scan.
         from tools import TOOL_INDEX
         err = {"content": "[!] Ollama timeout — model may still be loading or too large.",
                "tool_calls": []}
@@ -4522,23 +4520,42 @@ class TestLlmDownSynthesis(unittest.TestCase):
             return WAPITI_OUT
 
         with patch.object(TOOL_INDEX["wapiti_scan"], "exec_fn", fake_wapiti):
-            a = self._agent(script=[err, err])
+            a = self._agent(script=[err, err,
+                                    {"content": FINAL_JSON, "tool_calls": []}])
             res = a.run("test")
-        self.assertTrue(res["llm_down"])
-        self.assertEqual(len(a.chat.calls), 2)      # KHÔNG có final chat
-        self.assertFalse(any(c["json_mode"] for c in a.chat.calls))
-        self.assertEqual(a._llm_fail, 2)
+        self.assertNotIn("llm_down", res)
+        self.assertEqual(len(a.chat.calls), 3)
+        self.assertTrue(a.chat.calls[2]["json_mode"])
+        self.assertEqual(a._llm_fail, 0)
         self.assertTrue(a._wapiti_done)             # auto wapiti chạy ok
         self.assertEqual(res["calls"], 1)          # chỉ auto wapiti
-        self.assertEqual(res["risk_level"], "high")  # top severity từ wapiti
-        self.assertEqual(len(res["findings"]), 2)
+        self.assertEqual(res["risk_level"], "HIGH")
         self.assertEqual(len(a.ledger.all()), 2)
-        names = {f["name"] for f in res["findings"]}
-        self.assertEqual(names, {"SQL Injection", "XSS"})
-        urls = {f["url"] for f in res["findings"]}
-        self.assertEqual(urls, {"https://example.com/product.php",
-                                "https://example.com/search.php"})
-        self.assertIn("Ollama timeout", res["llm_note"])
+
+    def test_three_llm_errors_synthesize_structured_wapiti_data(self):
+        # Nếu recovery final vẫn timeout, fallback đọc ToolResult.data thay vì
+        # phụ thuộc format text hiển thị của Wapiti.
+        from tools import TOOL_INDEX
+        err = {"content": "[!] Ollama first-token timeout.", "tool_calls": []}
+        data = {"target": "https://example.com", "scope": "domain",
+                "findings": [{"category": "SQL Injection", "level": "3",
+                              "method": "GET", "path": "/items?id=1",
+                              "parameter": "id", "module": "sql"}]}
+
+        def fake_wapiti(**kw):
+            return ("localized output without detail rows", data)
+
+        with patch.object(TOOL_INDEX["wapiti_scan"], "exec_fn", fake_wapiti):
+            a = self._agent(script=[err, err, err])
+            res = a.run("test")
+        self.assertEqual(len(a.chat.calls), 3)
+        self.assertTrue(res["llm_down"])
+        self.assertEqual(res["risk_level"], "high")
+        self.assertEqual(len(res["findings"]), 1)
+        self.assertEqual(res["findings"][0]["name"], "SQL Injection")
+        self.assertEqual(res["findings"][0]["url"],
+                         "https://example.com/items?id=1")
+        self.assertEqual(len(a.ledger.all()), 1)
 
     def test_final_chat_error_falls_back_to_synthesis(self):
         # final round (json_mode) vẫn lỗi → fallback tổng hợp từ tool output

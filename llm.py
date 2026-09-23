@@ -119,7 +119,7 @@ def ollama_chat(messages: list, tools: list | None = None, config: dict | None =
         payload["format"] = "json"
     started = time.monotonic()
     legacy = int(cfg.get("llm_timeout") or (int(cfg["tool_timeout"]) * 4 + 30))
-    first_timeout = max(1, int(cfg.get("llm_first_token_timeout") or min(30, legacy)))
+    first_timeout = max(1, int(cfg.get("llm_first_token_timeout") or min(90, legacy)))
     completion_timeout = max(1, int(cfg.get("llm_completion_timeout") or legacy))
     overall_timeout = max(first_timeout, int(cfg.get("llm_overall_timeout") or legacy))
     try:
@@ -133,8 +133,10 @@ def ollama_chat(messages: list, tools: list | None = None, config: dict | None =
         return _conn_error(cfg)
     except requests.exceptions.Timeout:
         return {"content": "[!] Ollama first-token timeout — model did not start responding.",
-                "tool_calls": [], "metrics": {"llm_latency_ms": round(
-                    (time.monotonic() - started) * 1000, 3)}}
+                "tool_calls": [], "metrics": {"timeout_phase": "first_token",
+                    "llm_latency_ms": round((time.monotonic() - started) * 1000, 3),
+                    "first_token_latency_ms": round(
+                        (time.monotonic() - started) * 1000, 3)}}
     except Exception as e:
         return {"content": f"[!] Ollama error: {e}", "tool_calls": []}
 
@@ -164,7 +166,10 @@ def ollama_chat(messages: list, tools: list | None = None, config: dict | None =
             except (json.JSONDecodeError, TypeError):
                 continue
             msg = obj.get("message") or {}
-            if first_token_at is None and (msg.get("content") or msg.get("reasoning")
+            # Ollama exposes thinking tokens as message.thinking.  Keep the
+            # older message.reasoning alias for compatible proxies/adapters.
+            thinking = msg.get("thinking") or msg.get("reasoning")
+            if first_token_at is None and (msg.get("content") or thinking
                                            or msg.get("tool_calls") or obj.get("done")):
                 first_token_at = now
                 _set_stream_timeout(r, min(completion_timeout, overall_timeout))
@@ -178,10 +183,9 @@ def ollama_chat(messages: list, tools: list | None = None, config: dict | None =
                 parts.append(tok)
                 if on_token is not None:
                     on_token(tok)
-            rsn = msg.get("reasoning")
-            if rsn:
+            if thinking:
                 if on_reasoning is not None:
-                    on_reasoning(rsn)
+                    on_reasoning(thinking)
             for tc in msg.get("tool_calls") or []:
                 raw_calls.append(tc)
             if obj.get("done"):
@@ -191,8 +195,8 @@ def ollama_chat(messages: list, tools: list | None = None, config: dict | None =
     except requests.exceptions.Timeout:
         label = "first-token" if first_token_at is None else "completion"
         return {"content": f"[!] Ollama {label} timeout.", "tool_calls": [],
-                "metrics": {"llm_latency_ms": round(
-                    (time.monotonic() - started) * 1000, 3)}}
+                "metrics": {"timeout_phase": label.replace("-", "_"),
+                    "llm_latency_ms": round((time.monotonic() - started) * 1000, 3)}}
     except Exception as e:
         return {"content": f"[!] Ollama error: {e}", "tool_calls": []}
     finished = time.monotonic()

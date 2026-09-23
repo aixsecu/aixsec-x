@@ -191,7 +191,7 @@ python3 agent.py --non-interactive                # run automatically
 | `WEBX_CONTEXT_MAX_OBSERVATIONS` | `12` | Maximum direct observations in planner context |
 | `WEBX_CONTEXT_MAX_HISTORY` | `12` | Maximum recent history items before deterministic summarization |
 | `WEBX_CONTEXT_MAX_TOOLS` | `14` | Maximum action-relevant tool schemas sent per request |
-| `WEBX_LLM_FIRST_TOKEN_TIMEOUT` | `30` | Abort when Ollama does not start responding within this many seconds |
+| `WEBX_LLM_FIRST_TOKEN_TIMEOUT` | `90` | Abort when Ollama does not start responding within this many seconds; allows thinking models and cold CPU loads to begin streaming |
 | `WEBX_LLM_COMPLETION_TIMEOUT` | `180` | Completion phase timeout in seconds |
 | `WEBX_LLM_OVERALL_TIMEOUT` | `210` | Overall LLM request deadline in seconds |
 | `WEBX_INVENTORY_FILE` | *(empty)* | **v1.6.0** path to save the Attack Surface Inventory JSON (`host→port→service→URL→endpoint→method→param→auth→tech`, accumulated from real tool output) after every round and on exit. Empty = do not save |
