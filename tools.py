@@ -99,14 +99,13 @@ TOOL_TIMEOUTS: dict[str, int] = {
     "subdomain_enum": 90,    # subfinder brute từ từ
     "nikto_scan": 180,       # nikto vốn chậm — cap đủ cho scan trung bình
     "sqlmap_runner": 300,   # v1.4.7: sqlmap bounded — đủ cho 1 lần chạy technique set
-    "wapiti_scan": 600,      # v1.5.0: scan cả website (crawler+attack) — operator tăng WEBX_TOOL_TIMEOUT nếu cần
+    "wapiti_scan": 600,      # hard cap mặc định; dispatcher cấp max_scan_time + 90s cleanup
     "crawler": 120,          # v1.9.1: BFS crawl GET-only (hint có method thật; UNKNOWN không ép GET; time_budget tự dừng)
 }
 
-# v1.5.1: tool QUÉT DÀI — _dispatch dùng SÀN max(tool_timeout, cap) thay vì trần
-# min(). Lý do (Bug 2): min() chặn wapiti_scan ở tool_timeout mặc định 90s →
-# wapiti bị giết giữa chừng (chưa kịp ghi report JSON), vòng chạy mà như không
-# chạy. Cap 600s là mức TỐI THIỂU; operator muốn lâu hơn thì tăng WEBX_TOOL_TIMEOUT.
+# Tool quét dài được dispatcher cấp budget riêng. Wapiti dùng
+# max_scan_time + 90 giây cho cleanup/report, tối đa 600 giây mặc định; operator
+# có thể chủ động tăng WEBX_TOOL_TIMEOUT cho mục tiêu lớn.
 LONG_RUN_TOOLS: frozenset = frozenset({"wapiti_scan"})
 
 
@@ -1255,9 +1254,8 @@ def _wapiti_scan(**kw):
     # v1.5.1 (Bug 2): truyền NGUYÊN budget thay vì min(budget, scan_time+60) —
     # trước đây run_cmd giết wapiti khi scan_time+60 trôi qua dù budget còn dư,
     # wapiti chưa kịp ghi report JSON nên outcome=error 'thiếu report' mọi lần.
-    # Budget giờ = max(tool_timeout, 600) nhờ LONG_RUN_TOOLS trong _dispatch, còn
-    # wapiti tự kết thúc khi hết --max-scan-time (nhỏ hơn budget) nên run_cmd chỉ
-    # là lưới an toàn cuối, không cắt ngang scan giữa chừng.
+    # Dispatcher cấp max_scan_time + cleanup grace (bounded); run_cmd là lưới
+    # an toàn nếu Wapiti không tự thoát sau thời hạn scan/report.
     out = run_cmd(args, budget, max_chars=6000)
     # 1) lỗi thực thi (timeout / thiếu binary /...) — KHÔNG kết luận gì từ lần chạy này
     if out.startswith("[!]"):

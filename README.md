@@ -653,10 +653,10 @@ better than long prompts. `prompts.py` ships 2 variants with auto-selection:
   `min(tool_timeout, TOOL_TIMEOUTS[name])` — a low global `WEBX_TOOL_TIMEOUT`
   (e.g. 90 s) shrank `wapiti_scan`'s run_cmd timeout to 90 s and the scanner
   was killed mid-run (live v1.5.0: "wapiti không chạy gì cả"). Now
-  `max(...)`: the tool's own constant acts as a FLOOR, so low global
-  timeouts can't kill long runners; wapiti_scan floor = 600 s, and
-  `_wapiti_scan` passes the FULL budget to run_cmd (drops
-  `min(budget, scan_time+60)`), so wapiti finishes before the killer.
+  The current dispatcher derives Wapiti's outer budget from
+  `max_scan_time + 90 s` for cleanup/reporting, capped at 600 s by default;
+  an explicitly larger `WEBX_TOOL_TIMEOUT` can extend it for large targets.
+  This prevents a 120–300 s scan request from silently consuming 600 s.
   Test suite v1.5.1: **179 OK** (4 new: TestActiveCheckGate ×3 +
   test_wapiti_long_run_gets_cap_floor; test_plan_only_does_not_terminate
   rewritten for the gate; TestWapitiScan.test_scan_time_budget_clamps

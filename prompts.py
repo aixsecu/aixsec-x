@@ -212,8 +212,15 @@ remain hypotheses until supported by real evidence. Never invent responses,
 versions, CVEs, endpoints or successful execution. Do not repeat a completed or
 failed identical strategy. Select the next action from the supplied planner
 context. When sufficient evidence exists, return exactly one final JSON object:
-{"findings":[],"risk_level":"CRITICAL|HIGH|MEDIUM|LOW|UNKNOWN","overall_summary":"..."}
-Do not include prose outside final JSON."""
+{"findings":[{"name":"...","severity":"critical|high|medium|low|info",
+"url":"https://...","port":"","service":"","description":"...",
+"fix":"...","cves":[],"source":"tool_name","parameter":""}],
+"risk_level":"CRITICAL|HIGH|MEDIUM|LOW|UNKNOWN","overall_summary":"..."}
+Every findings[] item MUST contain name, severity, url, description and source.
+Execution outcome=ok means the tool completed; it does NOT imply HTTP 2xx. Use
+the explicit structured status or response text. Reconnaissance or a reachable
+endpoint is not a vulnerability. If there is no supported vulnerability, return
+findings=[] and risk_level=UNKNOWN. Do not include prose outside final JSON."""
 
 
 def build_orchestration_prompt(cfg: dict | None = None) -> str:
