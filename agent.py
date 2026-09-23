@@ -210,13 +210,17 @@ class _LiveDisplay:
             if len(self._buf) >= self._wrap:
                 self._flush()
 
-    def done(self):
+    def done(self, response=None):
         if self._done:
             return  # idempotent — không in "finished" lần thứ 2
         self._done = True
         self._flush()
         dt = time.time() - self.t0
-        print(f"{DIM}  └ model finished in {dt:.1f}s{RESET}", flush=True)
+        failed = response is not None and _llm_failure(response.get("content", ""))
+        state = "failed" if failed else "finished"
+        print(f"{DIM}  └ model {state} in {dt:.1f}s{RESET}", flush=True)
+        if failed:
+            print(response.get("content", ""), flush=True)
 
 
 class WebXAgent:
@@ -455,7 +459,7 @@ class WebXAgent:
         return self.context_metrics.to_dict()
 
     def _chat_contextual(self, messages: list[dict], goal: str, **kwargs) -> dict:
-        schemas = self._context_tool_schemas()
+        schemas = [] if kwargs.get("json_mode") else self._context_tool_schemas()
         kwargs["tools"] = schemas
         prepared = self._prepare_llm_messages(messages, goal, schemas)
         started = time.perf_counter()
@@ -667,7 +671,7 @@ class WebXAgent:
             # Chốt đồng hồ model ngay khi Ollama trả về. Thời gian thực thi
             # tool được in riêng bởi dispatcher và không được cộng vào nhãn
             # "model finished".
-            disp.done()
+            disp.done(resp)
             calls = resp.get("tool_calls") or []
             if not calls:
                 result["final_text"] = resp.get("content", "")
@@ -928,7 +932,7 @@ class WebXAgent:
         # Không có dữ liệu mới thì giữ fail-fast và tổng hợp tại chỗ.
         if llm_down and not dispatched:
             result["llm_down"] = True
-            result["llm_note"] = ("[!] Model không phản hồi (Ollama timeout) — "
+            result["llm_note"] = ("[!] Model không phản hồi (lỗi Ollama) — "
                                   "kết quả được tổng hợp từ tool output thật "
                                   "của phiên (không có phân tích của model).")
             self._synthesize_findings_json(result)
@@ -938,7 +942,7 @@ class WebXAgent:
         resp = self._chat_contextual(
             msgs, user_text, tools=[t.schema() for t in self.tools], json_mode=True,
             on_token=disp.on_token, on_reasoning=disp.on_reasoning)
-        disp.done()
+        disp.done(resp)
         result["final_text"] = resp.get("content", "")
         if _llm_failure(result["final_text"]):
             result["llm_down"] = True
@@ -1071,11 +1075,11 @@ class WebXAgent:
         if findings:
             result["overall_summary"] = (
                 f"Tổng hợp tự động từ tool output thật (wapiti_scan) — model "
-                f"không phản hồi (Ollama timeout) nên không có phân tích của "
+                f"không phản hồi (lỗi Ollama) nên không có phân tích của "
                 f"model. {len(findings)} finding từ wapiti.")
         else:
             result["overall_summary"] = (
-                "Model không phản hồi (Ollama timeout) và không có finding nào "
+                "Model không phản hồi (lỗi Ollama) và không có finding nào "
                 "tổng hợp được từ tool output — risk UNKNOWN là kết quả trung thực.")
         result["findings"] = findings
         result["final_text"] = json.dumps({
@@ -1223,6 +1227,11 @@ class WebXAgent:
             else f"{RED}[✗]{RESET}"
         print(f"{tag} wapiti_scan → outcome={r.get('outcome', '?')} ({dt:.1f}s)",
               flush=True)
+        scan_data = r.get("data") or {}
+        if isinstance(scan_data, dict) and isinstance(scan_data.get("findings"), list):
+            print(f"[i] Wapiti: {len(scan_data['findings'])} findings; "
+                  f"crawled={scan_data.get('crawled', '?')}; "
+                  f"report={scan_data.get('report_path', '?')}", flush=True)
         self.transcript.append({"round": 0, "type": "tools", "calls": [r],
                                 "auto": True})
         self.inventory.ingest([r])   # v1.6.0: wapiti auto cũng vào attack surface
@@ -1264,9 +1273,9 @@ class WebXAgent:
     def _apply_final_contract(self, result: dict) -> None:
         """Validate final JSON before accepting its risk or ledger entries.
 
-        Legacy findings that contain ``name`` remain accepted for backward
-        compatibility. Malformed items are removed. A model cannot assign a
-        non-UNKNOWN risk when no valid finding survives validation.
+        Require structured Wapiti support for scanner-attributed findings.
+        Scan summaries are observations, never vulnerability findings. Other
+        adapters retain their existing evidence validation.
         """
         raw = self._strip_fence(str(result.get("final_text") or ""))
         try:
@@ -1281,6 +1290,54 @@ class WebXAgent:
         valid_items = [item for item in items
                        if isinstance(item, dict) and str(item.get("name") or "").strip()]
         invalid_count = len(items) - len(valid_items)
+        # Scanner observations are not vulnerabilities. For structured Wapiti
+        # evidence require a matching category, URL and parameter, and use the
+        # scanner's severity rather than allowing the model to inflate it.
+        rejected = []
+        accepted = []
+        wapiti_runs = [r for r in self._history()
+                       if r.get("name") == "wapiti_scan" and r.get("outcome") == "ok"
+                       and isinstance(r.get("data"), dict)
+                       and isinstance(r["data"].get("findings"), list)]
+        only_wapiti = bool(wapiti_runs) and not any(
+            r.get("outcome") == "ok" and r.get("name") != "wapiti_scan"
+            for r in self._history())
+        levels = {"0": "info", "1": "low", "2": "medium", "3": "high",
+                  "4": "critical"}
+        for item in valid_items:
+            name = str(item.get("name") or "").lower()
+            source = " ".join(str(item.get(k) or "") for k in
+                              ("source", "source_tool", "description")).lower()
+            scan_observation = bool(re.search(
+                r"^(?:wapiti[ \-_]*)?(?:domain |web |website )?scan(?: summary| report| results?| completed)?$",
+                name.strip()))
+            matches = []
+            if only_wapiti or "wapiti" in source or "wapiti" in name:
+                for run in wapiti_runs:
+                    base = str(run["data"].get("target") or run.get("args", {}).get("url") or "")
+                    for finding in run["data"]["findings"]:
+                        if not isinstance(finding, dict):
+                            continue
+                        category = str(finding.get("category") or "").strip().lower()
+                        url = urljoin(base.rstrip("/") + "/", str(finding.get("path") or ""))
+                        if (category and category in name
+                                and str(item.get("url") or "").rstrip("/") == url.rstrip("/")
+                                and str(item.get("parameter") or "") == str(finding.get("parameter") or "")):
+                            matches.append(finding)
+                if wapiti_runs and not matches:
+                    rejected.append(item)
+                    continue
+            if scan_observation:
+                rejected.append(item)
+                continue
+            if matches:
+                item = dict(item)
+                rank = {"info": 0, "low": 1, "medium": 2, "high": 3, "critical": 4}
+                item["severity"] = max(
+                    (levels.get(str(f.get("level")), str(f.get("level") or "info").lower())
+                     for f in matches), key=lambda v: rank.get(v, 0))
+            accepted.append(item)
+        valid_items = accepted
         risk = str(data.get("risk_level") or "UNKNOWN").upper()
         if risk not in {"CRITICAL", "HIGH", "MEDIUM", "LOW", "UNKNOWN"}:
             risk = "UNKNOWN"
@@ -1291,6 +1348,15 @@ class WebXAgent:
                 note = (f"Đã loại {invalid_count} finding không đúng schema "
                         "(thiếu trường name); không còn finding hợp lệ nên risk UNKNOWN.")
                 summary = (summary.rstrip() + " " + note).strip()
+        if rejected or wapiti_runs:
+            ranks = {"low": 1, "medium": 2, "high": 3, "critical": 4}
+            severities = [str(f.get("severity") or "").lower() for f in valid_items]
+            risk = max((v for v in severities if v in ranks),
+                       key=ranks.get, default="UNKNOWN").upper()
+        if rejected:
+            summary = (f"Đã loại {len(rejected)} mục mô tả scan hoặc không khớp bằng chứng Wapiti. "
+                       f"Còn {len(valid_items)} finding; đánh giá chưa đầy đủ.")
+            result["unsupported_findings"] = len(rejected)
         data["findings"] = valid_items
         data["risk_level"] = risk
         data["overall_summary"] = summary

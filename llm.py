@@ -11,6 +11,7 @@ import re
 import time
 
 import requests
+from urllib3.exceptions import ReadTimeoutError
 
 _MARKER_RE = re.compile(r"\[(?:TOOL|SEARCH|EXEC):\s*.+?\]")
 _ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[a-zA-Z]")
@@ -190,7 +191,14 @@ def ollama_chat(messages: list, tools: list | None = None, config: dict | None =
                 raw_calls.append(tc)
             if obj.get("done"):
                 break
-    except requests.exceptions.ConnectionError:
+    except requests.exceptions.ConnectionError as exc:
+        # Requests wraps urllib3 read timeouts in ConnectionError while streaming.
+        if isinstance(exc.__context__, ReadTimeoutError) or any(
+                isinstance(arg, ReadTimeoutError) for arg in exc.args):
+            label = "first-token" if first_token_at is None else "completion"
+            return {"content": f"[!] Ollama {label} timeout.", "tool_calls": [],
+                    "metrics": {"timeout_phase": label.replace("-", "_"),
+                                "llm_latency_ms": round((time.monotonic() - started) * 1000, 3)}}
         return _conn_error(cfg)
     except requests.exceptions.Timeout:
         label = "first-token" if first_token_at is None else "completion"
@@ -199,6 +207,8 @@ def ollama_chat(messages: list, tools: list | None = None, config: dict | None =
                     "llm_latency_ms": round((time.monotonic() - started) * 1000, 3)}}
     except Exception as e:
         return {"content": f"[!] Ollama error: {e}", "tool_calls": []}
+    finally:
+        r.close()
     finished = time.monotonic()
     return {"content": "".join(parts).strip(),
             "tool_calls": _parse_tool_calls({"tool_calls": raw_calls}),
