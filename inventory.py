@@ -206,6 +206,19 @@ class Inventory:
         n_new = 0
         for c in calls or []:
             name = str(c.get("name") or "")
+            if name in {"zap_baseline", "zap_active_scan"} and c.get("outcome") in {"ok", "partial", "timeout"}:
+                for url in (c.get("data") or {}).get("endpoints", []):
+                    host = self.ensure_web(url, name)
+                    if host:
+                        self.add_endpoint(host, url, method="UNKNOWN", source=name)
+                        n_new += 1
+                for alert in (c.get("data") or {}).get("alerts", []):
+                    host = self.ensure_web(alert.get("url", ""), name)
+                    if host:
+                        ep = self.add_endpoint(host, alert["url"], method=alert.get("method", "UNKNOWN"), source=name)
+                        if alert.get("parameter"):
+                            ep.params.add(alert["parameter"])
+                continue
             if c.get("outcome") != "ok":
                 continue
             args = c.get("args") or {}

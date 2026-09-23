@@ -53,7 +53,9 @@ class GoalDrivenPlanner:
                              "methods": endpoint.attributes.get("methods") or ["GET"],
                              "information_gain": 1.0})
             discovery = [item for item in observations
-                         if item.attributes.get("tool") in {"crawler", "api_discovery"}]
+                         if item.attributes.get("tool") in {"crawler", "api_discovery"}
+                         or (item.attributes.get("tool") in {"zap_baseline", "zap_active_scan"}
+                             and item.attributes.get("status") == "complete")]
             sources = endpoint.attributes.get("sources") or []
             root_candidate = ("configured_target" in sources
                               or urlparse(str(url)).path in {"", "/"})
@@ -97,6 +99,8 @@ class GoalDrivenPlanner:
         if kind == "unobserved_endpoint":
             arguments = {"url": gap["url"], "method": str(gap["methods"][0]).lower()}
             tool, blockers = "http_request", []
+            if str(gap['methods'][0]).upper() == 'UNKNOWN':
+                blockers.append('observe_request_method_before_replay')
             if "{" in gap["url"]:
                 blockers.append("substitute_observed_path_parameters")
         elif kind == "undiscovered_surface":

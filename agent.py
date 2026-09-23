@@ -41,7 +41,7 @@ from tools import (TOOL_REGISTRY, TOOL_INDEX, TOOL_BINS, TOOL_TIMEOUTS,
 # v1.8.0: HTTP Session Engine (http_engine.py) — http_request là adapter trên
 # engine (cookie jar theo host, auth, redirect history, timing, evidence, replay,
 # proxy WEBX_HTTP_PROXY/WEBX_HTTPS_PROXY).
-VERSION = "4.1.0"
+VERSION = "4.2.0"
 
 # v1.7.0 (#12 attack memory): phân loại vuln_class cho TestHistory theo tool
 # (sqli→sqli, scanner→scan, recon→recon, poc→poc; tool không khớp → "").
@@ -244,7 +244,7 @@ class WebXAgent:
         # v1.4.2: phát hiện binary thiếu lúc khởi động (nuclei/arjun/... không
         # có trên máy) → model được báo TRƯỚC để không lên kế hoạch quanh tool
         # chết (trước đây tốn round vào outcome=error rồi mới bị gate cứng).
-        self.available, self.missing_tools = available_tools()
+        self.available, self.missing_tools = available_tools(self.config)
         if self.missing_tools:
             self.system_prompt += (
                 "\n\n⚠ TOOLS KHÔNG KHẢ DỤNG PHIÊN NÀY (binary thiếu trên máy): "
@@ -279,6 +279,9 @@ class WebXAgent:
         # (response THẬT) trong transcript. _no_http_json đếm lượt JSON bị chặn.
         self.ai_native = bool(self.config.get("ai_native", False))
         self._no_http_json = 0
+        from evidence import EvidenceStore
+        self.evidence_store = EvidenceStore(self.ledger)
+        self._pipeline_deadline = None
         self.context_metrics = RuntimeMetrics()
         self.context_metrics_history: list[dict] = []
 
@@ -483,7 +486,10 @@ class WebXAgent:
         if mode == "ask":
             if spec.risk == "safe":
                 return True
-            ans = input(f"\n[APPROVAL] '{spec.name}' risk [{spec.risk}] — run? [y/N] ").strip().lower()
+            try:
+                ans = input(f"\n[APPROVAL] '{spec.name}' risk [{spec.risk}] — run? [y/N] ").strip().lower()
+            except EOFError:
+                return False
             return ans == "y"
         if mode == "safe":
             return spec.risk == "safe"
@@ -494,6 +500,12 @@ class WebXAgent:
         if not spec:
             return {"name": name, "outcome": "error",
                     "output": f"[!] Tool '{name}' not found in registry."}
+        modern = self.config.get("scan_backend", "auto") != "legacy"
+        if modern:
+            from execution_policy import check_action
+            reason = check_action(self.config, name, arguments, self.evidence_store)
+            if reason:
+                return {"name": name, "outcome": "blocked", "output": "[POLICY] " + reason}
         # scope check
         for p in spec.scope_params:
             if p in arguments:
@@ -506,6 +518,19 @@ class WebXAgent:
                     "output": "[!] Operator denied this tool."}
         try:
             kw = dict(arguments)
+            if name.startswith("zap_"):
+                kw["_config"] = self.config
+            if name in {"evidence_validate", "evidence_status", "evidence_replay"}:
+                kw["_evidence_store"] = self.evidence_store
+                kw["_scope_policy"] = self.policy
+            if modern:
+                if name == "wapiti_scan":
+                    kw["exploit"] = False
+                if name == "ffuf_dir":
+                    kw["_rate"] = max(1, int(self.config.get("ffuf_rate", 5)))
+                    kw["_threads"] = max(1, int(self.config.get("ffuf_threads", 2)))
+                if name == "http_request":
+                    kw["follow_redirects"] = False
             # v1.4.3: trần timeout theo từng tool — chặn tool chạy vô hạn
             # không tôn trọng _timeout tốt (vd arjun 427s ở live-run), ngay cả
             # khi operator cấu hình tool_timeout cao.
@@ -513,7 +538,9 @@ class WebXAgent:
             # max(tool_timeout, cap) — cap từng tool là MỨC TỐI THIỂU để wapiti
             # không bị giết ở tool_timeout mặc định 90s giữa chừng scan.
             cap = TOOL_TIMEOUTS.get(name, self.config["tool_timeout"])
-            if name == "wapiti_scan":
+            if name.startswith("zap_"):
+                kw["_timeout"] = int(self.config.get("zap_timeout", 300))
+            elif name == "wapiti_scan":
                 # max_scan_time bounds Wapiti's scan phase. Allow a small
                 # cleanup/report window instead of always granting the old
                 # fixed 600-second floor. Operators can explicitly raise
@@ -525,6 +552,11 @@ class WebXAgent:
                 kw["_timeout"] = max(self.config["tool_timeout"], cap)
             else:
                 kw["_timeout"] = min(self.config["tool_timeout"], cap)
+            if modern and self._pipeline_deadline is not None:
+                remaining = int(self._pipeline_deadline - time.monotonic())
+                if remaining < 1:
+                    return {"name": name, "outcome": "blocked", "output": "Session time budget exhausted"}
+                kw["_timeout"] = min(kw["_timeout"], remaining)
             # v1.4.4: chỉ đo thời gian THỰC THI tool — chờ operator duyệt
             # (_risk_ok/input()) nằm ngoài try này nên không bị tính vào duration.
             t0 = time.time()
@@ -540,6 +572,10 @@ class WebXAgent:
             # v1.4.4: output mở đầu '[!]' = lỗi thực thi (timeout, thiếu binary,
             # connect fail, args sai) → outcome=error để gate/fail-count đúng.
             oc = "error" if isinstance(out, str) and out.startswith("[!]") else "ok"
+            if name.startswith("zap_") and isinstance(data, dict):
+                scan_status = (data.get("coverage") or {}).get("status")
+                if scan_status in {"partial", "timeout", "error"}:
+                    oc = scan_status
             r = {"name": name, "outcome": oc, "output": out, "exec_time": dt}
             if data is not None:
                 r["data"] = data
@@ -596,6 +632,9 @@ class WebXAgent:
             result = self._dispatch(name, arguments)
             self._record_test(name, arguments, result)
             event = {**result, "args": arguments}
+            if self.config.get("scan_backend", "auto") != "legacy":
+                from pipeline import record_result
+                return record_result(self, name, arguments, event)
             self.inventory.ingest([event])
             _security_analysis.manager().ingest_tool_result(event)
             return result
@@ -631,6 +670,9 @@ class WebXAgent:
     # MAIN LOOP
     # ─────────────────────────────────────────
     def run(self, user_text: str) -> dict:
+        if self.config.get("scan_backend", "auto") != "legacy":
+            from pipeline import run
+            return run(self, user_text)
         # v1.8.0: mỗi run() bắt đầu với Session Engine SẠCH (cookie jar + request
         # records của lượt trước KHÔNG rò sang lượt này) + áp proxy từ config
         # (WEBX_HTTP_PROXY/WEBX_HTTPS_PROXY) — http_request dùng CHUNG engine này.
@@ -1413,6 +1455,9 @@ class WebXAgent:
             md += ("\n## Phase 3 Analysis (hypotheses, chưa phải verdict)\n```json\n" +
                    json.dumps(summary, ensure_ascii=False, indent=2)[:20000] +
                    "\n```\n")
+        if self.config.get("scan_backend", "auto") != "legacy":
+            coverage = self.evidence_store.summary()["coverage"]
+            md += "\n## Scan coverage (not a safety verdict)\n```json\n" + json.dumps(coverage, ensure_ascii=False, indent=2) + "\n```\n"
         path = f"aixsec-x_report_{int(time.time())}.md"
         with open(path, "w") as f:
             f.write(md)
@@ -1439,6 +1484,13 @@ class WebXAgent:
             self.capabilities = capability_report(force=False)
         elif force:
             self.capabilities = capability_report(force=True)
+        if self.config.get("scan_backend", "auto") != "legacy":
+            from zap_adapter import executable
+            ready = executable(self.config) is not None
+            return self.capabilities + [
+                {"tool": name, "binary": self.config.get("zap_executable", "zap.sh"),
+                 "available": ready, "version": "version recorded in scan artifact" if ready else ""}
+                for name in ("zap_baseline", "zap_active_scan")]
         return self.capabilities
 
 
@@ -1652,7 +1704,7 @@ def main():
         result = agent.run(prompt_text)
         if result.get("llm_down"):
             print("\n" + result.get("llm_note", ""))
-        print("\n" + result.get("final_text", "")[:3000])
+        print("\n" + result.get("final_text", ""))
         _print_findings(agent)
         print(f"\n[*] Report: {agent.export_report()}")
         inv_path = agent.save_inventory()   # v1.6.0: WEBX_INVENTORY_FILE
@@ -1701,7 +1753,7 @@ def main():
         result = agent.run(line)
         if result.get("llm_down"):
             print("\n" + result.get("llm_note", ""))
-        print("\n" + (result.get("final_text", "") or "(no response)")[:4000])
+        print("\n" + (result.get("final_text", "") or "(no response)"))
         if result.get("overall_summary"):
             print(f"\n[RISK] {result['risk_level']}\n[SUMMARY] {result['overall_summary']}")
         _print_findings(agent)

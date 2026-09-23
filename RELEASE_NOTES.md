@@ -1,3 +1,14 @@
+# AIXSEC-X 4.2.0 — ZAP and evidence pipeline
+
+- Baseline-before-LLM execution with ZAP AF, optional Wapiti or HTTP observation.
+- Isolated ZAP sessions, bounded spider/AJAX/OpenAPI/passive and selected active rules.
+- Structured evidence, private artifacts, graph links and candidate/confirmed separation.
+- Deterministic missing-header validators and isolated HTTP evidence replay.
+- Separate active scan, sqlmap, content discovery and data extraction policies.
+- Timeout/error/partial/auth-unverified coverage survives model failure.
+- Old agent behavior is explicitly available through WEBX_SCAN_BACKEND=legacy.
+- See docs/ZAP_PIPELINE.md for setup, current validator coverage and budget limits.
+
 # AIXSEC-X 4.1.0 — Context optimization
 
 - Added bounded, ranked subgraph, evidence and planner-memory retrieval.

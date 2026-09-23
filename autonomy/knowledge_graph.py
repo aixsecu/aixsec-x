@@ -199,6 +199,21 @@ class KnowledgeGraph:
             graph.add_node(NodeKind.AUTH_CONTEXT, safe,
                            _stable_id("auth_context", safe.get("name", safe)))
         analysis = getattr(inventory, "analysis", {}) or {}
+        for evidence in analysis.get("scanner_evidence") or []:
+            enode = graph.add_node(NodeKind.EVIDENCE, copy.deepcopy(evidence), evidence.get("evidence_id"))
+            endpoint = endpoint_nodes.get(evidence.get("url"))
+            if endpoint:
+                graph.add_edge(endpoint.node_id, "has_evidence", enode.node_id)
+        for coverage in analysis.get("scan_coverage") or []:
+            onode = graph.add_node(NodeKind.OBSERVATION, copy.deepcopy(coverage))
+            endpoint = endpoint_nodes.get(coverage.get("target"))
+            if endpoint:
+                graph.add_edge(endpoint.node_id, "has_observation", onode.node_id)
+        for finding in analysis.get("validated_findings") or []:
+            fnode = graph.add_node(NodeKind.HYPOTHESIS, copy.deepcopy(finding), finding.get("finding_id"))
+            for evidence_id in finding.get("evidence") or []:
+                if graph.get(evidence_id):
+                    graph.add_edge(fnode.node_id, "supported_by", evidence_id)
         for workflow, rules in sorted((analysis.get("business_rules") or {}).items()):
             for rule in rules:
                 graph.add_node(NodeKind.BUSINESS_RULE,
