@@ -849,6 +849,9 @@ def _wapiti_parse_report(report_path: str) -> dict:
     """Parse report JSON của wapiti → dict chuẩn + dedupe finding."""
     with open(report_path, encoding="utf-8") as f:
         rep = json.load(f)
+    if (not isinstance(rep, dict) or not isinstance(rep.get("infos"), dict)
+            or not isinstance(rep.get("vulnerabilities"), dict)):
+        raise ValueError("Wapiti report missing infos/vulnerabilities objects")
     infos = rep.get("infos") or {}
     vulns: dict = rep.get("vulnerabilities") or {}
     findings = []
@@ -1101,7 +1104,7 @@ def _form_sweep(base_url: str, session_dir: str, budget: int, req_timeout: int,
     t0 = t.monotonic()
     engine = _sweep_engine(base_url, req_timeout)
     if engine:
-        logs.append(f"[i] form sweep: engine ước lượng từ headers = {engine}")
+        logs.append(f"[i] form sweep: engine ước lượng từ headers = {engine} (heuristic only; NOT confirmed DBMS or vulnerability)")
     seen: set[tuple] = set()
     for db in dbs:
         try:
@@ -1303,6 +1306,7 @@ def _wapiti_scan(**kw):
     # v1.7.0 (structured ToolResult): data = findings giảm còn shape khai báo
     # (hostile-safe: .get, không truyền dict gốc từ report).
     wdata = {"target": rep.get("target") or url, "scope": rep.get("scope") or scope,
+             "crawled": craw, "report_path": report_path,
              "findings": [{"category": str(f.get("category") or ""),
                             "level": str(f.get("level") or "info"),
                             "method": str(f.get("method") or "GET"),
