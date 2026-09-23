@@ -24,7 +24,7 @@ export WEBX_TARGETS="https://your-authorized-target.example"
 export WEBX_SCAN_BACKEND=zap
 export WEBX_ZAP_EXECUTABLE=zaproxy  # Kali Linux
 export WEBX_AUTO_EXEC=ask
-export WEBX_ZAP_TIMEOUT=300
+export WEBX_ZAP_TIMEOUT=600
 export WEBX_PIPELINE_MAX_SECONDS=900
 python3 agent.py
 ```
@@ -180,7 +180,7 @@ Warnings, malformed reports and incomplete authentication cannot report complete
 | `WEBX_PIPELINE_MAX_ACTIONS` | 30 | Session action cap |
 | `WEBX_PIPELINE_MAX_SECONDS` | 900 | Session scheduling deadline; remaining time clamps tool/LLM timeouts |
 | `WEBX_PIPELINE_MAX_REQUESTS` | 5000 | Estimated request budget for scheduling, **not** a strict network request counter |
-| `WEBX_ZAP_TIMEOUT` | 300 | Process wall-clock budget; stop owned process group on expiry |
+| `WEBX_ZAP_TIMEOUT` | 600 | Process wall-clock budget; stop owned process group on expiry |
 | `WEBX_ZAP_PHASE_MINUTES` | 2 | Per-phase ZAP limit |
 | `WEBX_ZAP_MAX_URLS` | 200 | Planning cost estimate only; does not cap OpenAPI imports or spider URLs (compatible with older bundled OpenAPI add-ons) |
 | `WEBX_ZAP_DELAY_MS` | 200 | Delay for active scanner, one thread per host |
@@ -210,3 +210,80 @@ against an installed ZAP and an authorized test application.
 References: [Automation Framework](https://www.zaproxy.org/docs/automate/automation-framework/),
 [report template](https://www.zaproxy.org/docs/desktop/addons/report-generation/report-traditional-json-plus/),
 [authentication](https://www.zaproxy.org/docs/desktop/addons/automation-framework/authentication/).
+
+
+## Form and AJAX discovery
+
+The default baseline now runs both the traditional Spider and AJAX Spider.
+`WEBX_ZAP_AJAX=0` opts out of browser interaction. AJAX crawling fills inputs and
+clicks elements (including span/div tabs); it can submit forms and change state.
+Use the authorized test environment and configured exclusions. It is not a
+complete workflow test and does not guarantee every keyup, hover or custom widget
+has been exercised. Missing browser/driver support is reported as partial coverage.
+
+```bash
+# Kali, with Firefox and compatible ZAP Selenium/WebDriver add-ons installed
+export WEBX_ZAP_AJAX=1
+export WEBX_ZAP_BROWSER=firefox-headless
+export WEBX_ZAP_TIMEOUT=600
+export WEBX_ZAP_PHASE_MINUTES=2
+export WEBX_ZAP_SPIDER_DEPTH=10
+export WEBX_ZAP_SPIDER_CHILDREN=50
+export WEBX_ZAP_AJAX_STATES=100
+export WEBX_ZAP_AJAX_ELEMENTS=a,button,input,span,div
+```
+
+`WEBX_ZAP_BROWSER=chrome-headless` selects Chrome instead; its ChromeDriver must
+match the installed browser. Browser binaries/drivers are not installed by AIXSEC-X.
+Each scan's time budget must accommodate discovery, browser startup, passive queue
+processing and export; the session deadline still takes precedence.
+
+Each scan writes `traffic.har` (private raw HTTP capture) and `inventory.json`
+(redacted metadata), in addition to `report.json`, `urls.txt` and `zap.log`.
+The final AIXSEC-X JSON includes a `discovery` array even when there are no alerts:
+
+- `forms`: actions, methods and field names, with observed request/test state.
+- `inputs`: controls inside and outside forms, without their values.
+- `endpoints`: method, parameter names, authentication context and discovery source.
+- `state=discovered`: only a reference was found; no matching captured request.
+- `state=requested`: a matching request with a response exists in HAR.
+- `state=tested`: a captured request is attributed to an allowed active rule using
+  the scanner-injected header and an executor-owned HTTP sender observer. This is not proof of vulnerability or full rule coverage.
+
+Static JavaScript extraction handles common literal jQuery/fetch/XHR patterns;
+computed URLs and method options that cannot be resolved remain unknown. Relative
+URLs in external scripts are resolved against known including documents.
+`report.json` alone contains alert samples, so offline extraction from it cannot
+establish full request coverage. The inventory never executes extracted JavaScript.
+Raw HAR may contain credentials and personal data; it stays in the private scan
+directory and is not placed in the planner context.
+
+The planner now receives parameterized discovery leads and coverage gaps. Active
+scans still require `WEBX_ALLOW_ACTIVE_SCAN=1` and `WEBX_ZAP_ALLOWED_RULES`.
+For a selected endpoint, the adapter imports matching captures from the same
+session/authentication context without replay, preserving POST bodies for ZAP.
+No automatic bulk active scan is enabled. Captured request counters in a seeded
+scan can include imported history, not just newly sent requests.
+
+`coverage.status` describes job execution, not application-wide completion.
+`phases`, `gaps`, `captured_requests` and `active_test_requests` expose what ran
+and what remains unverified. A browser startup failure cannot be marked complete,
+even if Automation Framework returns exit code zero. An active job with zero
+attributed test requests is partial.
+
+Active request attribution requires the ZAP Script Console and GraalVM JavaScript
+add-ons (bundled in the tested ZAP distribution). An AIXSEC-owned HTTP sender
+observer writes `active-requests.jsonl`: endpoint, method, parameter names, rule
+ID and response status, without values/bodies. This also captures active messages
+that ZAP omits from HAR. The planner cannot supply or edit the observer script.
+If the observer cannot run, active coverage remains unverified/partial.
+
+To verify your Kali browser/driver setup against a local form/AJAX fixture:
+
+```bash
+WEBX_TEST_LIVE_ZAP=1 python3 -m unittest test_zap_live -v
+```
+
+The opt-in test starts only a localhost server and checks an AJAX click, POST
+form submission, and a targeted active scan seeded with the recorded POST body.
+Ordinary unit-test runs skip this browser-dependent test.

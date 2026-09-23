@@ -266,6 +266,7 @@ class ZapExecutorTests(unittest.TestCase):
                 dest = plan_path.parent
                 (dest / 'report.json').write_text(json.dumps(report()))
                 (dest / 'urls.txt').write_text(URL + '\n')
+                (dest / 'traffic.har').write_text(json.dumps({'log': {'entries': []}}))
                 self.assertTrue(kwargs['start_new_session'])
                 self.assertNotIn('activeScan', [j['type'] for j in plan['jobs']])
                 process = MagicMock()

@@ -519,7 +519,17 @@ class WebXAgent:
         try:
             kw = dict(arguments)
             if name.startswith("zap_"):
-                kw["_config"] = self.config
+                kw["_config"] = dict(self.config)
+                if name == "zap_active_scan" and getattr(self, "evidence_store", None):
+                    from zap_adapter import within
+                    from pathlib import Path
+                    for coverage in reversed(self.evidence_store.coverage):
+                        har = coverage.get("har_path", "")
+                        if (har and within(coverage.get("target", ""), arguments.get("url", ""))
+                                and coverage.get("auth_context") == arguments.get("auth_context", "anonymous")
+                                and Path(har).is_file()):
+                            kw["_config"]["_zap_seed_har"] = har
+                            break
             if name in {"evidence_validate", "evidence_status", "evidence_replay"}:
                 kw["_evidence_store"] = self.evidence_store
                 kw["_scope_policy"] = self.policy

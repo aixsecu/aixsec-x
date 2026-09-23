@@ -207,6 +207,12 @@ class Inventory:
         for c in calls or []:
             name = str(c.get("name") or "")
             if name in {"zap_baseline", "zap_active_scan"} and c.get("outcome") in {"ok", "partial", "timeout"}:
+                for row in ((c.get("data") or {}).get("discovery") or {}).get("endpoints", []):
+                    host = self.ensure_web(row.get("url", ""), name)
+                    if host:
+                        ep = self.add_endpoint(host, row["url"], method=row.get("method", "UNKNOWN"), source=name)
+                        ep.params.update(row.get("parameters", []))
+                        n_new += 1
                 for url in (c.get("data") or {}).get("endpoints", []):
                     host = self.ensure_web(url, name)
                     if host:

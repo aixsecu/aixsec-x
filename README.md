@@ -1,5 +1,13 @@
 > **4.2.0 — ZAP + Evidence pipeline:** baseline runs before AI; findings/risk come from evidence and validators. Default `WEBX_SCAN_BACKEND=auto` selects ZAP when available, otherwise HTTP-only partial coverage. The old Wapiti gate is opt-in `legacy`. See [setup, authentication, policy and limitations](docs/ZAP_PIPELINE.md). Wapiti-first examples below describe legacy mode.
 
+For sites with forms or AJAX, the baseline now enables AJAX Spider by default
+(`WEBX_ZAP_AJAX=1`), using `firefox-headless`. Install a compatible browser and
+ZAP WebDriver/Selenium add-ons; set `WEBX_ZAP_BROWSER=chrome-headless` to use Chrome.
+`WEBX_ZAP_AJAX=0` disables browser interactions. The default ZAP timeout is 600s.
+The final report includes a separate `discovery` inventory of forms, inputs and
+API endpoints, distinguishing discovered, requested and tested states. See
+[form/AJAX configuration and coverage limits](docs/ZAP_PIPELINE.md#form-and-ajax-discovery).
+
 > **4.1.0 / Phase 4.1:** deterministic context retrieval, modular prompt
 > composition, token budgets, staged LLM timeouts and runtime metrics. See the
 > [Phase 4.1 guide](docs/PHASE_4_1.md). Phase 4 provides the serializable knowledge graph, goal-driven planning,
