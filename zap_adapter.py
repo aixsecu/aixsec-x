@@ -165,10 +165,27 @@ def build_plan(config, target, workdir, *, active=False, rule_ids=(), auth_conte
     common = {'context': 'aixsec', **({'user': user} if user else {})}
     depth = max(1, int(config.get('zap_spider_depth', 10)))
     jobs = [{'type': 'passiveScan-config', 'parameters': {'scanOnlyInScope': True}}]
+    if not active:
+        catalog = Path(workdir) / 'rule-catalog.js'
+        catalog.write_text((Path(__file__).parent / 'examples/zap/rule-catalog.js').read_text().replace(
+            '__AIXSEC_OUTPUT__', json.dumps(str(Path(workdir) / 'active-rules.json'))))
+        catalog.chmod(0o600)
+        jobs.extend([{'type': 'script', 'parameters': {'action': 'add', 'type': 'standalone',
+            'engine': 'ECMAScript : Graal.js', 'name': 'aixsec-rule-catalog', 'source': str(catalog)}},
+            {'type': 'script', 'parameters': {'action': 'run', 'type': 'standalone', 'name': 'aixsec-rule-catalog'}}])
     # Executor-owned capture only; the model cannot supply a filesystem path.
     # Import requests/responses without replay, retaining POST bodies for the
     # selected endpoint so active scans are not limited to a fresh GET crawl.
+    seed_entry = config.get('_zap_seed_entry') if active else None
     seed = config.get('_zap_seed_har') if active else None
+    if seed_entry:
+        seed_path = Path(workdir) / 'seed.har'
+        entry = copy.deepcopy(seed_entry)
+        entry['request']['headers'] = [h for h in entry['request'].get('headers', []) if h.get('name', '').lower() != 'x-zap-scan-id']
+        seed_path.write_text(json.dumps({'log': {'version': '1.2', 'creator': {'name': 'AIXSEC-X', 'version': '1'}, 'entries': [entry]}}))
+        seed_path.chmod(0o600)
+        jobs.append({'type': 'import', 'parameters': {'type': 'har', 'fileName': str(seed_path)}})
+        seed = None
     if seed:
         capture = json.loads(Path(seed).read_text())
         target_path = urlsplit(target).path or '/'
@@ -192,16 +209,17 @@ def build_plan(config, target, workdir, *, active=False, rule_ids=(), auth_conte
             seed_path.chmod(0o600)
             jobs.append({'type': 'import', 'parameters': {'type': 'har',
                          'fileName': str(seed_path)}})  # default: import only; older add-ons lack sendRequests
-    spec = _openapi_file(config, target, workdir)
+    spec = _openapi_file(config, target, workdir) if not seed_entry else None
     if spec:
         # Older bundled OpenAPI add-ons reject maxMessages. Keep the plan
         # compatible; zap_max_urls is only a planning estimate, not an import cap.
         jobs.append({'type': 'openapi', 'parameters': {**common, 'apiFile': spec,
                      'targetUrl': origin(target)}})
-    jobs.append({'type': 'spider', 'parameters': {**common, 'url': target,
-        'maxDuration': minutes, 'maxDepth': depth,
-        'maxChildren': max(1, int(config.get('zap_spider_children', 50))), 'logoutAvoidance': True}})
-    if ajax:
+    if not seed_entry:
+        jobs.append({'type': 'spider', 'parameters': {**common, 'url': target,
+            'maxDuration': minutes, 'maxDepth': depth,
+            'maxChildren': max(1, int(config.get('zap_spider_children', 50))), 'logoutAvoidance': True}})
+    if ajax and not seed_entry:
         jobs.append({'type': 'spiderAjax', 'parameters': {**common, 'url': target,
             'maxDuration': minutes, 'maxCrawlDepth': depth, 'numberOfBrowsers': 1,
             'inScopeOnly': True, 'scopeCheck': 'Strict',
@@ -324,7 +342,8 @@ def run_scan(config, url, *, active=False, rule_ids=(), auth_context='anonymous'
     env = {k: v for k, v in os.environ.items() if not k.startswith('ZAP_AUTH_HEADER')}
     try:
         with log_path.open('w') as log:
-            process = subprocess.Popen(launch_command(binary) + ['-cmd', '-dir', str(home), '-autorun', str(plan_path)],
+            process = subprocess.Popen(launch_command(binary) + ['-cmd', '-host', '127.0.0.1', '-port', '0',
+                '-dir', str(home), '-autorun', str(plan_path)],
                 stdout=log, stderr=subprocess.STDOUT, start_new_session=True, env=env)
             try:
                 code = process.wait(timeout=deadline)
@@ -446,6 +465,15 @@ def run_scan(config, url, *, active=False, rule_ids=(), auth_context='anonymous'
                     active_requests_path=str(active_path),
                     inventory_summary=inventory['summary'],
                     captured_requests=inventory['request_count'], active_test_requests=inventory['test_request_count'])
+    active_rules = []
+    catalog_path = directory / 'active-rules.json'
+    if catalog_path.exists():
+        try:
+            active_rules = json.loads(catalog_path.read_text())
+            if not isinstance(active_rules, list) or any(type(r.get('id')) is not int for r in active_rules):
+                active_rules = []
+        except (ValueError, TypeError, AttributeError):
+            active_rules = []
     summary = inventory['summary']
     return (f"ZAP {state}: {len(urls)} URLs, {len(rows)} alert instances; "
             f"{summary['forms']} forms, {summary['inputs']} inputs; "
@@ -455,4 +483,4 @@ def run_scan(config, url, *, active=False, rule_ids=(), auth_context='anonymous'
             f"auth={auth_state}; inventory={inventory_path}; report={report_path}",
             {'target': canonical_url(url), 'scan_id': scan_id, 'coverage': coverage,
              'endpoints': [EvidenceRedactor().redact_url(u) for u in urls], 'alerts': rows,
-             'discovery': inventory})
+             'discovery': inventory, 'active_rules': active_rules})

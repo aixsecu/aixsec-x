@@ -2213,6 +2213,7 @@ TOOL_REGISTRY: list[ToolSpec] = [
                "ajax": {"type": "boolean"}}, "required": ["url"]}, _zap_baseline, risk="noisy"),
     ToolSpec("zap_active_scan", "Targeted ZAP active scan with explicit operator-allowed rule IDs and time budget.",
              {"type": "object", "properties": {"url": {"type": "string"},
+               "request_id": {"type": "string"}, "method": {"type": "string"},
                "auth_context": {"type": "string"},
                "rule_ids": {"type": "array", "items": {"type": "integer"}}},
                "required": ["url", "rule_ids"]}, _zap_active_scan, risk="active"),

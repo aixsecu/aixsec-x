@@ -520,6 +520,10 @@ class WebXAgent:
             kw = dict(arguments)
             if name.startswith("zap_"):
                 kw["_config"] = dict(self.config)
+                if kw["_config"].get("zap_allowed_rules") == "all":
+                    kw["_config"]["zap_allowed_rules"] = [r['id'] for r in getattr(getattr(self, 'evidence_store', None), 'active_rules', [])]
+                if name == "zap_active_scan" and getattr(self, "_zap_active_entry", None):
+                    kw["_config"]["_zap_seed_entry"] = self._zap_active_entry
                 if name == "zap_active_scan" and getattr(self, "evidence_store", None):
                     from zap_adapter import within
                     from pathlib import Path

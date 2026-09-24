@@ -81,8 +81,10 @@ def run(agent, user_text):
     max_actions = max(1, int(cfg.get('pipeline_max_actions', 30)))
     calls, cache, estimated_requests = 0, {}, 0
     max_requests = max(1, int(cfg.get('pipeline_max_requests', 5000)))
+    from zap_schedule import ScanSchedule
+    schedule = ScanSchedule(cfg.get('evidence_dir', '.aixsec-evidence'), cfg.get('zap_history_namespace', 'default'))
 
-    def execute(name, args, baseline=False):
+    def execute(name, args, baseline=False, scheduled=False):
         nonlocal calls, estimated_requests
         def blocked(message):
             result = {'name': name, 'outcome': 'blocked', 'output': message}
@@ -91,6 +93,20 @@ def run(agent, user_text):
                                   'status': 'blocked', 'reason': message}}
                 record_result(agent, name, args, result, baseline=True)
             return result
+        representative = None
+        if name == 'zap_active_scan':
+            from execution_policy import check_action
+            reason = check_action(cfg, name, args, agent.evidence_store)
+            if reason:
+                return blocked(reason)
+            representative = schedule.select(args)
+            if representative is None:
+                return blocked('Select one captured request_id from the active schedule; no synthetic request is scanned')
+            remaining_rules = schedule.remaining(representative['request_id'], args.get('rule_ids', []))
+            if not remaining_rules:
+                return {'name':name, 'outcome':'duplicate', 'output':'This request structure/rule combination was already attempted.'}
+            args = {**args, 'url': representative['_entry']['request']['url'],
+                    'auth_context': representative['auth_context'], 'rule_ids': remaining_rules}
         key = json.dumps([name, args], sort_keys=True)
         if key in cache:
             return {'name': name, 'outcome': 'duplicate', 'output': 'Action already attempted; use existing evidence.'}
@@ -99,14 +115,28 @@ def run(agent, user_text):
         from autonomy.cost_model import CostModel
         estimate = CostModel().estimate({'tool': name, 'arguments': args}).requests
         if name.startswith('zap_'):
-            estimate = int(cfg.get('zap_max_urls', 200)) * (10 if name == 'zap_active_scan' else 2)
+            estimate = (max(1, len(args.get('rule_ids', []))) * 20 if name == 'zap_active_scan'
+                        else int(cfg.get('zap_max_urls', 200)) * 2)
         if estimated_requests + estimate > max_requests:
             return blocked('Estimated request budget exhausted')
         estimated_requests += estimate
         calls += 1
         agent._pipeline_deadline = deadline
-        print(f'[→] {name} ({"baseline" if baseline else "planner"})', flush=True)
-        result = agent._dispatch(name, args)
+        if representative:
+            claimed = schedule.claim(representative['request_id'], args['rule_ids'])
+            if not claimed:
+                return {'name':name, 'outcome':'duplicate', 'output':'Another run already reserved these structure/rule pairs.'}
+            args['rule_ids'] = claimed
+            agent._zap_active_entry = representative['_entry']
+        trigger = 'baseline' if baseline else 'scheduler' if scheduled else 'planner'
+        print(f'[→] {name} ({trigger})', flush=True)
+        try:
+            result = agent._dispatch(name, args)
+        finally:
+            agent._zap_active_entry = None
+        if representative:
+            schedule.finish(representative['request_id'], args['rule_ids'], result)
+        result['trigger'] = trigger
         # Coverage failure is retained even if no scanner process was launched.
         if baseline and not isinstance((result.get('data') or {}).get('coverage'), dict):
             if not isinstance(result.get('data'), dict):
@@ -146,9 +176,33 @@ def run(agent, user_text):
                 args.update(scope='domain', modules='sql,xss,file,exec', max_scan_time=120, exploit=False)
             if backend == 'http':
                 args.update(method='get', follow_redirects=False)
-            execute(tool, args, True)
+            baseline_result = execute(tool, args, True)
+            if backend == 'zap':
+                coverage = (baseline_result.get('data') or {}).get('coverage') or {}
+                schedule.collect(coverage)
     if backend == 'none':
         agent.evidence_store.coverage.extend({'target': u, 'status': 'not_run', 'reason': 'baseline disabled'} for u in targets)
+    schedule.rules = agent.evidence_store.active_rules
+    configured = cfg.get('zap_allowed_rules', [])
+    active_rules = sorted({r['id'] for r in schedule.rules} if configured == 'all' else set(configured))
+    if backend == 'zap' and cfg.get('zap_auto_active', True) and cfg.get('allow_active_scan', False):
+        if not active_rules:
+            schedule.stop_reason = 'No installed/allowed active rules; inspect the ZAP rule catalog job'
+        elif not schedule.entries:
+            schedule.stop_reason = 'No eligible captured requests to test'
+        # Run independently of the LLM, once per structural family and rule.
+        for representative in sorted(schedule.entries.values(), key=lambda e: (
+                not bool(e['structure']['query'] or e['structure']['body']), e['url'])):
+            if not schedule.remaining(representative['request_id'], active_rules):
+                continue
+            response = execute('zap_active_scan', {'url':representative['_entry']['request']['url'],
+                'request_id':representative['request_id'], 'auth_context':representative['auth_context'],
+                'rule_ids':active_rules}, scheduled=True)
+            if response.get('outcome') in ('blocked', 'denied'):
+                schedule.stop_reason = response.get('output', response['outcome'])
+                break
+    elif backend == 'zap':
+        schedule.stop_reason = 'Automatic active scanning disabled by operator configuration'
     # Apply supported validators without waiting for an LLM to request them.
     for eid in list(agent.evidence_store.records):
         agent.evidence_store.validate(eid)
@@ -174,6 +228,9 @@ def run(agent, user_text):
         schemas = [TOOL_INDEX[n].schema() for n in sorted(requested_tools) if n in agent.available]
         snapshot = agent.evidence_store.summary()
         context = {'coverage': snapshot['coverage'], 'evidence': snapshot['evidence'][:30],
+                   'active_requests': [{'request_id':e['request_id'], 'url':e['url'], 'method':e['method'],
+                       'auth_context':e['auth_context'], 'remaining_rule_ids':schedule.remaining(e['request_id'], active_rules)}
+                       for e in list(schedule.entries.values())[:40]],
                    'discovery': [{'scan_id': d['scan_id'], 'summary': d.get('summary', {}),
                        'endpoints': sorted(d.get('endpoints', []),
                            key=lambda e: (not bool(e.get('parameters')), e.get('tested', False)))[:40],
@@ -219,6 +276,12 @@ def run(agent, user_text):
             break
     agent._pipeline_deadline = None
     result = agent.evidence_store.finish(llm_down or failures > 0)
+    result['active_schedule'] = schedule.summary(active_rules)
+    from pathlib import Path
+    schedule_path = agent.evidence_store.directory / 'active-schedule.json'
+    schedule_path.write_text(json.dumps(result['active_schedule'], ensure_ascii=False, indent=2))
+    schedule_path.chmod(0o600)
+    result['active_schedule_path'] = str(schedule_path)
     result['calls'] = calls
     result['budget'] = {'actions': calls, 'max_actions': max_actions,
                         'elapsed_seconds': round(time.monotonic() - began, 2),

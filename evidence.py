@@ -41,6 +41,7 @@ class EvidenceStore:
         self.coverage = []
         self.observations = []
         self.discovery = []
+        self.active_rules = []
         self.directory = None
         if directory:
             root = Path(directory).resolve()
@@ -65,6 +66,8 @@ class EvidenceStore:
             self.coverage.append(public(coverage))
         if isinstance(data.get('discovery'), dict):
             self.discovery.append({'scan_id': data.get('scan_id', ''), **public(data['discovery'])})
+        if isinstance(data.get('active_rules'), list) and data['active_rules']:
+            self.active_rules = public(data['active_rules'])
         self.observations.append({'tool': name, 'outcome': result.get('outcome'),
             'url': EvidenceRedactor().redact_url(str(args.get('url') or '')),
             'data_sha256': stable_id('data', public(data)), 'artifact_ref': raw_artifact, 'time': time.time()})

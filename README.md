@@ -8,6 +8,14 @@ The final report includes a separate `discovery` inventory of forms, inputs and
 API endpoints, distinguishing discovered, requested and tested states. See
 [form/AJAX configuration and coverage limits](docs/ZAP_PIPELINE.md#form-and-ajax-discovery).
 
+Active testing now runs automatically after discovery, independently of the AI:
+`WEBX_ZAP_AUTO_ACTIVE=1`, `WEBX_ALLOW_ACTIVE_SCAN=1`, and
+`WEBX_ZAP_ALLOWED_RULES=all` are the defaults. `all` selects installed ZAP rules;
+it does not guarantee discovery of every vulnerability. Existing execution
+approvals and budgets remain in effect. Set `WEBX_ALLOW_ACTIVE_SCAN=0` for passive-only.
+Equivalent request structures are tested once per rule, with history persisted
+across runs. See [scheduling and deduplication](docs/ZAP_PIPELINE.md#automatic-multi-rule-scheduling-and-persistent-deduplication).
+
 > **4.1.0 / Phase 4.1:** deterministic context retrieval, modular prompt
 > composition, token budgets, staged LLM timeouts and runtime metrics. See the
 > [Phase 4.1 guide](docs/PHASE_4_1.md). Phase 4 provides the serializable knowledge graph, goal-driven planning,

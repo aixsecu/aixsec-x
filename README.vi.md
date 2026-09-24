@@ -8,6 +8,14 @@ Báo cáo cuối có inventory `discovery` riêng cho form, ô nhập và API, p
 “phát hiện”, “đã gửi request” và “đã kiểm thử”. Xem
 [cấu hình form/AJAX và giới hạn coverage](docs/ZAP_PIPELINE.md#form-and-ajax-discovery).
 
+Active Scan hiện được lập lịch tự động sau discovery, không phụ thuộc AI:
+mặc định `WEBX_ZAP_AUTO_ACTIVE=1`, `WEBX_ALLOW_ACTIVE_SCAN=1` và
+`WEBX_ZAP_ALLOWED_RULES=all`. `all` chọn các rule ZAP đã cài, không bảo đảm phát hiện
+mọi lỗ hổng. Cơ chế phê duyệt chạy tool và giới hạn ngân sách vẫn áp dụng.
+Đặt `WEBX_ALLOW_ACTIVE_SCAN=0` nếu chỉ muốn discovery/passive scan.
+Các request cùng cấu trúc chỉ được lập lịch một lần cho mỗi rule; lịch sử lưu
+qua các lần chạy. Xem [lập lịch và chống quét trùng](docs/ZAP_PIPELINE.md#automatic-multi-rule-scheduling-and-persistent-deduplication).
+
 > **4.1.0 / Phase 4.1:** context retrieval xác định, prompt tách lớp, token
 > budget, timeout LLM theo giai đoạn và runtime metrics. Xem
 > [hướng dẫn Phase 4.1](docs/PHASE_4_1.md). Phase 4 gồm knowledge graph có thể lưu, goal-driven planner, bộ nhớ
