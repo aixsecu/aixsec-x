@@ -235,6 +235,9 @@ def build_plan(config, target, workdir, *, active=False, rule_ids=(), auth_conte
         selected = {int(x) for x in rule_ids}
         if not selected or not selected <= allowed:
             raise ValueError('Active scan requires explicit rule_ids within WEBX_ZAP_ALLOWED_RULES')
+        strength = str(config.get('zap_strength', 'Medium')).capitalize()
+        if strength not in ('Low', 'Medium', 'High', 'Insane'):
+            raise ValueError('WEBX_ZAP_STRENGTH must be Low, Medium, High or Insane')
         observer = Path(workdir) / 'active-observer.js'
         observer.write_text((Path(__file__).parent / 'examples/zap/active-observer.js').read_text().replace(
             '__AIXSEC_OUTPUT__', json.dumps(str(Path(workdir) / 'active-requests.jsonl'))))
@@ -242,8 +245,8 @@ def build_plan(config, target, workdir, *, active=False, rule_ids=(), auth_conte
         jobs.append({'type': 'script', 'parameters': {'action': 'add', 'type': 'httpsender',
             'engine': 'ECMAScript : Graal.js', 'name': 'aixsec-active-observer', 'source': str(observer)}})
         jobs.append({'type': 'activeScan-policy', 'parameters': {'name': 'aixsec-targeted'},
-            'policyDefinition': {'defaultStrength': 'Low', 'defaultThreshold': 'Off',
-                'rules': [{'id': i, 'strength': 'Low', 'threshold': 'Medium'} for i in sorted(selected)]}})
+            'policyDefinition': {'defaultStrength': strength, 'defaultThreshold': 'Off',
+                'rules': [{'id': i, 'strength': strength, 'threshold': 'Medium'} for i in sorted(selected)]}})
         jobs.append({'type': 'activeScan', 'parameters': {**common,
             'policy': 'aixsec-targeted', 'maxScanDurationInMins': minutes,
             'maxRuleDurationInMins': minutes, 'threadPerHost': 1,
@@ -417,6 +420,11 @@ def run_scan(config, url, *, active=False, rule_ids=(), auth_context='anonymous'
             discovery.active_records(active_path)
         except (ValueError, TypeError, KeyError, OSError) as exc:
             inventory_error = 'Cannot parse active request evidence: ' + str(exc)
+    from zap_active_evidence import analyze
+    diagnostics, candidates = analyze(directory, url, rule_ids, auth_context, scan_id) if active else ({}, [])
+    for candidate in candidates:
+        candidate['auth_state'] = auth_state
+    rows.extend(candidates)
     for endpoint in urls:
         discovery.add(endpoint, 'UNKNOWN', [], 'url_export')
     inventory = discovery.result()
@@ -460,6 +468,7 @@ def run_scan(config, url, *, active=False, rule_ids=(), auth_context='anonymous'
         'openapi_requested': bool(config.get('zap_openapi_file')), 'returncode': code,
         'duration': round(time.monotonic() - started, 2), 'report_path': str(report_path),
         'log_path': str(log_path), 'error': parse_error, **metadata}
+    coverage['active_evidence'] = diagnostics
     coverage.update(status_meaning='execution_only_not_full_coverage', phases=phases, gaps=gaps,
                     inventory_path=str(inventory_path), har_path=str(har_path),
                     active_requests_path=str(active_path),

@@ -94,7 +94,7 @@ AJAX is opt-in because it starts a browser and can exercise application actions.
 
 The scheduler and planner may call `zap_active_scan(url, rule_ids, auth_context, request_id)` only with rule
 IDs allowed by the operator. `all` resolves to the installed rule catalog exported by ZAP; a comma-separated list restricts the policy. The generated policy turns every rule off and then
-enables the requested IDs at low strength. Select installed rule IDs from the
+enables the requested IDs at configurable strength (Medium by default). Select installed rule IDs from the
 [ZAP alert catalog](https://www.zaproxy.org/docs/alerts/). A broad category such as
 XSS can require several different rules/add-ons; the adapter does not claim
 complete category coverage simply because the scan ran.
@@ -353,3 +353,41 @@ To intentionally retest a new application deployment or previously unverified
 attempts, choose a new `WEBX_ZAP_HISTORY_NAMESPACE` (default `default`). This does
 not erase old history. Reuse the same evidence directory and namespace to retain
 deduplication; deleting them or moving to a new directory starts fresh history.
+
+
+## Active response evidence
+
+`WEBX_ZAP_STRENGTH` accepts Low, Medium (default), High or Insane. Higher strength
+can consume the existing time/request budgets faster; it does not guarantee detection.
+All selected active rules retain the existing metadata observer and additionally write
+`active-evidence.jsonl` inside the private scan directory. This file stores URL/payload,
+response body, body hashes and elapsed milliseconds; it is not included in model context.
+Headers are omitted, common sensitive query/form/JSON fields are masked, unsupported
+request bodies are omitted. Response bodies can still contain application secrets:
+treat this artifact as private, like the existing seed HAR. The directory is mode 0700;
+the adapter sets the artifact to 0600 after execution.
+
+Limits: 16,384 characters per request body, 65,536 per response body, 16 MiB per scan.
+Truncation flags and a byte-limit marker expose incomplete retention. The separate
+metadata stream continues after the response capture limit. Hashes describe original
+unredacted input/body; stored text is not necessarily hash-equivalent.
+
+The offline SQL error comparator currently handles query parameters and URL-encoded
+forms for ZAP rule 40018. It requires the same origin/path/method as a successful
+captured control, unchanged parameter names/order, exactly one changed value, and a
+recognized SQL error absent from the control. It recognizes custom `syntax error: select`
+responses as well as MySQL syntax errors and SQLSTATE class 42. It does not infer
+injection from HTTP 200, a generic error, or a database technology name. JSON/opaque
+bodies are retained where supported but not attributed by this comparator.
+The control can be stale: results remain candidates needing repeated paired validation,
+not confirmed SQLi. This adds no extra network requests and does not extract data.
+
+`responses_recorded` means an attributed response was retained; `requests_observed`
+means only request metadata was available. Neither proves rule completion or safety.
+Previously attempted families remain suppressed. For an intentional rerun after this
+update use a new fixed `WEBX_ZAP_HISTORY_NAMESPACE=evidence-v2`; do not change it on
+every run if you want deduplication across runs. Internal requests made by a ZAP rule
+are not individual scheduler campaigns and can include related URLs.
+
+Local integration check without a browser or external target:
+`WEBX_TEST_LIVE_EVIDENCE=1 python3 -m unittest test_zap_live.LiveEvidenceTests -v`.
