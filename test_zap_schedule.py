@@ -39,6 +39,18 @@ class FamilyTests(unittest.TestCase):
                          family(request(BASE+'users/aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee')))
 
 class ScheduleTests(unittest.TestCase):
+    def test_recorded_responses_remain_deduplicated(self):
+        with tempfile.TemporaryDirectory() as root:
+            schedule = ScanSchedule(root)
+            schedule.claim('family', [40018])
+            schedule.finish('family', [40018], {'outcome': 'ok', 'data': {
+                'discovery': {'endpoints': [{'tested_rule_ids': ['40018']}]},
+                'coverage': {'active_evidence': {'rules_with_evidence': [40018]}}}})
+            self.assertEqual(ScanSchedule(root).remaining('family', [40018]), [])
+            with schedule.connection() as db:
+                self.assertEqual(db.execute('SELECT state FROM attempts').fetchone()[0], 'responses_recorded')
+
+
     def test_persistent_per_rule_reservation_and_denial_release(self):
         with tempfile.TemporaryDirectory() as root:
             s=ScanSchedule(root)

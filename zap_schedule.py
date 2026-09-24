@@ -139,12 +139,14 @@ class ScanSchedule:
         outcome = result.get('outcome')
         observed = {int(rule) for row in ((result.get('data') or {}).get('discovery') or {}).get('endpoints', [])
                     for rule in row.get('tested_rule_ids', []) if str(rule).isdigit()}
+        captured = set(((result.get('data') or {}).get('coverage') or {}).get('active_evidence', {}).get('rules_with_evidence', []))
         with self.connection() as db:
             for rule in rules:
                 if outcome in ('denied', 'blocked', 'scope_rejected'):
                     db.execute('DELETE FROM attempts WHERE namespace=? AND family=? AND rule=?', (self.namespace, fid, rule))
                 else:
-                    state = 'requests_observed' if rule in observed else 'attempted_unverified'
+                    state = ('responses_recorded' if rule in observed and rule in captured else
+                             'requests_observed' if rule in observed else 'attempted_unverified')
                     artifact = ((result.get('data') or {}).get('coverage') or {}).get('report_path', '')
                     db.execute('UPDATE attempts SET state=?,artifact_ref=? WHERE namespace=? AND family=? AND rule=?', (state, artifact, self.namespace, fid, rule))
 
@@ -159,4 +161,4 @@ class ScanSchedule:
         return {'namespace': self.namespace, 'history_path': str(self.path), 'families': rows,
                 'rules': self.rules, 'skipped_static_requests': self.skipped_static,
                 'stop_reason': self.stop_reason,
-                'interpretation': 'A reserved/attempted rule is never automatically repeated; requests_observed is not a vulnerability verdict.'}
+                'interpretation': 'A reserved/attempted rule is never automatically repeated; requests_observed/responses_recorded do not mean the rule completed or the endpoint is safe. Use a new operator-selected namespace for intentional retesting.'}

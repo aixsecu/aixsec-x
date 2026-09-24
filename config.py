@@ -29,6 +29,7 @@ def load_config() -> dict:
         "evidence_dir": os.environ.get("WEBX_EVIDENCE_DIR", ".aixsec-evidence"),
         "zap_executable": os.environ.get("WEBX_ZAP_EXECUTABLE", "zap.sh"),
         "zap_timeout": int(os.environ.get("WEBX_ZAP_TIMEOUT", "600")),
+        "zap_strength": os.environ.get("WEBX_ZAP_STRENGTH", "Medium"),
         "zap_phase_minutes": int(os.environ.get("WEBX_ZAP_PHASE_MINUTES", "2")),
         "zap_max_urls": int(os.environ.get("WEBX_ZAP_MAX_URLS", "200")),
         "zap_delay_ms": int(os.environ.get("WEBX_ZAP_DELAY_MS", "200")),

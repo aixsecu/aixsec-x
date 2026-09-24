@@ -26,6 +26,16 @@ across runs. See [scheduling and deduplication](docs/ZAP_PIPELINE.md#automatic-m
 
 # AIXSEC-X — AI Web Exploitation Assistant (local LLM, Kali Linux)
 
+Active scans now default to `WEBX_ZAP_STRENGTH=Medium` (Low/Medium/High/Insane).
+Private `active-evidence.jsonl` records bounded payloads, responses, hashes and timing
+for all selected rules. SQL errors absent from the captured control can produce a
+SQLi **candidate**, even without a ZAP alert; paired replay is still needed for confirmation.
+The scheduler distinguishes `responses_recorded` from `requests_observed`; neither means safe.
+To intentionally retest families already in history after this update, set
+`export WEBX_ZAP_HISTORY_NAMESPACE=evidence-v2` once and keep that namespace for
+subsequent runs. Deduplication remains effective within that namespace.
+See [capture limits and privacy](docs/ZAP_PIPELINE.md#active-response-evidence).
+
 | Language | File |
 |---|---|
 | **English** | **README.md** (this file) |

@@ -26,6 +26,16 @@ qua các lần chạy. Xem [lập lịch và chống quét trùng](docs/ZAP_PIPE
 
 # AIXSEC-X — AI Web Exploitation Assistant (local LLM, Kali Linux)
 
+Active scan hiện mặc định `WEBX_ZAP_STRENGTH=Medium` (Low/Medium/High/Insane).
+File riêng tư `active-evidence.jsonl` lưu payload, phản hồi có giới hạn, hash và thời gian
+cho các rule được chọn. Lỗi SQL không có trong mẫu đối chứng có thể tạo **candidate SQLi**
+kể cả khi ZAP không cảnh báo; vẫn cần replay đối chứng để xác nhận.
+Scheduler phân biệt `responses_recorded` với `requests_observed`; cả hai không có nghĩa an toàn.
+Để chủ động kiểm tra lại các nhóm URL đã có lịch sử sau cập nhật, đặt
+`export WEBX_ZAP_HISTORY_NAMESPACE=evidence-v2` một lần và giữ nguyên cho các lần chạy sau.
+Chống quét trùng vẫn có hiệu lực trong namespace đó.
+Xem [giới hạn lưu bằng chứng và dữ liệu riêng tư](docs/ZAP_PIPELINE.md#active-response-evidence).
+
 | Ngôn ngữ | Tệp |
 |---|---|
 | **Tiếng Việt** | **README.vi.md** (tệp này) |
