@@ -1,5 +1,7 @@
 > **4.2.0 — ZAP + Evidence pipeline:** baseline runs before AI; findings/risk come from evidence and validators. Default `WEBX_SCAN_BACKEND=auto` selects ZAP when available, otherwise HTTP-only partial coverage. The old Wapiti gate is opt-in `legacy`. See [setup, authentication, policy and limitations](docs/ZAP_PIPELINE.md). Wapiti-first examples below describe legacy mode.
 
+Scanner integrations live in `adapters/` (`adapters/zap.py` for ZAP). New scanner adapters should be added to this package; shared scheduling and evidence processing remain separate.
+
 For sites with forms or AJAX, the baseline now enables AJAX Spider by default
 (`WEBX_ZAP_AJAX=1`), using `firefox-headless`. Install a compatible browser and
 ZAP WebDriver/Selenium add-ons; set `WEBX_ZAP_BROWSER=chrome-headless` to use Chrome.

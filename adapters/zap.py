@@ -167,7 +167,7 @@ def build_plan(config, target, workdir, *, active=False, rule_ids=(), auth_conte
     jobs = [{'type': 'passiveScan-config', 'parameters': {'scanOnlyInScope': True}}]
     if not active:
         catalog = Path(workdir) / 'rule-catalog.js'
-        catalog.write_text((Path(__file__).parent / 'examples/zap/rule-catalog.js').read_text().replace(
+        catalog.write_text((Path(__file__).resolve().parent.parent / 'examples/zap/rule-catalog.js').read_text().replace(
             '__AIXSEC_OUTPUT__', json.dumps(str(Path(workdir) / 'active-rules.json'))))
         catalog.chmod(0o600)
         jobs.extend([{'type': 'script', 'parameters': {'action': 'add', 'type': 'standalone',
@@ -239,7 +239,7 @@ def build_plan(config, target, workdir, *, active=False, rule_ids=(), auth_conte
         if strength not in ('Low', 'Medium', 'High', 'Insane'):
             raise ValueError('WEBX_ZAP_STRENGTH must be Low, Medium, High or Insane')
         observer = Path(workdir) / 'active-observer.js'
-        observer.write_text((Path(__file__).parent / 'examples/zap/active-observer.js').read_text().replace(
+        observer.write_text((Path(__file__).resolve().parent.parent / 'examples/zap/active-observer.js').read_text().replace(
             '__AIXSEC_OUTPUT__', json.dumps(str(Path(workdir) / 'active-requests.jsonl'))))
         observer.chmod(0o600)
         jobs.append({'type': 'script', 'parameters': {'action': 'add', 'type': 'httpsender',

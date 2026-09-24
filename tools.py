@@ -121,7 +121,7 @@ def available_tools(config=None) -> tuple[set, dict]:
             avail.add(name)
         else:
             missing[name] = binary
-    from zap_adapter import executable
+    from adapters.zap import executable
     if not executable(config or {}):
         avail.difference_update({"zap_baseline", "zap_active_scan"})
     return avail, missing
@@ -2180,13 +2180,13 @@ def _gitleaks_scan(src: str) -> str:
 # ─────────────────────────────────────────────
 
 def _zap_baseline(**kw):
-    from zap_adapter import run_scan
+    from adapters.zap import run_scan
     return run_scan(kw["_config"], kw["url"], timeout=kw.get("_timeout"),
                     auth_context=kw.get("auth_context", "anonymous"), ajax=bool(kw.get("ajax", False)))
 
 
 def _zap_active_scan(**kw):
-    from zap_adapter import run_scan
+    from adapters.zap import run_scan
     return run_scan(kw["_config"], kw["url"], active=True, rule_ids=kw.get("rule_ids", []),
                     timeout=kw.get("_timeout"), auth_context=kw.get("auth_context", "anonymous"))
 

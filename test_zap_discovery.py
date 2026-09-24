@@ -6,7 +6,7 @@ import unittest
 from unittest.mock import MagicMock, patch
 
 from zap_discovery import Discovery
-from zap_adapter import build_plan, run_scan
+from adapters.zap import build_plan, run_scan
 from evidence import EvidenceStore
 from ledger import Ledger
 from inventory import Inventory
@@ -125,7 +125,7 @@ class DiscoveryTests(unittest.TestCase):
                 kwargs['stdout'].write('Job spiderAjax started\nJob spiderAjax finished\n')
                 kwargs['stdout'].flush()
                 return MagicMock(wait=MagicMock(return_value=0))
-            with patch('zap_adapter.executable',return_value='/fake/zap'),patch('zap_adapter.subprocess.Popen',side_effect=launch):
+            with patch('adapters.zap.executable',return_value='/fake/zap'),patch('adapters.zap.subprocess.Popen',side_effect=launch):
                 _, data = run_scan({'evidence_dir':root}, URL, ajax=True)
             self.assertEqual(data['coverage']['status'],'partial')
             self.assertEqual(data['coverage']['phases']['spiderAjax'],'failed')

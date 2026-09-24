@@ -525,7 +525,7 @@ class WebXAgent:
                 if name == "zap_active_scan" and getattr(self, "_zap_active_entry", None):
                     kw["_config"]["_zap_seed_entry"] = self._zap_active_entry
                 if name == "zap_active_scan" and getattr(self, "evidence_store", None):
-                    from zap_adapter import within
+                    from adapters.zap import within
                     from pathlib import Path
                     for coverage in reversed(self.evidence_store.coverage):
                         har = coverage.get("har_path", "")
@@ -1499,7 +1499,7 @@ class WebXAgent:
         elif force:
             self.capabilities = capability_report(force=True)
         if self.config.get("scan_backend", "auto") != "legacy":
-            from zap_adapter import executable
+            from adapters.zap import executable
             ready = executable(self.config) is not None
             return self.capabilities + [
                 {"tool": name, "binary": self.config.get("zap_executable", "zap.sh"),
