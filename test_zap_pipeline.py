@@ -18,7 +18,7 @@ from ledger import Ledger
 from pipeline import record_result
 from scope import ScopePolicy
 from tools import TOOL_INDEX
-from zap_adapter import build_plan, parse_report, run_scan, within
+from adapters.zap import build_plan, parse_report, run_scan, within
 
 URL = 'https://example.test/'
 
@@ -272,7 +272,7 @@ class ZapExecutorTests(unittest.TestCase):
                 process = MagicMock()
                 process.wait.return_value = 0
                 return process
-            with patch('zap_adapter.executable', return_value='/fake/zap'), patch('zap_adapter.subprocess.Popen', side_effect=launch):
+            with patch('adapters.zap.executable', return_value='/fake/zap'), patch('adapters.zap.subprocess.Popen', side_effect=launch):
                 text, data = run_scan(config(root), URL)
             self.assertEqual(data['coverage']['status'], 'complete')
             self.assertEqual(len(data['alerts']), 1)
@@ -288,7 +288,7 @@ class ZapExecutorTests(unittest.TestCase):
                 dest = Path(argv[-1]).parent
                 (dest / 'report.json').write_text(json.dumps(report()))
                 return proc
-            with patch('zap_adapter.executable', return_value='/fake/zap'), patch('zap_adapter.subprocess.Popen', side_effect=launch), patch('zap_adapter.os.killpg') as kill:
+            with patch('adapters.zap.executable', return_value='/fake/zap'), patch('adapters.zap.subprocess.Popen', side_effect=launch), patch('adapters.zap.os.killpg') as kill:
                 _, data = run_scan(config(root), URL, timeout=1)
             kill.assert_called_once()
             self.assertEqual(data['coverage']['status'], 'timeout')
@@ -322,7 +322,7 @@ class ZapAdditionalContracts(unittest.TestCase):
                 (dest / 'report.json').write_text(json.dumps(report()))
                 (dest / 'urls.txt').write_text(URL)
                 return MagicMock(wait=MagicMock(return_value=0))
-            with patch('zap_adapter.executable', return_value='/fake/zap'), patch('zap_adapter.build_plan', return_value={'env': {}, 'jobs': []}), patch('zap_adapter.subprocess.Popen', side_effect=launch):
+            with patch('adapters.zap.executable', return_value='/fake/zap'), patch('adapters.zap.build_plan', return_value={'env': {}, 'jobs': []}), patch('adapters.zap.subprocess.Popen', side_effect=launch):
                 _, data = run_scan(config(root), URL, auth_context='user_A')
             self.assertEqual(data['coverage']['auth_state'], 'unverified')
             self.assertEqual(data['coverage']['status'], 'partial')
@@ -370,19 +370,19 @@ class ZapAdditionalContracts(unittest.TestCase):
 
 class MacLauncherTests(unittest.TestCase):
     def test_default_launcher_discovers_application_bundle(self):
-        from zap_adapter import executable
-        with patch('zap_adapter.sys.platform', 'darwin'), patch('zap_adapter.shutil.which', return_value=None), patch('zap_adapter.Path.is_file', side_effect=lambda: True), patch('zap_adapter.os.access', side_effect=lambda p, mode: str(p).startswith('/Applications/')):
+        from adapters.zap import executable
+        with patch('adapters.zap.sys.platform', 'darwin'), patch('adapters.zap.shutil.which', return_value=None), patch('adapters.zap.Path.is_file', side_effect=lambda: True), patch('adapters.zap.os.access', side_effect=lambda p, mode: str(p).startswith('/Applications/')):
             self.assertEqual(executable({}), '/Applications/ZAP.app/Contents/MacOS/ZAP.sh')
 
     def test_explicit_missing_launcher_does_not_silently_fallback(self):
-        from zap_adapter import executable
-        with patch('zap_adapter.sys.platform', 'darwin'), patch('zap_adapter.shutil.which', return_value=None), patch('zap_adapter.Path.is_file', return_value=False):
+        from adapters.zap import executable
+        with patch('adapters.zap.sys.platform', 'darwin'), patch('adapters.zap.shutil.which', return_value=None), patch('adapters.zap.Path.is_file', return_value=False):
             self.assertIsNone(executable({'zap_executable': '/missing/custom-zap'}))
 
 
 class MacCliCommandTests(unittest.TestCase):
     def test_app_bundle_uses_bundled_java_and_jar(self):
-        from zap_adapter import launch_command
+        from adapters.zap import launch_command
         with tempfile.TemporaryDirectory() as root:
             contents = Path(root) / 'ZAP.app' / 'Contents'
             (contents / 'MacOS').mkdir(parents=True)
@@ -393,45 +393,45 @@ class MacCliCommandTests(unittest.TestCase):
             java.chmod(0o700)
             jar = contents / 'Java' / 'zap-2.17.0.jar'
             jar.touch()
-            with patch('zap_adapter.sys.platform', 'darwin'):
+            with patch('adapters.zap.sys.platform', 'darwin'):
                 cmd = launch_command(str(contents / 'MacOS' / 'ZAP.sh'))
             self.assertEqual(cmd[0], str(java))
             self.assertEqual(cmd[-2:], ['-jar', str(jar)])
             self.assertIn('-Djava.awt.headless=true', cmd)
 
     def test_non_bundle_launcher_is_unchanged(self):
-        from zap_adapter import launch_command
+        from adapters.zap import launch_command
         self.assertEqual(launch_command('/opt/zap.sh'), ['/opt/zap.sh'])
 
 
 class LinuxLauncherTests(unittest.TestCase):
     def test_kali_prefers_zaproxy_on_path(self):
-        from zap_adapter import executable, launch_command
-        with patch('zap_adapter.sys.platform', 'linux'), patch('zap_adapter.shutil.which', side_effect=lambda name: '/usr/bin/' + name):
+        from adapters.zap import executable, launch_command
+        with patch('adapters.zap.sys.platform', 'linux'), patch('adapters.zap.shutil.which', side_effect=lambda name: '/usr/bin/' + name):
             self.assertEqual(executable({}), '/usr/bin/zaproxy')
             self.assertEqual(launch_command(executable({})), ['/usr/bin/zaproxy'])
 
     def test_upstream_launcher_on_path(self):
-        from zap_adapter import executable
-        with patch('zap_adapter.sys.platform', 'linux'), patch('zap_adapter.shutil.which', side_effect=lambda name: '/opt/ZAP/zap.sh' if name == 'zap.sh' else None):
+        from adapters.zap import executable
+        with patch('adapters.zap.sys.platform', 'linux'), patch('adapters.zap.shutil.which', side_effect=lambda name: '/opt/ZAP/zap.sh' if name == 'zap.sh' else None):
             self.assertEqual(executable({}), '/opt/ZAP/zap.sh')
 
     def test_kali_launcher_outside_path(self):
-        from zap_adapter import executable
-        with patch('zap_adapter.sys.platform', 'linux'), patch('zap_adapter.shutil.which', return_value=None), patch('zap_adapter.Path.is_file', return_value=True), patch('zap_adapter.os.access', side_effect=lambda path, mode: path == '/usr/share/zaproxy/zap.sh'):
+        from adapters.zap import executable
+        with patch('adapters.zap.sys.platform', 'linux'), patch('adapters.zap.shutil.which', return_value=None), patch('adapters.zap.Path.is_file', return_value=True), patch('adapters.zap.os.access', side_effect=lambda path, mode: path == '/usr/share/zaproxy/zap.sh'):
             self.assertEqual(executable({}), '/usr/share/zaproxy/zap.sh')
 
     def test_explicit_missing_override_is_not_replaced(self):
-        from zap_adapter import executable
-        with patch('zap_adapter.sys.platform', 'linux'), patch('zap_adapter.shutil.which', side_effect=lambda name: '/usr/bin/zaproxy' if name == 'zaproxy' else None), patch('zap_adapter.Path.is_file', return_value=False):
+        from adapters.zap import executable
+        with patch('adapters.zap.sys.platform', 'linux'), patch('adapters.zap.shutil.which', side_effect=lambda name: '/usr/bin/zaproxy' if name == 'zaproxy' else None), patch('adapters.zap.Path.is_file', return_value=False):
             self.assertIsNone(executable({'zap_executable': '/Applications/ZAP.app/Contents/MacOS/ZAP.sh'}))
 
     def test_explicit_custom_launcher_wins(self):
-        from zap_adapter import executable
-        with patch('zap_adapter.sys.platform', 'linux'), patch('zap_adapter.shutil.which', return_value=None), patch('zap_adapter.Path.is_file', return_value=True), patch('zap_adapter.os.access', return_value=True):
+        from adapters.zap import executable
+        with patch('adapters.zap.sys.platform', 'linux'), patch('adapters.zap.shutil.which', return_value=None), patch('adapters.zap.Path.is_file', return_value=True), patch('adapters.zap.os.access', return_value=True):
             self.assertEqual(executable({'zap_executable': '/opt/custom/zap.sh'}), '/opt/custom/zap.sh')
 
     def test_no_installation_returns_none(self):
-        from zap_adapter import executable
-        with patch('zap_adapter.sys.platform', 'linux'), patch('zap_adapter.shutil.which', return_value=None), patch('zap_adapter.Path.is_file', return_value=False):
+        from adapters.zap import executable
+        with patch('adapters.zap.sys.platform', 'linux'), patch('adapters.zap.shutil.which', return_value=None), patch('adapters.zap.Path.is_file', return_value=False):
             self.assertIsNone(executable({}))

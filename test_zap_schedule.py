@@ -6,7 +6,7 @@ import unittest
 from unittest.mock import patch
 
 from zap_schedule import family, ScanSchedule
-from zap_adapter import build_plan
+from adapters.zap import build_plan
 from config import load_config
 from agent import WebXAgent
 from tools import TOOL_INDEX

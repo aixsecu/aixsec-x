@@ -12,7 +12,7 @@ import threading
 import unittest
 
 from config import load_config
-from zap_adapter import run_scan
+from adapters.zap import run_scan
 
 
 @unittest.skipUnless(os.environ.get('WEBX_TEST_LIVE_ZAP') == '1', 'opt-in real ZAP/browser test')

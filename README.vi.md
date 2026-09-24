@@ -1,5 +1,7 @@
 > **4.2.0 — ZAP + Evidence pipeline:** baseline chạy trước AI; finding/risk lấy từ evidence và validator. Mặc định `WEBX_SCAN_BACKEND=auto` chọn ZAP nếu có, nếu không chỉ thu HTTP observation (coverage chưa đầy đủ). Wapiti gate cũ chỉ còn trong `legacy`. Xem [cấu hình, auth, policy và giới hạn](docs/ZAP_PIPELINE.md). Các ví dụ Wapiti-first bên dưới mô tả chế độ legacy.
 
+Các tích hợp scanner nằm trong `adapters/` (`adapters/zap.py` dành cho ZAP). Adapter cho scanner mới sẽ được thêm vào package này; phần lập lịch và xử lý bằng chứng dùng chung vẫn tách riêng.
+
 Với website có form hoặc AJAX, baseline hiện bật AJAX Spider mặc định
 (`WEBX_ZAP_AJAX=1`), dùng `firefox-headless`. Cần trình duyệt và add-on
 WebDriver/Selenium tương thích; đặt `WEBX_ZAP_BROWSER=chrome-headless` để dùng Chrome.
