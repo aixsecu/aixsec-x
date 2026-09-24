@@ -41,8 +41,11 @@ def load_config() -> dict:
         "zap_auth_context": os.environ.get("WEBX_ZAP_AUTH_CONTEXT", "anonymous"),
         "zap_auth_file": os.environ.get("WEBX_ZAP_AUTH_FILE", ""),
         "zap_openapi_file": os.environ.get("WEBX_ZAP_OPENAPI_FILE", ""),
-        "zap_allowed_rules": [int(x.strip()) for x in os.environ.get("WEBX_ZAP_ALLOWED_RULES", "").split(",") if x.strip()],
-        "allow_active_scan": os.environ.get("WEBX_ALLOW_ACTIVE_SCAN", "0") == "1",
+        "zap_allowed_rules": ('all' if os.environ.get("WEBX_ZAP_ALLOWED_RULES", "all").strip().lower() == 'all'
+                              else [int(x.strip()) for x in os.environ.get("WEBX_ZAP_ALLOWED_RULES", "").split(",") if x.strip()]),
+        "allow_active_scan": os.environ.get("WEBX_ALLOW_ACTIVE_SCAN", "1") == "1",
+        "zap_auto_active": os.environ.get("WEBX_ZAP_AUTO_ACTIVE", "1") == "1",
+        "zap_history_namespace": os.environ.get("WEBX_ZAP_HISTORY_NAMESPACE", "default"),
         "allow_sqlmap": os.environ.get("WEBX_ALLOW_SQLMAP", "0") == "1",
         "allow_content_discovery": os.environ.get("WEBX_ALLOW_CONTENT_DISCOVERY", "1") == "1",
         "allow_extraction": os.environ.get("WEBX_ALLOW_EXTRACTION", "0") == "1",

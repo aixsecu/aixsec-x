@@ -1,3 +1,14 @@
+## Automatic active scheduling and structural deduplication
+
+- Resolve `WEBX_ZAP_ALLOWED_RULES=all` from the installed ZAP rule catalog.
+- Schedule active tests on captured request families before the LLM; active
+  scheduling/permission now default on, with existing execution approvals intact.
+- Import one representative request per family; no repeat crawl during its active test.
+- Persist atomic per-family/per-rule reservations across sessions, and report
+  unrun, reserved, unverified and observed-request states separately.
+- Preserve method, body schema, authentication context and routing parameters
+  when grouping query values, numeric path IDs and UUIDs.
+
 ## Form/API discovery and browser coverage
 
 - Enable bounded AJAX Spider by default, with configurable browser, clickable tags,

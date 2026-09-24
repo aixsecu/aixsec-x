@@ -1,7 +1,7 @@
 # AIXSEC-X 4.2 — Baseline-first ZAP and evidence pipeline
 
 The default `run()` path now executes a configured baseline before consulting
-Ollama. The model chooses follow-up actions; it cannot insert arbitrary findings,
+Ollama. A deterministic active scheduler then tests captured request families; the model chooses further follow-up actions; it cannot insert arbitrary findings,
 set severity, or mark an alert confirmed in the final report.
 
 ```text
@@ -84,7 +84,7 @@ The `--recon` preflight output is not reused as evidence in that new session.
 export WEBX_ZAP_AJAX=1
 export WEBX_ZAP_OPENAPI_FILE=/absolute/path/to/bundled-openapi.json
 export WEBX_ALLOW_ACTIVE_SCAN=1
-export WEBX_ZAP_ALLOWED_RULES=40018
+export WEBX_ZAP_ALLOWED_RULES=all
 ```
 
 The OpenAPI file must be local JSON, with bundled internal references. External
@@ -92,14 +92,14 @@ The OpenAPI file must be local JSON, with bundled internal references. External
 origin is fixed by the dispatcher and plan; auth URLs must use the same origin.
 AJAX is opt-in because it starts a browser and can exercise application actions.
 
-The planner may call `zap_active_scan(url, rule_ids, auth_context)` only with rule
-IDs allowed by the operator. The generated policy turns every rule off and then
+The scheduler and planner may call `zap_active_scan(url, rule_ids, auth_context, request_id)` only with rule
+IDs allowed by the operator. `all` resolves to the installed rule catalog exported by ZAP; a comma-separated list restricts the policy. The generated policy turns every rule off and then
 enables the requested IDs at low strength. Select installed rule IDs from the
 [ZAP alert catalog](https://www.zaproxy.org/docs/alerts/). A broad category such as
 XSS can require several different rules/add-ons; the adapter does not claim
 complete category coverage simply because the scan ran.
 
-The baseline does not run active scan. Both baseline and active scan pass through
+The baseline itself does not run active scan; the scheduler runs afterward, before the LLM. Both baseline and active scan pass through
 existing scope and auto-exec approval checks. ZAP context limits scope; browser
 subresources/redirect behavior is not a network egress firewall.
 
@@ -172,7 +172,7 @@ Warnings, malformed reports and incomplete authentication cannot report complete
 
 | Setting | Default | Meaning |
 |---|---:|---|
-| `WEBX_ALLOW_ACTIVE_SCAN` | 0 | Permit targeted ZAP active scan and evidence replay |
+| `WEBX_ALLOW_ACTIVE_SCAN` | 1 | Permit targeted ZAP active scan and evidence replay |
 | `WEBX_ALLOW_SQLMAP` | 0 | Permit sqlmap only for an existing SQLi candidate on that endpoint |
 | `WEBX_ALLOW_CONTENT_DISCOVERY` | 1 | Permit ffuf discovery, still subject to normal approval |
 | `WEBX_ALLOW_EXTRACTION` | 0 | Separate permission for blind SQLi data extraction |
@@ -262,7 +262,7 @@ The planner now receives parameterized discovery leads and coverage gaps. Active
 scans still require `WEBX_ALLOW_ACTIVE_SCAN=1` and `WEBX_ZAP_ALLOWED_RULES`.
 For a selected endpoint, the adapter imports matching captures from the same
 session/authentication context without replay, preserving POST bodies for ZAP.
-No automatic bulk active scan is enabled. Captured request counters in a seeded
+Automatic active scheduling is now enabled; it operates on one captured representative per request family, within session budgets. Captured request counters in a seeded
 scan can include imported history, not just newly sent requests.
 
 `coverage.status` describes job execution, not application-wide completion.
@@ -287,3 +287,69 @@ WEBX_TEST_LIVE_ZAP=1 python3 -m unittest test_zap_live -v
 The opt-in test starts only a localhost server and checks an AJAX click, POST
 form submission, and a targeted active scan seeded with the recorded POST body.
 Ordinary unit-test runs skip this browser-dependent test.
+
+
+## Automatic multi-rule scheduling and persistent deduplication
+
+Defaults now select all installed ZAP active rules and schedule them after the
+baseline, even when the LLM is unavailable. ZAP passive rules still analyze the
+baseline traffic. This covers the checks implemented by installed add-ons, not
+all possible vulnerabilities: business logic and multi-user authorization require
+separate workflow/identity tests. Missing add-ons are not silently substituted.
+Script Console and GraalVM JavaScript are required to export the installed rule
+catalog as well as to record active-request evidence.
+
+```bash
+export WEBX_SCAN_BACKEND=zap
+export WEBX_ZAP_AUTO_ACTIVE=1
+export WEBX_ALLOW_ACTIVE_SCAN=1
+export WEBX_ZAP_ALLOWED_RULES=all
+# To restrict rules, for example: WEBX_ZAP_ALLOWED_RULES=40012,40018
+# To remain discovery/passive-only: WEBX_ALLOW_ACTIVE_SCAN=0
+```
+
+Existing `WEBX_AUTO_EXEC` approvals, scope checks and action/time/request estimates
+remain in effect. The defaults changed from passive-only: set the opt-out above
+when active testing is not wanted. An existing explicit `WEBX_ZAP_ALLOWED_RULES=40018`
+continues to restrict scans to that rule until changed to `all`.
+
+A family includes normalized origin/port, path, HTTP method, query parameter
+names (including multiplicity), body media type/schema and authentication context.
+Numeric path segments and UUIDs are generalized. Values of routing keys such as
+`action`, `act`, `type`, `view`, `route`, `controller`, `task`, `operation` and `op`
+are preserved. Unknown slugs remain distinct to avoid merging unrelated handlers.
+
+Examples: `/users/12?q=a` and `/users/34?q=b` share a family; GET and POST do not.
+`/api?act=search` and `/api?act=delete` do not share a family. JSON fields and
+query fields are distinct. Opaque bodies are hashed rather than guessed.
+Static asset extensions are omitted from active scheduling; passive analysis still
+covers their captured responses. Endpoint headers, cookies and the original body
+are retained privately for the selected representative; values are not invented.
+
+The active plan imports exactly one captured request, without replay, and skips
+re-crawling/OpenAPI import. It uses a context restricted to that endpoint. Each
+family/rule pair is reserved atomically in `WEBX_EVIDENCE_DIR/scan-history.sqlite3`.
+This applies to automatic and planner-requested ZAP active actions and persists
+across runs. One scan per rule means one test campaign, not one HTTP request;
+a rule may need multiple payloads/control requests.
+
+The final report and `active-schedule.json` list every eligible family and rule.
+`artifact_ref` links an earlier attempt to its scanner report; historical findings
+are not silently treated as newly verified findings in the current session:
+
+- `not_run`: not scheduled, for example because budgets were exhausted.
+- `reserved`: a run claimed it; an interrupted process may leave this state.
+- `attempted_unverified`: execution was attempted, but no rule-attributed request
+  was observed. It must not be interpreted as a completed vulnerability test.
+- `requests_observed`: at least one attributed request was captured; not proof
+  of either vulnerability or safety.
+
+Denied/blocked actions release reservations. Other attempts are not automatically
+repeated, including failures/timeouts, to respect the no-repeat policy. Review
+unverified attempts and the `stop_reason`; budgets can leave checks unrun. The
+estimated request budget is not a hard network-request counter.
+
+To intentionally retest a new application deployment or previously unverified
+attempts, choose a new `WEBX_ZAP_HISTORY_NAMESPACE` (default `default`). This does
+not erase old history. Reuse the same evidence directory and namespace to retain
+deduplication; deleting them or moving to a new directory starts fresh history.

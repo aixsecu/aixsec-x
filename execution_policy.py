@@ -12,11 +12,14 @@ def check_action(config, name, args, store=None):
     if name.startswith('zap_'):
         if name == 'zap_active_scan':
             selected = args.get('rule_ids') or []
+            allowed = config.get('zap_allowed_rules', [])
+            if allowed == 'all':
+                allowed = [r['id'] for r in getattr(store, 'active_rules', [])]
             if not config.get('allow_active_scan', False):
                 return 'Active scan disabled by WEBX_ALLOW_ACTIVE_SCAN'
             if (not isinstance(selected, list) or not selected
                     or any(type(value) is not int for value in selected)
-                    or not set(selected) <= set(config.get('zap_allowed_rules', []))):
+                    or not set(selected) <= set(allowed)):
                 return 'Requested ZAP rules are not in the operator allowlist'
     if name in ('sqlmap_runner', 'sqlmap_check'):
         if not config.get('allow_sqlmap', False):
