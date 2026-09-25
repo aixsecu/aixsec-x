@@ -10,7 +10,7 @@ There is no session-wide time, action or estimated-request cap. The old
 `mode=sequential` and null limits. Local executor limits remain: ZAP phase/process
 timeouts, Nuclei batch timeout, HTTP request timeout, rate limits and LLM timeouts.
 The Planner retains `WEBX_MAX_ROUNDS`, stops after two model failures or when it
-returns no actions or makes no successful new action. A scanner's completion
+returns no actions or adds no new observed endpoint, evidence, auth or validation facts. Fresh scan IDs and changing response hashes alone are not progress. A scanner's completion
 means execution finished, not that every vulnerability has been excluded.
 
 ## Kali configuration
@@ -38,19 +38,51 @@ and Nuclei. `WEBX_NUCLEI_ENABLED=0` disables Nuclei alone.
 
 ## Supported Nuclei coverage
 
-`adapters/nuclei.py` lists local templates with operator filters. It selects HTTP
-path templates rooted at `{{BaseURL}}` or `{{RootURL}}`. Raw requests, flow/code,
-headless/browser, network protocols, unsafe/race/fuzzing and redirects are excluded;
-OAST is disabled and dos/fuzz/bruteforce tags are excluded. The catalog records
-eligible/excluded counts. This is intentionally a subset of Nuclei templates, not
-an assertion that every installed template ran. No match is not a safety verdict.
+`adapters/nuclei.py` lists local templates with operator filters. Supported HTTP
+requests include path templates rooted at `{{BaseURL}}`/`{{RootURL}}` and ordinary
+raw HTTP with a relative path and exactly `Host: {{Hostname}}`. Raw framing/proxy
+overrides, unsafe/race/fuzzing, flow/code, headless and OAST remain excluded. Each
+rejected template path and reason is recorded in `nuclei-catalog.json`; binding gaps
+are recorded in `nuclei-bindings.json`. These paths are linked in the final report.
 
-RootURL-only templates are grouped by origin; BaseURL templates use captured GET
-request families. Configured targets are also included. Authenticated/POST captures
-are not silently converted to public GET tests. Nuclei findings are anonymous
-observations and are not evidence of authenticated coverage. Templates are batched
-(up to 64) per representative, with one batch running at a time. Hashes are checked
-before launching to reject templates changed since cataloging.
+RootURL/literal raw paths group by origin. BaseURL paths group by request family.
+Captured GET/POST/PUT/PATCH bodies can be used with an operator-selected single-raw
+request template whose request URI is `{{AIXSECPath}}` and body is `{{AIXSECBody}}`.
+The template method must match the captured method. These variables preserve the
+captured query/body; ordinary templates are not rewritten into POST tests. Example
+binding (an observation template, not proof of a vulnerability):
+
+```yaml
+id: captured-json-observation
+info:
+  name: Authenticated JSON response observed
+  author: operator
+  severity: info
+http:
+  - raw:
+      - |
+        POST {{AIXSECPath}} HTTP/1.1
+        Host: {{Hostname}}
+        Content-Type: application/json
+
+        {{AIXSECBody}}
+    matchers:
+      - type: word
+        words: [YOUR_AUTHENTICATED_RESPONSE_MARKER]
+```
+
+Non-hop-by-hop captured headers, including cookies, authorization and custom CSRF
+headers, are written to a private Nuclei configuration file, not command-line
+arguments. A named context must pass a fresh control using the existing
+`WEBX_ZAP_AUTH_FILE` origin and logged-in/logged-out markers before credentials
+are reused. Expired/ambiguous auth stops the campaign with an explicit error.
+Anonymous captures carrying cookies are marked `captured_unverified`; this is not
+proof of a logged-in identity. No authenticated capture is relabelled as anonymous.
+
+Templates are batched up to 64 per representative. Hashes are checked before launch.
+`coverage.templates` distinguishes campaign completion from unverified attempts;
+it does not claim that every internal request succeeded. Flow/headless/OAST need
+separate scope, browser-session and callback evidence handling before enablement.
 
 Private `report.jsonl` stores original scanner evidence; `nuclei.log` stores runtime
 output. Only normalized metadata/hashes are exposed to the model and Evidence
@@ -79,8 +111,11 @@ export WEBX_RETRY_INCOMPLETE=1
 
 Resume requires the original configuration, evidence root and namespace. It loads
 completed observations into the same session and only dispatches missing work.
-Authentication setup can be refreshed; a resume is not a claim that old sessions or
-findings have been freshly revalidated. An interrupted in-flight task is retried:
+Restored coverage is labelled `restored_not_revalidated`. Auth profile changes reject
+resume and require a new discovery session. Remaining authenticated actions perform
+a fresh control; old findings are not automatically revalidated. Changed/missing
+Nuclei template revisions are listed in `nuclei-resume-check.json` and make coverage
+partial; old templates are not silently substituted. An interrupted in-flight task is retried:
 exactly-once network execution across a crash cannot be guaranteed. Without the
 retry flag, recorded failures are retained rather than automatically repeated.
 To scan a new deployment, unset resume and choose a new history namespace. Do not
@@ -89,16 +124,23 @@ private because HARs, checkpoint arguments and response bodies can contain secre
 
 ## SQLi verification
 
-SQL candidates with a named parameter and matching captured GET or URL-encoded
-POST request receive two fresh control/apostrophe-payload pairs. A new SQL error
-must recur in both payload responses and be absent from both successful controls.
-Artifacts retain the pair facts. Reproduced SQL errors remain candidates: they are
-not proof of exploitability or data extraction. Unsupported/ambiguous inputs are
-reported as incomplete rather than synthesized.
+SQL candidates support query parameters, URL-encoded forms and nested JSON
+(GET/POST/PUT/PATCH). JSON locations accept JSON Pointer, a unique field name or
+common dotted/indexed paths. Duplicate query/form names are tested one occurrence
+at a time; duplicate JSON object keys are rejected rather than silently collapsed.
+Unchanged query/form bytes and captured headers are retained. Each location gets
+two fresh control/apostrophe-payload pairs within the per-tool timeout. Only pairs
+with successful controls and repeated new SQL errors create an observation.
+Named auth contexts additionally require fresh authentication markers on controls.
+Artifacts record the exact input selector. Reproduced SQL errors remain candidates,
+not proof of exploitability or extraction. The offline ZAP comparator also recognizes
+one changed nested JSON field and records its JSON Pointer.
 
 When `WEBX_ALLOW_SQLMAP=1`, the scheduled verifier supplies the captured request to
 sqlmap with only boolean/error checks, a bounded runtime and a single named
-parameter. It does not request database enumeration or data dumping. Raw request
+parameter. Ambiguous duplicate names stay with the paired verifier rather than being
+passed ambiguously to sqlmap. JSON Pointer selectors resolve to a unique sqlmap
+field name. Authentication is checked before launch. It does not request database enumeration or data dumping. Raw request
 credentials stay in a private request file. SQLmap observations also remain
 candidates pending independent validation. Generic ffuf, workflow/auth testing,
 SAST correlation and HTTP exploration still depend on Planner decisions.
@@ -113,3 +155,22 @@ without invoking completed tools:
 python3 -m unittest test_sequential_pipeline test_nuclei_adapter test_verification
 WEBX_TEST_LIVE_SEQUENTIAL=1 python3 -m unittest test_sequential_pipeline.LiveSequentialTests -v
 ```
+
+
+## Expanded local/Kali checks
+
+```bash
+# Offline regression tests (external scanners disabled/mocked):
+WEBX_NUCLEI_ENABLED=0 python3 -m unittest discover
+# Actual local scanners only; synthetic localhost, not an external target:
+WEBX_TEST_LIVE_CAPTURE=1 python3 -m unittest test_capture_expansion.LiveCaptureTests -v
+WEBX_TEST_LIVE_SEQUENTIAL=1 python3 -m unittest test_sequential_pipeline.LiveSequentialTests -v
+```
+
+The capture fixture verifies raw POST JSON, cookie and CSRF propagation, named auth,
+and SQL error pairs. It is portable to Kali with the Python requirements and Nuclei
+installed. Browser/AJAX compatibility is a separate optional test in `test_zap_live`.
+These commands do not package a ZIP. The latest expansion was verified on macOS;
+a native Kali run is still required to establish environment-specific compatibility.
+
+Raw HTTP syntax reference: [ProjectDiscovery documentation](https://docs.projectdiscovery.io/templates/protocols/http/raw-http).

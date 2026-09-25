@@ -48,7 +48,7 @@ class VerificationTests(unittest.TestCase):
                 kwargs['stdout'].write('Parameter: q (GET)\n    Type: boolean-based blind\nPRIVATE output\n')
                 process=MagicMock();process.wait.return_value=0
                 return process
-            with patch('shutil.which',return_value='/fake/sqlmap'),patch('verification.subprocess.Popen',side_effect=launch):
+            with patch('shutil.which',return_value='/fake/sqlmap'),patch('verification.subprocess.Popen',side_effect=launch),patch('captured_auth.preflight',return_value='verified'):
                 output,data=sqlmap_probe({'evidence_dir':root},entry,'q',timeout=10)
             self.assertIn('--technique=BE',commands[0])
             self.assertFalse(set(commands[0]) & {'--dbs','--tables','--dump','--current-user','--banner'})

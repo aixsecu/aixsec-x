@@ -372,13 +372,11 @@ Truncation flags and a byte-limit marker expose incomplete retention. The separa
 metadata stream continues after the response capture limit. Hashes describe original
 unredacted input/body; stored text is not necessarily hash-equivalent.
 
-The offline SQL error comparator currently handles query parameters and URL-encoded
-forms for ZAP rule 40018. It requires the same origin/path/method as a successful
+The offline SQL error comparator handles query parameters, URL-encoded forms and nested JSON for ZAP rule 40018. It requires the same origin/path/method as a successful
 captured control, unchanged parameter names/order, exactly one changed value, and a
 recognized SQL error absent from the control. It recognizes custom `syntax error: select`
 responses as well as MySQL syntax errors and SQLSTATE class 42. It does not infer
-injection from HTTP 200, a generic error, or a database technology name. JSON/opaque
-bodies are retained where supported but not attributed by this comparator.
+injection from HTTP 200, a generic error, or a database technology name. Nested JSON fields are attributed by JSON Pointer; opaque bodies remain unsupported.
 The control can be stale: results remain candidates needing repeated paired validation,
 not confirmed SQLi. This adds no extra network requests and does not extract data.
 

@@ -1,3 +1,12 @@
+## Captured request and authentication improvements
+
+- Added nested JSON selectors and per-occurrence query/form mutation; retained duplicate order and untouched query/form bytes.
+- Added fresh authentication controls, custom-header propagation, expired-session handling and auth-profile checks on resume.
+- Extended Nuclei to scoped raw HTTP and capture-bound request bodies with per-template exclusion/binding diagnostics.
+- Labelled restored evidence as not freshly revalidated and reported changed/missing template revisions.
+- Replaced tool-success progress with observed-fact progress; fixed checkpoint handling of status tools returning coverage lists.
+- Added local authenticated JSON/Nuclei integration and offline regression tests. No release ZIP generated for this change.
+
 ## Sequential scanner pipeline
 
 - Removed modern pipeline session-wide time/action/request-estimate gates; retained per-tool limits.

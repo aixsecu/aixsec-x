@@ -68,8 +68,18 @@ def analyze(directory, target, rules, auth_context, scan_id):
                     if post.get('mimeType', '').split(';')[0] == 'application/x-www-form-urlencoded':
                         before += parse_qsl(post.get('text', ''), keep_blank_values=True)
                         after += parse_qsl(row.get('request_body', ''), keep_blank_values=True)
+                    elif 'json' in post.get('mimeType','').lower():
+                        from request_inputs import load_json
+                        def flatten(value,path=''):
+                            if isinstance(value,dict):
+                                return [pair for k,v in sorted(value.items()) for pair in flatten(v,path+'/'+k.replace('~','~0').replace('/','~1'))]
+                            if isinstance(value,list):
+                                return [pair for i,v in enumerate(value) for pair in flatten(v,path+'/'+str(i))]
+                            return [(path,value)]
+                        before += flatten(load_json(post.get('text','')))
+                        after += flatten(load_json(row.get('request_body','')))
                     elif post.get('text') or row.get('request_body'):
-                        continue  # Do not invent parameter attribution for opaque/JSON bodies.
+                        continue  # Opaque bodies require a location-aware executor.
                     if [k for k,v in before] != [k for k,v in after]:
                         continue
                     changed = [k for (k,v),(_,w) in zip(before, after) if v != w and not SENSITIVE.search(k)]
