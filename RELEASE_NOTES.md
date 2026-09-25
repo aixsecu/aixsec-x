@@ -1,3 +1,11 @@
+## Sequential scanner pipeline
+
+- Removed modern pipeline session-wide time/action/request-estimate gates; retained per-tool limits.
+- Added local HTTP Nuclei adapter, structured candidate ingestion and scanner/template revision history.
+- Added atomic stage/task checkpoints, namespace locking and explicit resume/retry of incomplete work.
+- Added fresh SQL error control/payload pairs and opt-in captured-request sqlmap verification without enumeration.
+- Reported skipped/missing/unsupported coverage explicitly; added offline and local scanner integration tests.
+
 ## Automatic active scheduling and structural deduplication
 
 - Resolve `WEBX_ZAP_ALLOWED_RULES=all` from the installed ZAP rule catalog.

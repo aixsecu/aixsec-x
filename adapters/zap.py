@@ -350,7 +350,7 @@ def run_scan(config, url, *, active=False, rule_ids=(), auth_context='anonymous'
                 stdout=log, stderr=subprocess.STDOUT, start_new_session=True, env=env)
             try:
                 code = process.wait(timeout=deadline)
-            except (subprocess.TimeoutExpired, KeyboardInterrupt):
+            except (subprocess.TimeoutExpired, KeyboardInterrupt) as interruption:
                 timed_out = True
                 try:
                     os.killpg(process.pid, signal.SIGTERM)
@@ -362,6 +362,8 @@ def run_scan(config, url, *, active=False, rule_ids=(), auth_context='anonymous'
                         pass
                     process.wait()
                 code = process.returncode
+                if isinstance(interruption, KeyboardInterrupt):
+                    raise
     finally:
         # Plan contains credentials resolved from operator environment.
         plan_path.unlink(missing_ok=True)

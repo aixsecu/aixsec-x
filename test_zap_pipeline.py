@@ -35,7 +35,7 @@ def report(rule='40018', risk='3', confidence='4'):
 
 def config(directory, **updates):
     value = load_config()
-    value.update(targets=[URL], scan_backend='zap', auto_exec='all', evidence_dir=str(directory),
+    value.update(nuclei_enabled=False, targets=[URL], scan_backend='zap', auto_exec='all', evidence_dir=str(directory),
                  zap_executable='/fake/zap', planner_enabled=False, max_rounds=2,
                  zap_allowed_rules=[40018], allow_active_scan=True)
     value.update(updates)
@@ -247,14 +247,14 @@ class ZapPipelineTests(unittest.TestCase):
             self.assertEqual(result['coverage'][0]['status'], 'timeout')
             self.assertEqual(len(result['findings']), 1)
 
-    def test_action_budget_limits_multiple_targets(self):
+    def test_retired_action_budget_does_not_skip_targets(self):
         with tempfile.TemporaryDirectory() as root:
             agent = WebXAgent(config(root, targets=[URL, 'https://other.test'], pipeline_max_actions=1))
             with patch.object(TOOL_INDEX['zap_baseline'], 'exec_fn', return_value=('scan', scanner_data(root))) as tool, contextlib.redirect_stdout(io.StringIO()):
                 result = agent.run('scan')
-            self.assertEqual(tool.call_count, 1)
-            self.assertEqual(result['budget']['actions'], 1)
-            self.assertEqual(result['coverage'][-1]['status'], 'blocked')
+            self.assertEqual(tool.call_count, 2)
+            self.assertEqual(result['budget']['actions'], 2)
+            self.assertIsNone(result['budget']['max_actions'])
 
 
 class ZapExecutorTests(unittest.TestCase):

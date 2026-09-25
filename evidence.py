@@ -75,7 +75,7 @@ class EvidenceStore:
             self.persist()
             return
         rows = []
-        if name in ('zap_baseline', 'zap_active_scan'):
+        if name in ('zap_baseline', 'zap_active_scan', 'nuclei_scan', 'sql_error_verify'):
             rows = data.get('alerts') or []
         elif name == 'wapiti_scan':
             for f in data.get('findings') or []:

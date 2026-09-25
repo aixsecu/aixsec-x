@@ -145,7 +145,8 @@ class ScanSchedule:
                 if outcome in ('denied', 'blocked', 'scope_rejected'):
                     db.execute('DELETE FROM attempts WHERE namespace=? AND family=? AND rule=?', (self.namespace, fid, rule))
                 else:
-                    state = ('responses_recorded' if rule in observed and rule in captured else
+                    state = (outcome if outcome in ('error', 'timeout', 'partial') else
+                             'responses_recorded' if rule in observed and rule in captured else
                              'requests_observed' if rule in observed else 'attempted_unverified')
                     artifact = ((result.get('data') or {}).get('coverage') or {}).get('report_path', '')
                     db.execute('UPDATE attempts SET state=?,artifact_ref=? WHERE namespace=? AND family=? AND rule=?', (state, artifact, self.namespace, fid, rule))
