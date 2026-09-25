@@ -67,3 +67,18 @@ fuser -v .aixsec-evidence/run-*.lock
 ```
 
 Wait for the existing scan or stop it in its original terminal. A job suspended with Ctrl+Z still holds its lock; resume it with `fg` in that shell before stopping it with Ctrl+C. Do not delete the lock file or change history namespace to bypass a running scan. An existing lock file alone does not block execution: the kernel releases the lock when the owner closes it or exits. Owner metadata can remain in the file after exit and is informational; lock acquisition is authoritative. Older running versions may have no PID metadata.
+
+## Cookie-aware concurrency diagnostics
+
+The console now prints `parallel eligible`, `serial`, and counts for each serial reason before dispatch. A group can have multiple reasons, so reason counts may exceed the serial group count. Private `zap-scheduling.json` contains request IDs and decisions without cookie/header values. Aggregate scheduling counts remain in the `zap_active` stage of `progress.json`. Eligibility counts describe the discovered schedule; they do not imply every group needs rerunning (history/resume still apply), or that every eligible worker is currently occupied.
+
+`WEBX_ZAP_COOKIE_PARALLEL=strict` is the default. Cookies in either the Cookie header or the structured HAR cookie list require serial execution. `anonymous` is only a configured label and does not establish that a cookie is unauthenticated.
+
+After verifying the captured cookies are guest sessions and the requests can execute independently, opt in for a **new session**:
+
+```bash
+export WEBX_ZAP_COOKIE_PARALLEL=guest
+export WEBX_ZAP_WORKERS=2
+```
+
+This mode changes only the cookie scheduling constraint. It does not remove, rewrite, or automatically classify cookies. Named authentication contexts, credential/CSRF headers, sensitive query parameter names, request bodies and non-GET/HEAD methods remain serial barriers. Custom authentication or state-changing GET endpoints may not be detectable from these fields; retain strict mode/one worker for such workflows. Rate pacing and history claims are unchanged. Raising the worker count alone cannot overcome serial constraints. Existing checkpoints require their original configuration; changing cookie mode requires a new session, retaining the same history namespace to preserve deduplication.

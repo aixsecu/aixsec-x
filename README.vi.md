@@ -271,6 +271,7 @@ Các công tắc boolean dùng `1` (bật) và `0` (tắt). Mặc định dướ
 |---|---|---|
 | `WEBX_ZAP_EXECUTABLE` | `zap.sh` | Tên/đường dẫn executable ZAP. Kali có thể dùng zaproxy; cơ chế tìm mặc định cũng dò bản cài theo hệ điều hành. |
 | `WEBX_ZAP_WORKERS` | `2` | Số worker ZAP active (1–8). Nhóm GET/HEAD anonymous không có credential chạy song song; request có session và method khác chạy tuần tự. |
+| `WEBX_ZAP_COOKIE_PARALLEL` | `strict` | `strict`: có cookie thì chạy tuần tự. `guest`: cho phép GET/HEAD anonymous mang cookie chạy song song khi operator đã xác định đây là phiên khách độc lập; giữ nguyên cookie. Đăng nhập, credential/CSRF header, query nhạy cảm và request có body vẫn chạy tuần tự. |
 | `WEBX_ZAP_ROUTE_GROUPS_FILE` | *(trống)* | File JSON nhóm route do operator khai báo để gộp slug; trống giữ cách nhóm cấu trúc mặc định. Xem hướng dẫn worker bên dưới. |
 | `WEBX_ZAP_TIMEOUT` | `600` | Timeout giây cho mỗi tiến trình ZAP, không phải tổng phiên. |
 | `WEBX_ZAP_STRENGTH` | `Medium` | Cường độ active scan: Low, Medium, High hoặc Insane; mức cao gửi nhiều payload hơn. |

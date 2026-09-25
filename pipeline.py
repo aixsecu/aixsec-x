@@ -286,13 +286,27 @@ def _run(agent, user_text):
             not bool(e['structure']['query'] or e['structure']['body']), e['url']))
         workers = max(1, min(8, int(cfg.get('zap_workers', 2))))
         if active_rules and representatives:
-            from zap_workers import drive
+            from zap_workers import drive, scheduling_summary
+            from scan_state import atomic
+            cookie_mode = cfg.get('zap_cookie_parallel', 'strict')
+            scheduling = scheduling_summary(representatives, workers, cookie_mode)
+            atomic(journal.directory / 'zap-scheduling.json', scheduling)
+            journal.data['stages']['zap_active']['scheduling'] = {
+                k:v for k,v in scheduling.items() if k != 'groups'}
+            journal.save()
+            print(f"[zap] parallel eligible={scheduling['parallel_eligible']}; "
+                  f"serial={scheduling['serial_groups']}; cookie mode={cookie_mode}", flush=True)
+            for reason, count in scheduling['serial_reasons'].items():
+                print(f'[zap] serial reason: {reason}={count}', flush=True)
+            if scheduling['serial_reasons'].get('cookie_requires_opt_in'):
+                print('[zap] Guest cookies can be allowed with WEBX_ZAP_COOKIE_PARALLEL=guest '
+                      'only after verifying these captures are unauthenticated and independent.', flush=True)
             print(f'[zap] {len(representatives)} request groups; {len(active_rules)} rules; {workers} workers', flush=True)
             def start(representative, cancelled):
                 return execution('zap_active_scan', {'url':representative['_entry']['request']['url'],
                     'request_id':representative['request_id'], 'auth_context':representative['auth_context'],
                     'rule_ids':active_rules}, scheduled=True, cancelled=cancelled)
-            schedule.stop_reason = drive(representatives, start, workers) or schedule.stop_reason
+            schedule.stop_reason = drive(representatives, start, workers, cookie_mode) or schedule.stop_reason
     elif backend == 'zap':
         schedule.stop_reason = 'Automatic active scanning disabled by operator configuration'
     close_stage('zap_active')

@@ -3,16 +3,55 @@ from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
 import threading
 
 
-def parallel_safe(entry):
+def scheduling_reasons(entry, cookie_mode='strict'):
+    """Return all serial constraints; anonymous is a label, not proof of logout."""
+    from urllib.parse import urlsplit, parse_qsl
+    import re
+    if cookie_mode not in ('strict', 'guest'):
+        raise ValueError('WEBX_ZAP_COOKIE_PARALLEL must be strict or guest')
     request = entry['_entry']['request']
-    # Shared login state and state-changing workflows must not race.
-    return (entry.get('auth_context', 'anonymous') == 'anonymous'
-            and request.get('method', 'GET').upper() in ('GET', 'HEAD')
-            and not any(h.get('name', '').lower() in ('cookie', 'authorization', 'x-api-key', 'x-csrf-token', 'x-xsrf-token')
-                        for h in request.get('headers', [])))
+    reasons = []
+    if entry.get('auth_context', 'anonymous') != 'anonymous':
+        reasons.append('authenticated_context')
+    if request.get('method', 'GET').upper() not in ('GET', 'HEAD'):
+        reasons.append('non_read_method')
+    names = {h.get('name', '').lower() for h in request.get('headers', [])}
+    if names & {'authorization', 'proxy-authorization', 'x-api-key'}:
+        reasons.append('credential_header')
+    if any(re.search(r'csrf|xsrf', name, re.I) for name in names):
+        reasons.append('csrf_header')
+    query_names = [k for k, _ in parse_qsl(urlsplit(request.get('url', '')).query, keep_blank_values=True)]
+    if any(re.search(r'csrf|xsrf|token|session|password|secret|api.?key', name, re.I) for name in query_names):
+        reasons.append('sensitive_query')
+    # Structured HAR cookies can carry credentials even when headers are omitted.
+    has_cookie = 'cookie' in names or bool(request.get('cookies'))
+    if has_cookie and cookie_mode == 'strict':
+        reasons.append('cookie_requires_opt_in')
+    if request.get('postData'):
+        reasons.append('request_body')
+    return reasons
 
 
-def drive(jobs, start, workers=2):
+def parallel_safe(entry, cookie_mode='strict'):
+    return not scheduling_reasons(entry, cookie_mode)
+
+
+def scheduling_summary(jobs, workers=2, cookie_mode='strict'):
+    from collections import Counter
+    counts = Counter()
+    rows = []
+    for entry in jobs:
+        reasons = scheduling_reasons(entry, cookie_mode)
+        counts.update(reasons)
+        rows.append({'request_id':entry.get('request_id'),
+                     'mode':'serial' if reasons else 'parallel_eligible', 'reasons':reasons})
+    eligible = sum(row['mode'] == 'parallel_eligible' for row in rows)
+    return {'workers':workers, 'cookie_mode':cookie_mode, 'total_groups':len(jobs),
+            'parallel_eligible':eligible, 'serial_groups':len(jobs)-eligible,
+            'serial_reasons':dict(counts), 'groups':rows}
+
+
+def drive(jobs, start, workers=2, cookie_mode='strict'):
     """start returns a generator: yield a callable, receive its result on caller thread."""
     cancelled = threading.Event()
     pool = ThreadPoolExecutor(max_workers=workers, thread_name_prefix='zap')
@@ -43,7 +82,10 @@ def drive(jobs, start, workers=2):
 
     try:
         for entry in jobs:
-            safe = parallel_safe(entry)
+            reasons = scheduling_reasons(entry, cookie_mode)
+            safe = not reasons
+            if reasons:
+                print('[zap] serial group: ' + ', '.join(reasons), flush=True)
             while pending and (len(pending) >= workers or not safe):
                 collect()
             if stop:

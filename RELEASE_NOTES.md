@@ -1,3 +1,9 @@
+## Cookie-aware ZAP worker diagnostics
+
+- Added serial reason counts and a private `zap-scheduling.json`, with aggregate counts retained in progress after stage completion.
+- Added `WEBX_ZAP_COOKIE_PARALLEL=strict|guest` (default strict). Explicit guest mode permits anonymous read requests with cookies to overlap without modifying captures; other authentication/body/CSRF constraints remain serial.
+- Structured HAR cookies now also trigger the strict constraint. Added classification, header preservation and concurrent cookie request tests; updated both env tables.
+
 ## ZAP parallel request groups
 
 - Added `WEBX_ZAP_WORKERS` (default 2, range 1–8), bounded active workers, serial barriers for session-bearing/non-GET requests, owner-thread evidence/checkpoint updates, progress and cancellation.

@@ -59,7 +59,7 @@ class Journal:
         atomic(self.path, self.data)
 
     def stage(self, name, status, reason=''):
-        self.data['stages'][name] = {'status':status, 'reason':reason}
+        self.data['stages'][name] = {**self.data['stages'].get(name, {}), 'status':status, 'reason':reason}
         self.save()
         print(f'[stage] {name}: {status}' + (f' — {reason}' if reason else ''), flush=True)
 
