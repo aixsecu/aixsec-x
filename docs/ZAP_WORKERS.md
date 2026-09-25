@@ -55,3 +55,15 @@ The two-JVM regression also checks that both scans produce rule evidence and sha
 ```bash
 WEBX_TEST_LIVE_ZAP_WORKERS=1 python3 -m unittest test_zap_workers.LiveWorkerTests
 ```
+
+## Another scan is using this history namespace
+
+A pipeline holds an OS file lock for its evidence directory/history namespace. This is separate from the internal ZAP worker pool: increasing workers does not require starting another agent. A competing launch returns `status=busy` with the lock path and owner PID/host when available; it does not start scanners or export the previous run's findings. The interactive CLI remains available.
+
+On Kali, inspect lock holders from the project directory (adjust the path if using a custom evidence root):
+
+```bash
+fuser -v .aixsec-evidence/run-*.lock
+```
+
+Wait for the existing scan or stop it in its original terminal. A job suspended with Ctrl+Z still holds its lock; resume it with `fg` in that shell before stopping it with Ctrl+C. Do not delete the lock file or change history namespace to bypass a running scan. An existing lock file alone does not block execution: the kernel releases the lock when the owner closes it or exits. Owner metadata can remain in the file after exit and is informational; lock acquisition is authoritative. Older running versions may have no PID metadata.

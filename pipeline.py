@@ -4,7 +4,7 @@ from __future__ import annotations
 import json
 import time
 from pathlib import Path
-from scan_state import Journal, RunLock, ScannerHistory, digest
+from scan_state import Journal, RunLock, ScanBusyError, ScannerHistory, digest
 
 from autonomy import KnowledgeGraph
 from evidence import EvidenceStore, public
@@ -60,15 +60,20 @@ def record_result(agent, name, args, result, *, baseline=False):
 def run(agent, user_text):
     cfg = agent.config
     agent._scan_journal = None
-    with RunLock(cfg.get('evidence_dir', '.aixsec-evidence'), cfg.get('zap_history_namespace', 'default')):
-        try:
-            return _run(agent, user_text)
-        except BaseException:
-            journal = getattr(agent, '_scan_journal', None)
-            if journal:
-                journal.data['status'] = 'interrupted'
-                journal.save()
-            raise
+    try:
+        with RunLock(cfg.get('evidence_dir', '.aixsec-evidence'), cfg.get('zap_history_namespace', 'default')):
+            try:
+                return _run(agent, user_text)
+            except BaseException:
+                journal = getattr(agent, '_scan_journal', None)
+                if journal:
+                    journal.data['status'] = 'interrupted'
+                    journal.save()
+                raise
+    except ScanBusyError as exc:
+        return {'status':'busy', 'busy':True, 'calls':0, 'findings':[],
+                'lock_path':exc.path, 'lock_owner':exc.owner,
+                'final_text':'[BUSY] ' + str(exc)}
 
 
 def _run(agent, user_text):

@@ -1727,6 +1727,9 @@ def main():
             agent.save_inventory()
             return
         result = agent.run(prompt_text)
+        if result.get("busy"):
+            print("\n" + result['final_text'])
+            return
         if result.get("llm_down"):
             print("\n" + result.get("llm_note", ""))
         print("\n" + result.get("final_text", ""))
@@ -1776,6 +1779,9 @@ def main():
             agent.save_inventory()
             continue
         result = agent.run(line)
+        if result.get("busy"):
+            print("\n" + result['final_text'])
+            continue
         if result.get("llm_down"):
             print("\n" + result.get("llm_note", ""))
         print("\n" + (result.get("final_text", "") or "(no response)"))

@@ -4,6 +4,7 @@ from contextlib import contextmanager
 import hashlib
 import json
 import os
+import socket
 from pathlib import Path
 import sqlite3
 import time
@@ -94,19 +95,54 @@ class Journal:
                          for t in self.data['tasks'].values()]}
 
 
+class ScanBusyError(ValueError):
+    """Expected contention, not a scanner failure or permission to bypass history."""
+    def __init__(self, path, owner=None):
+        self.path = str(path)
+        self.owner = owner or {}
+        details = ''
+        if self.owner.get('pid'):
+            details = f" (PID {self.owner['pid']}, host {self.owner.get('host', 'unknown')})"
+        super().__init__('Another scan is using this history namespace' + details +
+                         '; wait for it to finish or stop that scan in its original terminal. '
+                         'Do not delete the lock file or change namespace to bypass it. '
+                         f'Lock: {self.path}')
+
+
 class RunLock:
     def __init__(self, root, namespace):
         root = Path(root).resolve(); root.mkdir(mode=0o700, parents=True, exist_ok=True)
-        self.stream = (root / ('run-' + digest(namespace)[:20] + '.lock')).open('a')
+        self.stream = (root / ('run-' + digest(namespace)[:20] + '.lock')).open('a+')
         os.chmod(self.stream.name, 0o600)
     def __enter__(self):
         try:
             fcntl.flock(self.stream, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
+            try:
+                self.stream.seek(0)
+                owner = json.loads(self.stream.read(4096))
+                if not isinstance(owner, dict):
+                    owner = {}
+            except (ValueError, OSError):
+                owner = {}
+            path = self.stream.name
             self.stream.close()
-            raise ValueError('Another scan is using this history namespace; wait for it to finish')
+            raise ScanBusyError(path, owner) from None
+        except BaseException:
+            self.stream.close()
+            raise
+        try:
+            self.stream.seek(0)
+            self.stream.truncate()
+            json.dump({'pid':os.getpid(), 'host':socket.gethostname(), 'started_at':time.time()}, self.stream)
+            self.stream.flush()
+        except BaseException:
+            self.stream.close()
+            raise
         return self
     def __exit__(self, *args):
+        # Keep the inode: unlinking a held flock file allows a second lock.
+        # The kernel releases flock when this descriptor/process closes.
         self.stream.close()
 
 
