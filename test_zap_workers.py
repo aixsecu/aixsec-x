@@ -222,3 +222,37 @@ class CookiePolicyTests(unittest.TestCase):
                 return {'outcome':'ok'}
             yield call
         drive(jobs,start,2,cookie_mode='guest')
+
+
+class EmptyHarBodyTests(unittest.TestCase):
+    def test_empty_export_metadata_does_not_block_get(self):
+        from zap_workers import scheduling_reasons
+        for post in ({}, {'mimeType':''}, {'mimeType':'application/x-www-form-urlencoded','text':'','params':[]}):
+            with self.subTest(post=post):
+                job=entry('search?q=one')
+                job['_entry']['request'].update(postData=post,bodySize=0)
+                self.assertEqual(scheduling_reasons(job),[])
+                job['_entry']['request']['headers']=[{'name':'Cookie','value':'sid=private'}]
+                self.assertEqual(scheduling_reasons(job),['cookie_requires_opt_in'])
+                self.assertEqual(scheduling_reasons(job,'guest'),[])
+
+    def test_real_or_omitted_positive_body_stays_serial(self):
+        from zap_workers import scheduling_reasons
+        for payload in ({'postData':{'text':' '}}, {'postData':{'text':'{}'}},
+                        {'postData':{'params':[{'name':'q','value':''}]}},
+                        {'bodySize':10}, {'headers':[{'name':'Content-Length','value':'10'}]},
+                        {'headers':[{'name':'Transfer-Encoding','value':'chunked'}]}):
+            with self.subTest(payload=payload):
+                job=entry('search');job['_entry']['request'].update(payload)
+                self.assertIn('request_body',scheduling_reasons(job,'guest'))
+        self.assertFalse(parallel_safe(entry('save','POST'),'guest'))
+
+    def test_empty_har_gets_actually_overlap_in_guest_mode(self):
+        barrier=threading.Barrier(2)
+        jobs=[entry('a'),entry('b')]
+        for job in jobs:
+            job['_entry']['request'].update(postData={'mimeType':'','text':'','params':[]},
+                headers=[{'name':'Cookie','value':'guest=private'}],bodySize=0)
+        def start(job,cancelled):
+            yield lambda: barrier.wait(3)
+        drive(jobs,start,2,cookie_mode='guest')

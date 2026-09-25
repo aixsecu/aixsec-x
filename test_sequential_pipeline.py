@@ -18,7 +18,7 @@ TEMPLATE = {'id':'fixture', 'sha256':'abcd', 'path':'/unused/template.yaml', 'sc
 def config(root, **updates):
     cfg = load_config()
     cfg.update(targets=[URL], scan_backend='zap', evidence_dir=root, auto_exec='all', planner_enabled=False,
-               nuclei_enabled=True, allow_active_scan=True, zap_allowed_rules=[40018])
+               nuclei_enabled=True, allow_active_scan=True, zap_allowed_rules=[40018], zap_cookie_parallel='strict')
     cfg.update(updates)
     return cfg
 

@@ -40,13 +40,13 @@ class Journal:
             self.data = {'version':1, 'fingerprint':fingerprint, 'status':'running',
                          'stages':{}, 'tasks':{}}
         dependencies={}
-        for key in ('zap_auth_file', 'zap_route_groups_file'):
+        for key in ('zap_auth_file', 'zap_route_groups_file', 'zap_concurrency_file'):
             path=config.get(key)
             if path:
                 dependencies[key]=hashlib.sha256(Path(path).read_bytes()).hexdigest()
         previous=self.data.get('dependencies')
         if previous is not None and previous!=dependencies:
-            raise ValueError('Resume auth profile changed or route profile changed; refresh discovery in a new session')
+            raise ValueError('Resume auth profile changed, route profile changed or concurrency profile changed; refresh discovery in a new session')
         self.data['dependencies']=dependencies
         self.retry = bool(config.get('retry_incomplete', False))
         self.interrupted = [t for t in self.data['tasks'].values() if t['status'] == 'running']

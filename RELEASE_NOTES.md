@@ -1,3 +1,22 @@
+## Automatic concurrency trials by default
+
+- Defaulted `WEBX_ZAP_COOKIE_PARALLEL` to `auto`, retaining strict/guest and explicit policy overrides.
+- Added bounded fresh controls before eligible scans, preserved credentials and shared per-origin request pacing; unstable controls downgrade rather than skip scans.
+- Added one-worker warmup, promotion to at most two workers per origin after observed successful trials, and sticky backoff from scanner/auth/status/session/latency signals.
+- Persisted decisions and backoff for resume, without probing completed tasks again; documented limits and added regression/localhost tests.
+
+## Request independence concurrency policy
+
+- Added optional `WEBX_ZAP_CONCURRENCY_FILE` with origin/auth/path scoped `parallel_read` declarations and overriding `serial` rules. Preserves captured credentials; no automatic server-session isolation.
+- Kept method/body/CSRF/sensitive-query constraints. Changed serial barriers to per-origin exclusion with same-origin dispatch ordering; unrelated origins can use free workers.
+- Added policy match diagnostics, policy-content resume checks, example configuration, and authentication/ordering/pipeline regression tests.
+
+## Empty HAR body scheduling fix
+
+- Fixed GET/HEAD captures with empty `postData` metadata being incorrectly classified as request bodies, which could serialize the entire ZAP queue.
+- Retained serial handling for actual payloads, form fields and positive/streamed body indicators; cookie policy remains unchanged.
+- Added empty-body classification and concurrent guest-cookie HAR regression tests.
+
 ## Cookie-aware ZAP worker diagnostics
 
 - Added serial reason counts and a private `zap-scheduling.json`, with aggregate counts retained in progress after stage completion.

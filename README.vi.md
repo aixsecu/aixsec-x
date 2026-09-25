@@ -271,7 +271,8 @@ Các công tắc boolean dùng `1` (bật) và `0` (tắt). Mặc định dướ
 |---|---|---|
 | `WEBX_ZAP_EXECUTABLE` | `zap.sh` | Tên/đường dẫn executable ZAP. Kali có thể dùng zaproxy; cơ chế tìm mặc định cũng dò bản cài theo hệ điều hành. |
 | `WEBX_ZAP_WORKERS` | `2` | Số worker ZAP active (1–8). Nhóm GET/HEAD anonymous không có credential chạy song song; request có session và method khác chạy tuần tự. |
-| `WEBX_ZAP_COOKIE_PARALLEL` | `strict` | `strict`: có cookie thì chạy tuần tự. `guest`: cho phép GET/HEAD anonymous mang cookie chạy song song khi operator đã xác định đây là phiên khách độc lập; giữ nguyên cookie. Đăng nhập, credential/CSRF header, query nhạy cảm và request có body vẫn chạy tuần tự. |
+| `WEBX_ZAP_CONCURRENCY_FILE` | *(trống)* | Policy JSON theo origin, auth_context và đường dẫn: `parallel_read` cho request đọc đã xác định độc lập, kể cả có đăng nhập; `serial` ưu tiên giữ thứ tự. Không tạo session mới; xem hướng dẫn worker. |
+| `WEBX_ZAP_COOKIE_PARALLEL` | `auto` | `auto`: tự kiểm tra đối chứng, bắt đầu 1 worker/origin, tăng tối đa 2 khi ổn định và giảm về 1 khi có tín hiệu lỗi. `strict`: tuần tự khi có cookie; `guest`: operator cho phép cookie khách. Policy thủ công vẫn được ưu tiên. |
 | `WEBX_ZAP_ROUTE_GROUPS_FILE` | *(trống)* | File JSON nhóm route do operator khai báo để gộp slug; trống giữ cách nhóm cấu trúc mặc định. Xem hướng dẫn worker bên dưới. |
 | `WEBX_ZAP_TIMEOUT` | `600` | Timeout giây cho mỗi tiến trình ZAP, không phải tổng phiên. |
 | `WEBX_ZAP_STRENGTH` | `Medium` | Cường độ active scan: Low, Medium, High hoặc Insane; mức cao gửi nhiều payload hơn. |
@@ -361,6 +362,8 @@ export WEBX_LLM_OVERALL_TIMEOUT=210
 ```
 
 ### Worker ZAP và nhóm route
+
+Mặc định mới là `auto`: không cần file policy cho các request đủ điều kiện kiểm tra tự động. Hệ thống gửi hai request đối chứng (giữ cookie, không theo redirect), chỉ tăng song song sau lượt thử ổn định. Không xác định được tính ổn định thì vẫn quét tuần tự. Xem giới hạn và nhật ký `auto-concurrency.json` trong hướng dẫn worker. Biến env cũ đã export vẫn được ưu tiên; dùng `unset WEBX_ZAP_COOKIE_PARALLEL` để dùng mặc định mới trong phiên mới.
 
 Đặt `WEBX_ZAP_WORKERS=2` để chạy tối đa hai nhóm request độc lập cùng lúc; đặt `1` để chạy tuần tự. Khoảng cách `WEBX_ZAP_DELAY_MS` được phối hợp giữa các worker theo origin cho request active scanner, tránh mỗi worker tự nhân tốc độ. Journal và evidence được cập nhật tuần tự, có tiến độ `[zap] x/y`.
 

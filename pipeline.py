@@ -86,6 +86,8 @@ def _run(agent, user_text):
     from tools import TOOL_INDEX
 
     cfg = agent.config
+    from zap_concurrency import ConcurrencyPolicy
+    concurrency_policy = ConcurrencyPolicy(cfg.get('zap_concurrency_file', ''))
     http_engine.reset_sessions()
     auth_context.reset_contexts()
     security_analysis.reset()
@@ -112,6 +114,7 @@ def _run(agent, user_text):
     for stage in ('discovery', 'zap_active', 'nuclei', 'verification', 'planner', 'report'):
         journal.data['stages'].setdefault(stage, {'status':'pending', 'reason':''})
     journal.save()
+    auto_concurrency = None
     stage_name = 'discovery'
     history = ScannerHistory(cfg.get('evidence_dir', '.aixsec-evidence'), cfg.get('zap_history_namespace', 'default'))
     from zap_schedule import ScanSchedule
@@ -205,6 +208,10 @@ def _run(agent, user_text):
             approved = agent._risk_ok(TOOL_INDEX[name])
             worker._risk_ok = lambda spec: approved
             worker._zap_active_entry = representative['_entry'] if representative else None
+            if approved and auto_concurrency and representative:
+                scope_error = agent.policy.check_param(name, 'url', args['url'])
+                if not scope_error:
+                    auto_concurrency.prepare(representative)
             agent._zap_active_entry = None
             result = yield lambda: worker._dispatch(name, args)
         else:
@@ -213,6 +220,8 @@ def _run(agent, user_text):
             finally:
                 agent._zap_active_entry = None
         if representative:
+            if auto_concurrency:
+                auto_concurrency.observe(representative, result)
             schedule.finish(representative['request_id'], args['rule_ids'], result)
         result['trigger'] = trigger
         # Coverage failure is retained even if no scanner process was launched.
@@ -288,14 +297,20 @@ def _run(agent, user_text):
         if active_rules and representatives:
             from zap_workers import drive, scheduling_summary
             from scan_state import atomic
-            cookie_mode = cfg.get('zap_cookie_parallel', 'strict')
-            scheduling = scheduling_summary(representatives, workers, cookie_mode)
+            cookie_mode = cfg.get('zap_cookie_parallel', 'auto')
+            if cookie_mode == 'auto':
+                from zap_auto import AutoConcurrency
+                auto_concurrency = AutoConcurrency(cfg, journal.directory, representatives, concurrency_policy)
+                print('[zap:auto] one worker per origin initially; stable trials permit up to two', flush=True)
+            scheduling = scheduling_summary(representatives, workers, cookie_mode, concurrency_policy)
             atomic(journal.directory / 'zap-scheduling.json', scheduling)
             journal.data['stages']['zap_active']['scheduling'] = {
                 k:v for k,v in scheduling.items() if k != 'groups'}
             journal.save()
             print(f"[zap] parallel eligible={scheduling['parallel_eligible']}; "
                   f"serial={scheduling['serial_groups']}; cookie mode={cookie_mode}", flush=True)
+            for policy_id, count in scheduling['policy_matches'].items():
+                print(f'[zap] concurrency policy: {policy_id}={count} groups', flush=True)
             for reason, count in scheduling['serial_reasons'].items():
                 print(f'[zap] serial reason: {reason}={count}', flush=True)
             if scheduling['serial_reasons'].get('cookie_requires_opt_in'):
@@ -306,9 +321,12 @@ def _run(agent, user_text):
                 return execution('zap_active_scan', {'url':representative['_entry']['request']['url'],
                     'request_id':representative['request_id'], 'auth_context':representative['auth_context'],
                     'rule_ids':active_rules}, scheduled=True, cancelled=cancelled)
-            schedule.stop_reason = drive(representatives, start, workers, cookie_mode) or schedule.stop_reason
+            schedule.stop_reason = drive(representatives, start, workers, cookie_mode, concurrency_policy, auto_concurrency) or schedule.stop_reason
     elif backend == 'zap':
         schedule.stop_reason = 'Automatic active scanning disabled by operator configuration'
+    if auto_concurrency:
+        journal.data['stages']['zap_active']['automatic'] = auto_concurrency.summary()
+        journal.save()
     close_stage('zap_active')
     stage_name = 'nuclei'
     if backend == 'none':

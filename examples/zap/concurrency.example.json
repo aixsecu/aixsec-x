@@ -1,0 +1,19 @@
+{
+  "version": 1,
+  "rules": [
+    {
+      "id": "independent-member-catalog",
+      "origin": "https://example.com",
+      "auth_context": "member",
+      "paths": ["/catalog/*"],
+      "mode": "parallel_read"
+    },
+    {
+      "id": "session-and-checkout",
+      "origin": "https://example.com",
+      "auth_context": "*",
+      "paths": ["/logout", "/checkout", "/checkout/*", "/cart", "/cart/*", "/catalog/logout"],
+      "mode": "serial"
+    }
+  ]
+}
