@@ -82,7 +82,7 @@ class ScheduleTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as root:
             har=Path(root)/'traffic.har'
             har.write_text(json.dumps({'log':{'entries':[entry(request(BASE+'search?q=a')),entry(request(BASE+'search?q=b'))]}}))
-            cfg=load_config();cfg.update(targets=[BASE],evidence_dir=root,scan_backend='zap',planner_enabled=False,
+            cfg=load_config();cfg.update(nuclei_enabled=False, targets=[BASE],evidence_dir=root,scan_backend='zap',planner_enabled=False,
                 allow_active_scan=True,zap_auto_active=True,zap_allowed_rules='all',auto_exec='all')
             baseline={'target':BASE,'coverage':{'target':BASE,'har_path':str(har),'auth_context':'anonymous','status':'complete'},
                       'active_rules':[{'id':40018,'name':'SQLi'},{'id':40012,'name':'XSS'}], 'alerts':[]}

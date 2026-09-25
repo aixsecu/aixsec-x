@@ -518,6 +518,13 @@ class WebXAgent:
                     "output": "[!] Operator denied this tool."}
         try:
             kw = dict(arguments)
+            if modern and name in ('sql_error_verify', 'sqlmap_runner'):
+                kw['_config'] = dict(self.config)
+                kw['_verification_entry'] = getattr(self, '_verification_entry', None)
+                kw['_verification_record'] = getattr(self, '_verification_record', None)
+            if modern and name == "nuclei_scan":
+                kw["_config"] = dict(self.config)
+                kw["_templates"] = getattr(self, "_nuclei_templates", [])
             if name.startswith("zap_"):
                 kw["_config"] = dict(self.config)
                 if kw["_config"].get("zap_allowed_rules") == "all":
@@ -554,6 +561,8 @@ class WebXAgent:
             cap = TOOL_TIMEOUTS.get(name, self.config["tool_timeout"])
             if name.startswith("zap_"):
                 kw["_timeout"] = int(self.config.get("zap_timeout", 300))
+            elif modern and name == "nuclei_scan":
+                kw["_timeout"] = max(1, int(self.config.get("nuclei_timeout", 600)))
             elif name == "wapiti_scan":
                 # max_scan_time bounds Wapiti's scan phase. Allow a small
                 # cleanup/report window instead of always granting the old
@@ -586,7 +595,7 @@ class WebXAgent:
             # v1.4.4: output mở đầu '[!]' = lỗi thực thi (timeout, thiếu binary,
             # connect fail, args sai) → outcome=error để gate/fail-count đúng.
             oc = "error" if isinstance(out, str) and out.startswith("[!]") else "ok"
-            if name.startswith("zap_") and isinstance(data, dict):
+            if (name.startswith("zap_") or name in ("nuclei_scan", "sql_error_verify", "sqlmap_runner")) and isinstance(data, dict):
                 scan_status = (data.get("coverage") or {}).get("status")
                 if scan_status in {"partial", "timeout", "error"}:
                     oc = scan_status

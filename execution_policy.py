@@ -21,6 +21,10 @@ def check_action(config, name, args, store=None):
                     or any(type(value) is not int for value in selected)
                     or not set(selected) <= set(allowed)):
                 return 'Requested ZAP rules are not in the operator allowlist'
+    if name == 'sql_error_verify' and not config.get('allow_active_scan',False):
+        return 'Active verification disabled by operator'
+    if name == 'nuclei_scan' and (not config.get('nuclei_enabled', True) or not config.get('allow_active_scan', False)):
+        return 'Nuclei disabled by operator scan policy'
     if name in ('sqlmap_runner', 'sqlmap_check'):
         if not config.get('allow_sqlmap', False):
             return 'sqlmap disabled by WEBX_ALLOW_SQLMAP'

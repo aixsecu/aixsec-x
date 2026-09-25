@@ -1,3 +1,19 @@
+## Sequential ZAP + Nuclei pipeline
+
+The modern pipeline runs discovery → ZAP active → Nuclei → candidate verification → AI Planner → report. Scanner stages run without waiting for the model. Session-wide `WEBX_PIPELINE_MAX_SECONDS`, `WEBX_PIPELINE_MAX_ACTIONS`, and `WEBX_PIPELINE_MAX_REQUESTS` are retired and ignored; tool/request/model timeouts and request rates remain. A failed stage does not consume the next stage's time.
+
+Nuclei is enabled by default (`WEBX_NUCLEI_ENABLED=1`) when active scanning is allowed. It needs the executable and locally installed templates; missing dependencies appear as a skipped/error stage. The first integration supports public URL-based HTTP templates, with explicit exclusions for raw, flow, browser, code and external/OAST templates. Findings remain candidates.
+
+`progress.json` in each `session-*` directory stores atomic checkpoints. To continue an interrupted session with the same configuration:
+
+```bash
+export WEBX_RESUME_SESSION=/absolute/path/to/.aixsec-evidence/session-XXXX
+# Optional: explicitly retry earlier timeout/error/denied tasks as well:
+export WEBX_RETRY_INCOMPLETE=1
+```
+
+Keep the same history namespace and evidence directory. Completed tasks restore their evidence without scanning again. Interrupted in-flight tasks may send requests again because their completion was not recorded. Unset `WEBX_RESUME_SESSION` to start a new session. See [sequential pipeline, template coverage and resume](docs/SEQUENTIAL_PIPELINE.md).
+
 > **4.2.0 — ZAP + Evidence pipeline:** baseline runs before AI; findings/risk come from evidence and validators. Default `WEBX_SCAN_BACKEND=auto` selects ZAP when available, otherwise HTTP-only partial coverage. The old Wapiti gate is opt-in `legacy`. See [setup, authentication, policy and limitations](docs/ZAP_PIPELINE.md). Wapiti-first examples below describe legacy mode.
 
 Scanner integrations live in `adapters/` (`adapters/zap.py` for ZAP). New scanner adapters should be added to this package; shared scheduling and evidence processing remain separate.
@@ -14,7 +30,7 @@ Active testing now runs automatically after discovery, independently of the AI:
 `WEBX_ZAP_AUTO_ACTIVE=1`, `WEBX_ALLOW_ACTIVE_SCAN=1`, and
 `WEBX_ZAP_ALLOWED_RULES=all` are the defaults. `all` selects installed ZAP rules;
 it does not guarantee discovery of every vulnerability. Existing execution
-approvals and budgets remain in effect. Set `WEBX_ALLOW_ACTIVE_SCAN=0` for passive-only.
+approvals and per-tool timeouts remain in effect. Set `WEBX_ALLOW_ACTIVE_SCAN=0` for passive-only.
 Equivalent request structures are tested once per rule, with history persisted
 across runs. See [scheduling and deduplication](docs/ZAP_PIPELINE.md#automatic-multi-rule-scheduling-and-persistent-deduplication).
 

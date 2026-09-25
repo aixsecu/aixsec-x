@@ -1,17 +1,18 @@
 """Build a source-only release ZIP with a per-file SHA-256 manifest."""
 import hashlib
 import json
+import re
 from pathlib import Path
 import zipfile
 
 root = Path(__file__).resolve().parent.parent
-version = '2.1.4'
+version = re.search(r'^VERSION = "([^"]+)"', (root / 'agent.py').read_text(), re.M).group(1)
 files = sorted(set(list(root.glob('*.py')) + list(root.glob('README*.md')) +
                    [root / 'requirements.txt', root / 'RELEASE_NOTES.md', root / '.gitignore'] +
-                   [p for folder in ('api_discovery', 'docs', 'examples', 'scripts', 'bench')
+                   [p for folder in ('adapters', 'api_discovery', 'autonomy', 'context_optimization', 'docs', 'examples', 'scripts', 'bench')
                     for p in (root / folder).rglob('*')
-                    if p.is_file() and '__pycache__' not in p.parts and p.suffix in ('.py', '.md', '.json', '.yaml')]))
-destination = root / 'dist' / f'aixsec-x-{version}-phase-2.1.zip'
+                    if p.is_file() and '__pycache__' not in p.parts and p.suffix in ('.py', '.md', '.json', '.yaml', '.yml', '.js')]))
+destination = root / 'dist' / f'aixsec-x-{version}.zip'
 destination.parent.mkdir(exist_ok=True)
 manifest = {str(p.relative_to(root)): hashlib.sha256(p.read_bytes()).hexdigest() for p in files}
 with zipfile.ZipFile(destination, 'w', zipfile.ZIP_DEFLATED) as archive:

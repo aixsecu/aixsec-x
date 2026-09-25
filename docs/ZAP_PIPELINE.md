@@ -25,7 +25,7 @@ export WEBX_SCAN_BACKEND=zap
 export WEBX_ZAP_EXECUTABLE=zaproxy  # Kali Linux
 export WEBX_AUTO_EXEC=ask
 export WEBX_ZAP_TIMEOUT=600
-export WEBX_PIPELINE_MAX_SECONDS=900
+# No session-wide deadline; configure per-tool timeouts instead.
 python3 agent.py
 ```
 
@@ -168,7 +168,7 @@ auth state, discovered URL count, requested active rules and artifact locations.
 `complete` refers to the configured AF execution, not exhaustive site coverage.
 Warnings, malformed reports and incomplete authentication cannot report complete.
 
-## Policy and budgets
+## Policy and per-tool limits
 
 | Setting | Default | Meaning |
 |---|---:|---|
@@ -177,9 +177,9 @@ Warnings, malformed reports and incomplete authentication cannot report complete
 | `WEBX_ALLOW_CONTENT_DISCOVERY` | 1 | Permit ffuf discovery, still subject to normal approval |
 | `WEBX_ALLOW_EXTRACTION` | 0 | Separate permission for blind SQLi data extraction |
 | `WEBX_FFUF_RATE` / `WEBX_FFUF_THREADS` | 5 / 2 | ffuf request rate and concurrency |
-| `WEBX_PIPELINE_MAX_ACTIONS` | 30 | Session action cap |
-| `WEBX_PIPELINE_MAX_SECONDS` | 900 | Session scheduling deadline; remaining time clamps tool/LLM timeouts |
-| `WEBX_PIPELINE_MAX_REQUESTS` | 5000 | Estimated request budget for scheduling, **not** a strict network request counter |
+| `WEBX_PIPELINE_MAX_ACTIONS` | retired | Ignored by the sequential pipeline |
+| `WEBX_PIPELINE_MAX_SECONDS` | retired | Ignored; stages do not share a deadline |
+| `WEBX_PIPELINE_MAX_REQUESTS` | retired | Estimates are reporting metrics only |
 | `WEBX_ZAP_TIMEOUT` | 600 | Process wall-clock budget; stop owned process group on expiry |
 | `WEBX_ZAP_PHASE_MINUTES` | 2 | Per-phase ZAP limit |
 | `WEBX_ZAP_MAX_URLS` | 200 | Planning cost estimate only; does not cap OpenAPI imports or spider URLs (compatible with older bundled OpenAPI add-ons) |
@@ -262,7 +262,7 @@ The planner now receives parameterized discovery leads and coverage gaps. Active
 scans still require `WEBX_ALLOW_ACTIVE_SCAN=1` and `WEBX_ZAP_ALLOWED_RULES`.
 For a selected endpoint, the adapter imports matching captures from the same
 session/authentication context without replay, preserving POST bodies for ZAP.
-Automatic active scheduling is now enabled; it operates on one captured representative per request family, within session budgets. Captured request counters in a seeded
+Automatic active scheduling is now enabled; it operates on one captured representative per request family, without a session-wide budget. Captured request counters in a seeded
 scan can include imported history, not just newly sent requests.
 
 `coverage.status` describes job execution, not application-wide completion.
@@ -337,7 +337,7 @@ The final report and `active-schedule.json` list every eligible family and rule.
 `artifact_ref` links an earlier attempt to its scanner report; historical findings
 are not silently treated as newly verified findings in the current session:
 
-- `not_run`: not scheduled, for example because budgets were exhausted.
+- `not_run`: not scheduled, for example because no eligible request or allowed rule exists.
 - `reserved`: a run claimed it; an interrupted process may leave this state.
 - `attempted_unverified`: execution was attempted, but no rule-attributed request
   was observed. It must not be interpreted as a completed vulnerability test.
@@ -346,8 +346,8 @@ are not silently treated as newly verified findings in the current session:
 
 Denied/blocked actions release reservations. Other attempts are not automatically
 repeated, including failures/timeouts, to respect the no-repeat policy. Review
-unverified attempts and the `stop_reason`; budgets can leave checks unrun. The
-estimated request budget is not a hard network-request counter.
+unverified attempts and the `stop_reason`; per-tool timeouts can leave checks incomplete.
+Use explicit checkpoint resume/retry for interrupted or failed tasks; see [sequential pipeline](SEQUENTIAL_PIPELINE.md).
 
 To intentionally retest a new application deployment or previously unverified
 attempts, choose a new `WEBX_ZAP_HISTORY_NAMESPACE` (default `default`). This does
@@ -358,7 +358,7 @@ deduplication; deleting them or moving to a new directory starts fresh history.
 ## Active response evidence
 
 `WEBX_ZAP_STRENGTH` accepts Low, Medium (default), High or Insane. Higher strength
-can consume the existing time/request budgets faster; it does not guarantee detection.
+can reach per-tool timeouts sooner; it does not guarantee detection.
 All selected active rules retain the existing metadata observer and additionally write
 `active-evidence.jsonl` inside the private scan directory. This file stores URL/payload,
 response body, body hashes and elapsed milliseconds; it is not included in model context.

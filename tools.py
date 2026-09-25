@@ -121,6 +121,12 @@ def available_tools(config=None) -> tuple[set, dict]:
             avail.add(name)
         else:
             missing[name] = binary
+    from adapters.nuclei import executable as nuclei_executable
+    if nuclei_executable(config or {}):
+        avail.add('nuclei_scan'); missing.pop('nuclei_scan', None)
+    else:
+        avail.discard('nuclei_scan')
+        missing['nuclei_scan'] = (config or {}).get('nuclei_executable', 'nuclei')
     from adapters.zap import executable
     if not executable(config or {}):
         avail.difference_update({"zap_baseline", "zap_active_scan"})
@@ -512,7 +518,18 @@ def _nikto_scan(**kw):
 # TOOLS — active exploitation layer
 # ─────────────────────────────────────────────
 
+def _sql_error_verify(**kw):
+    from verification import paired
+    if not kw.get('_verification_entry') or not kw.get('_verification_record'):
+        raise ValueError('Verification requires an executor-selected captured request and candidate')
+    return paired(kw['_config'], kw['_verification_entry'], kw['parameter'],
+                  kw['_verification_record'], kw.get('_timeout',60))
+
+
 def _nuclei_scan(**kw):
+    if kw.get('_config') is not None:
+        from adapters.nuclei import run_scan
+        return run_scan(kw['_config'], kw['url'], kw.get('_templates') or [], kw.get('_timeout'))
     _need("nuclei")
     args = ["nuclei", "-u", kw["url"], "-silent"]
     if kw.get("severity"):
@@ -677,6 +694,9 @@ def _sqlmap_runner(**kw):
     không ra dấu hiệu (vd template CONTAINS hấp thụ payload) → model ghi nhận
     và hạ cấp kỳ vọng / chuyển manual, KHÔNG spam lại cùng url (bị blocked).
     """
+    if kw.get('_verification_entry'):
+        from verification import sqlmap_probe
+        return sqlmap_probe(kw['_config'], kw['_verification_entry'], kw['parameter'], kw.get('_timeout',240))
     _need("sqlmap")
     url = kw["url"]
     # technique: allowlist B/E/U/S/T/Q, dedupe, giữ thứ tự (dict.fromkeys)
@@ -2416,6 +2436,10 @@ TOOL_REGISTRY: list[ToolSpec] = [
               "required": ["url"]}, _param_discovery, risk="noisy"),
 
     # ── Active ──
+    ToolSpec("sql_error_verify", "Repeat fresh captured control/payload pairs for an SQL error candidate.",
+             {"type":"object", "properties":{"url":{"type":"string"}, "parameter":{"type":"string"},
+              "evidence_id":{"type":"string"}}, "required":["url","parameter","evidence_id"]},
+             _sql_error_verify, risk="active"),
     ToolSpec("nuclei_scan", "Quét lỗ hổng bằng nuclei templates (CVE, misconfig, exposures). "
              "Severity: critical,high,medium,low. Tags ví dụ: cve,rce,sqli,lfi.",
              {"type": "object",

@@ -1,4 +1,20 @@
-> **4.2.0 — ZAP + Evidence pipeline:** baseline chạy trước AI; finding/risk lấy từ evidence và validator. Mặc định `WEBX_SCAN_BACKEND=auto` chọn ZAP nếu có, nếu không chỉ thu HTTP observation (coverage chưa đầy đủ). Wapiti gate cũ chỉ còn trong `legacy`. Xem [cấu hình, auth, policy và giới hạn](docs/ZAP_PIPELINE.md). Các ví dụ Wapiti-first bên dưới mô tả chế độ legacy.
+## Pipeline tuần tự ZAP + Nuclei
+
+Pipeline hiện chạy discovery → ZAP active → Nuclei → xác minh candidate → AI Planner → báo cáo. Các bước scanner không chờ model quyết định. Ba biến `WEBX_PIPELINE_MAX_SECONDS`, `WEBX_PIPELINE_MAX_ACTIONS`, `WEBX_PIPELINE_MAX_REQUESTS` đã ngừng áp dụng; vẫn giữ timeout từng công cụ/request/model và giới hạn tốc độ. Một bước lỗi không lấy mất thời gian của bước sau.
+
+Nuclei bật mặc định (`WEBX_NUCLEI_ENABLED=1`) khi cho phép active scan. Cần binary và template đã cài cục bộ; thiếu thành phần sẽ được ghi rõ trong trạng thái bước. Tích hợp đầu tiên hỗ trợ template HTTP theo URL công khai, loại trừ rõ các template raw, flow, browser, code và external/OAST. Kết quả vẫn là candidate.
+
+File `progress.json` trong mỗi thư mục `session-*` lưu checkpoint. Để tiếp tục phiên bị gián đoạn với cùng cấu hình:
+
+```bash
+export WEBX_RESUME_SESSION=/duong/dan/tuyet/doi/.aixsec-evidence/session-XXXX
+# Tùy chọn: chủ động thử lại cả những tác vụ timeout/lỗi/bị từ chối trước đó:
+export WEBX_RETRY_INCOMPLETE=1
+```
+
+Giữ nguyên namespace lịch sử và thư mục evidence. Tác vụ hoàn tất được khôi phục bằng chứng mà không quét lại. Tác vụ bị ngắt giữa chừng có thể gửi lại request vì chưa ghi nhận hoàn tất. Bỏ `WEBX_RESUME_SESSION` để bắt đầu phiên mới. Xem [luồng tuần tự, phạm vi template và tiếp tục phiên](docs/SEQUENTIAL_PIPELINE.md).
+
+> **4.2.0 — ZAP + Evidence pipeline:** baseline chạy trước AI; finding/risk lấy từ evidence và validator. Mặc định `WEBX_SCAN_BACKEND=auto` chọn ZAP nếu có, nếu không dùng HTTP observation làm discovery, sau đó chạy Nuclei nếu được bật và có sẵn. Wapiti gate cũ chỉ còn trong `legacy`. Xem [cấu hình, auth, policy và giới hạn](docs/ZAP_PIPELINE.md). Các ví dụ Wapiti-first bên dưới mô tả chế độ legacy.
 
 Các tích hợp scanner nằm trong `adapters/` (`adapters/zap.py` dành cho ZAP). Adapter cho scanner mới sẽ được thêm vào package này; phần lập lịch và xử lý bằng chứng dùng chung vẫn tách riêng.
 
@@ -13,7 +29,7 @@ Báo cáo cuối có inventory `discovery` riêng cho form, ô nhập và API, p
 Active Scan hiện được lập lịch tự động sau discovery, không phụ thuộc AI:
 mặc định `WEBX_ZAP_AUTO_ACTIVE=1`, `WEBX_ALLOW_ACTIVE_SCAN=1` và
 `WEBX_ZAP_ALLOWED_RULES=all`. `all` chọn các rule ZAP đã cài, không bảo đảm phát hiện
-mọi lỗ hổng. Cơ chế phê duyệt chạy tool và giới hạn ngân sách vẫn áp dụng.
+mọi lỗ hổng. Cơ chế phê duyệt chạy tool và timeout từng công cụ vẫn áp dụng.
 Đặt `WEBX_ALLOW_ACTIVE_SCAN=0` nếu chỉ muốn discovery/passive scan.
 Các request cùng cấu trúc chỉ được lập lịch một lần cho mỗi rule; lịch sử lưu
 qua các lần chạy. Xem [lập lịch và chống quét trùng](docs/ZAP_PIPELINE.md#automatic-multi-rule-scheduling-and-persistent-deduplication).
