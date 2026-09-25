@@ -9,6 +9,8 @@ from pathlib import Path
 import re
 import shutil
 import signal
+import socket
+import threading
 import subprocess
 import sys
 import tempfile
@@ -241,6 +243,15 @@ def build_plan(config, target, workdir, *, active=False, rule_ids=(), auth_conte
         observer = Path(workdir) / 'active-observer.js'
         observer.write_text((Path(__file__).resolve().parent.parent / 'examples/zap/active-observer.js').read_text().replace(
             '__AIXSEC_OUTPUT__', json.dumps(str(Path(workdir) / 'active-requests.jsonl'))))
+        if config.get('_zap_rate_root'):
+            # A Java FileLock serializes request start times across ZAP JVMs.
+            rate_path = Path(config['_zap_rate_root']) / ('zap-rate-' + hashlib.sha256(origin(target).encode()).hexdigest() + '.lock')
+            rate_path.touch(mode=0o600, exist_ok=True)
+            rate_script = (Path(__file__).resolve().parent.parent / 'examples/zap/shared-rate.js').read_text()
+            observer.write_text(observer.read_text().replace(
+                'function sendingRequest(msg, initiator, helper) {}',
+                rate_script.replace('__AIXSEC_RATE_PATH__', json.dumps(str(rate_path)))
+                           .replace('__AIXSEC_RATE_MS__', str(max(0, int(config.get('zap_delay_ms', 200)))))))
         observer.chmod(0o600)
         jobs.append({'type': 'script', 'parameters': {'action': 'add', 'type': 'httpsender',
             'engine': 'ECMAScript : Graal.js', 'name': 'aixsec-active-observer', 'source': str(observer)}})
@@ -321,6 +332,24 @@ def parse_report(path, target, scan_id, auth_context='anonymous'):
                   'rejected_out_of_origin': rejected, 'matched_sites': matched_sites, 'statistics': stats}
 
 
+_port_lock = threading.Lock()
+_owned_ports = set()
+
+
+def reserve_proxy_port():
+    # ZAP versions may treat -port 0 as the configured default, not ephemeral.
+    # Keep a process-local reservation until the owned JVM exits.
+    with _port_lock:
+        for _ in range(100):
+            with socket.socket() as probe:
+                probe.bind(('127.0.0.1', 0))
+                port = probe.getsockname()[1]
+            if port not in _owned_ports:
+                _owned_ports.add(port)
+                return port
+    raise RuntimeError('Unable to allocate a private ZAP proxy port')
+
+
 def run_scan(config, url, *, active=False, rule_ids=(), auth_context='anonymous', ajax=False, timeout=None):
     binary = executable(config)
     if not binary:
@@ -343,13 +372,28 @@ def run_scan(config, url, *, active=False, rule_ids=(), auth_context='anonymous'
     started = time.monotonic()
     # Do not inherit global header injection from an unrelated scan.
     env = {k: v for k, v in os.environ.items() if not k.startswith('ZAP_AUTH_HEADER')}
+    proxy_port = None
     try:
+        proxy_port = reserve_proxy_port()
         with log_path.open('w') as log:
-            process = subprocess.Popen(launch_command(binary) + ['-cmd', '-host', '127.0.0.1', '-port', '0',
+            process = subprocess.Popen(launch_command(binary) + ['-cmd', '-host', '127.0.0.1', '-port', str(proxy_port),
                 '-dir', str(home), '-autorun', str(plan_path)],
                 stdout=log, stderr=subprocess.STDOUT, start_new_session=True, env=env)
             try:
-                code = process.wait(timeout=deadline)
+                if config.get('_zap_cancelled') is None:
+                    code = process.wait(timeout=deadline)
+                while config.get('_zap_cancelled') is not None:
+                    cancelled = config.get('_zap_cancelled')
+                    if cancelled is not None and cancelled.is_set():
+                        raise subprocess.TimeoutExpired(process.args, deadline)
+                    remaining = deadline - (time.monotonic() - started)
+                    if remaining <= 0:
+                        raise subprocess.TimeoutExpired(process.args, deadline)
+                    try:
+                        code = process.wait(timeout=min(1, remaining))
+                        break
+                    except subprocess.TimeoutExpired:
+                        continue
             except (subprocess.TimeoutExpired, KeyboardInterrupt) as interruption:
                 timed_out = True
                 try:
@@ -365,6 +409,8 @@ def run_scan(config, url, *, active=False, rule_ids=(), auth_context='anonymous'
                 if isinstance(interruption, KeyboardInterrupt):
                     raise
     finally:
+        with _port_lock:
+            _owned_ports.discard(proxy_port)
         # Plan contains credentials resolved from operator environment.
         plan_path.unlink(missing_ok=True)
     report_path = directory / 'report.json'

@@ -37,6 +37,8 @@ def load_config() -> dict:
         "nuclei_rate": int(os.environ.get("WEBX_NUCLEI_RATE", "5")),
         "evidence_dir": os.environ.get("WEBX_EVIDENCE_DIR", ".aixsec-evidence"),
         "zap_executable": os.environ.get("WEBX_ZAP_EXECUTABLE", "zap.sh"),
+        "zap_workers": max(1, min(8, int(os.environ.get("WEBX_ZAP_WORKERS", "2")))),
+        "zap_route_groups_file": os.environ.get("WEBX_ZAP_ROUTE_GROUPS_FILE", ""),
         "zap_timeout": int(os.environ.get("WEBX_ZAP_TIMEOUT", "600")),
         "zap_strength": os.environ.get("WEBX_ZAP_STRENGTH", "Medium"),
         "zap_phase_minutes": int(os.environ.get("WEBX_ZAP_PHASE_MINUTES", "2")),

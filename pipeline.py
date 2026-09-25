@@ -110,7 +110,7 @@ def _run(agent, user_text):
     stage_name = 'discovery'
     history = ScannerHistory(cfg.get('evidence_dir', '.aixsec-evidence'), cfg.get('zap_history_namespace', 'default'))
     from zap_schedule import ScanSchedule
-    schedule = ScanSchedule(cfg.get('evidence_dir', '.aixsec-evidence'), cfg.get('zap_history_namespace', 'default'))
+    schedule = ScanSchedule(cfg.get('evidence_dir', '.aixsec-evidence'), cfg.get('zap_history_namespace', 'default'), cfg.get('zap_route_groups_file', ''))
 
     # A checkpoint's interrupted dispatch has no completed result. Explicit resume
     # recovers only its reservations, under the exclusive namespace lock.
@@ -129,7 +129,7 @@ def _run(agent, user_text):
         journal.stage(name, 'partial' if incomplete else 'complete' if any(v != 'duplicate' for v in states) else 'skipped',
                       'Some actions did not complete; inspect task states' if incomplete else 'Previously attempted; see persistent history' if states and all(v == 'duplicate' for v in states) else '' if states else 'No eligible work')
 
-    def execute(name, args, baseline=False, scheduled=False):
+    def execution(name, args, baseline=False, scheduled=False, cancelled=None):
         nonlocal calls, estimated_requests
         key = digest([name, args])
         if key in cache:
@@ -186,10 +186,27 @@ def _run(agent, user_text):
             agent._zap_active_entry = representative['_entry']
         trigger = 'baseline' if baseline else 'scheduler' if scheduled else 'planner'
         print(f'[→] {name} ({trigger})', flush=True)
-        try:
-            result = agent._dispatch(name, args)
-        finally:
+        if cancelled is not None:
+            # Approvals and snapshots happen on the owner thread. Workers never
+            # mutate the live agent's seed, journal, graph or evidence store.
+            import copy
+            worker = copy.copy(agent)
+            worker.config = dict(cfg)
+            worker.config['_zap_cancelled'] = cancelled
+            worker.config['_zap_rate_root'] = str(journal.directory)
+            worker.evidence_store = copy.copy(agent.evidence_store)
+            worker.evidence_store.coverage = list(agent.evidence_store.coverage)
+            worker.evidence_store.active_rules = list(agent.evidence_store.active_rules)
+            approved = agent._risk_ok(TOOL_INDEX[name])
+            worker._risk_ok = lambda spec: approved
+            worker._zap_active_entry = representative['_entry'] if representative else None
             agent._zap_active_entry = None
+            result = yield lambda: worker._dispatch(name, args)
+        else:
+            try:
+                result = agent._dispatch(name, args)
+            finally:
+                agent._zap_active_entry = None
         if representative:
             schedule.finish(representative['request_id'], args['rule_ids'], result)
         result['trigger'] = trigger
@@ -205,8 +222,16 @@ def _run(agent, user_text):
         journal.finish(key, result)
         result = record_result(agent, name, args, result, baseline=baseline)
         cache[key] = result
-        print(f"[i] {name}: {result.get('outcome')} — {str(result.get('output', ''))[:400]}", flush=True)
+        print(f"[i] {name}: {result.get('outcome')} ({result.get('exec_time', 0)}s) — {str(result.get('output', ''))[:400]}", flush=True)
         return result
+
+    def execute(name, args, baseline=False, scheduled=False):
+        task = execution(name, args, baseline, scheduled)
+        try:
+            next(task)
+        except StopIteration as finished:
+            return finished.value
+        raise RuntimeError('Synchronous execution unexpectedly yielded')
 
     backend = cfg.get('scan_backend', 'auto')
     if backend == 'auto':
@@ -252,14 +277,17 @@ def _run(agent, user_text):
         elif not schedule.entries:
             schedule.stop_reason = 'No eligible captured requests to test'
         # Run independently of the LLM, once per structural family and rule.
-        for representative in sorted(schedule.entries.values(), key=lambda e: (
-                not bool(e['structure']['query'] or e['structure']['body']), e['url'])):
-            response = execute('zap_active_scan', {'url':representative['_entry']['request']['url'],
-                'request_id':representative['request_id'], 'auth_context':representative['auth_context'],
-                'rule_ids':active_rules}, scheduled=True)
-            if response.get('outcome') in ('blocked', 'denied'):
-                schedule.stop_reason = response.get('output', response['outcome'])
-                break
+        representatives = sorted(schedule.entries.values(), key=lambda e: (
+            not bool(e['structure']['query'] or e['structure']['body']), e['url']))
+        workers = max(1, min(8, int(cfg.get('zap_workers', 2))))
+        if active_rules and representatives:
+            from zap_workers import drive
+            print(f'[zap] {len(representatives)} request groups; {len(active_rules)} rules; {workers} workers', flush=True)
+            def start(representative, cancelled):
+                return execution('zap_active_scan', {'url':representative['_entry']['request']['url'],
+                    'request_id':representative['request_id'], 'auth_context':representative['auth_context'],
+                    'rule_ids':active_rules}, scheduled=True, cancelled=cancelled)
+            schedule.stop_reason = drive(representatives, start, workers) or schedule.stop_reason
     elif backend == 'zap':
         schedule.stop_reason = 'Automatic active scanning disabled by operator configuration'
     close_stage('zap_active')

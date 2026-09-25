@@ -268,6 +268,8 @@ Boolean switches use `1` (enabled) and `0` (disabled). Defaults below come from 
 | Var | Default | Meaning |
 |---|---|---|
 | `WEBX_ZAP_EXECUTABLE` | `zap.sh` | ZAP executable name/path. Kali can use zaproxy; default discovery also searches platform-specific installations. |
+| `WEBX_ZAP_WORKERS` | `2` | Active ZAP workers (1–8). Anonymous GET/HEAD groups without credentials run concurrently; session-bearing requests and other methods run serially. |
+| `WEBX_ZAP_ROUTE_GROUPS_FILE` | *(empty)* | Operator-owned JSON route groups for slug deduplication; empty preserves default structural grouping. See the worker guide below. |
 | `WEBX_ZAP_TIMEOUT` | `600` | Timeout in seconds for each ZAP process, not the whole session. |
 | `WEBX_ZAP_STRENGTH` | `Medium` | Active scan strength: Low, Medium, High or Insane; higher levels send more payloads. |
 | `WEBX_ZAP_PHASE_MINUTES` | `2` | Per-phase duration in minutes (minimum 1): spider, AJAX, passive wait, active scan/rule. |
@@ -351,6 +353,12 @@ export WEBX_LLM_TIMEOUT=300
 
 # then: source ~/.zshrc   (or open a new terminal)
 ```
+
+### ZAP workers and route groups
+
+Set `WEBX_ZAP_WORKERS=2` for up to two independent request groups at once, or `1` for serial execution. `WEBX_ZAP_DELAY_MS` is coordinated across workers per origin for active scanner requests, so each worker does not multiply the configured rate. Journal and evidence updates remain serial, with `[zap] x/y` progress.
+
+Use `WEBX_ZAP_ROUTE_GROUPS_FILE=/path/to/routes.json` only for slugs known to share a route. See [parallel scan configuration](docs/ZAP_WORKERS.md) for an example and limitations. Only the representative is tested; grouped URLs are not individually verified. Each task still starts an isolated ZAP process; this version does not reuse JVMs across groups.
 
 ### Live display (streaming)
 
