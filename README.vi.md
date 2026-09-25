@@ -270,6 +270,8 @@ Các công tắc boolean dùng `1` (bật) và `0` (tắt). Mặc định dướ
 | Var | Mặc định | Ý nghĩa |
 |---|---|---|
 | `WEBX_ZAP_EXECUTABLE` | `zap.sh` | Tên/đường dẫn executable ZAP. Kali có thể dùng zaproxy; cơ chế tìm mặc định cũng dò bản cài theo hệ điều hành. |
+| `WEBX_ZAP_WORKERS` | `2` | Số worker ZAP active (1–8). Nhóm GET/HEAD anonymous không có credential chạy song song; request có session và method khác chạy tuần tự. |
+| `WEBX_ZAP_ROUTE_GROUPS_FILE` | *(trống)* | File JSON nhóm route do operator khai báo để gộp slug; trống giữ cách nhóm cấu trúc mặc định. Xem hướng dẫn worker bên dưới. |
 | `WEBX_ZAP_TIMEOUT` | `600` | Timeout giây cho mỗi tiến trình ZAP, không phải tổng phiên. |
 | `WEBX_ZAP_STRENGTH` | `Medium` | Cường độ active scan: Low, Medium, High hoặc Insane; mức cao gửi nhiều payload hơn. |
 | `WEBX_ZAP_PHASE_MINUTES` | `2` | Thời lượng từng pha tính bằng phút (tối thiểu 1): spider, AJAX, chờ passive, active scan/rule. |
@@ -356,6 +358,12 @@ export WEBX_LLM_OVERALL_TIMEOUT=210
 
 # sau đó: source ~/.zshrc   (hoặc mở terminal mới)
 ```
+
+### Worker ZAP và nhóm route
+
+Đặt `WEBX_ZAP_WORKERS=2` để chạy tối đa hai nhóm request độc lập cùng lúc; đặt `1` để chạy tuần tự. Khoảng cách `WEBX_ZAP_DELAY_MS` được phối hợp giữa các worker theo origin cho request active scanner, tránh mỗi worker tự nhân tốc độ. Journal và evidence được cập nhật tuần tự, có tiến độ `[zap] x/y`.
+
+Dùng `WEBX_ZAP_ROUTE_GROUPS_FILE=/path/to/routes.json` khi đã xác định các slug dùng chung route. File mẫu và giới hạn được mô tả trong [hướng dẫn quét song song](docs/ZAP_WORKERS.md). Chỉ request đại diện được kiểm tra; không coi mọi URL trong nhóm đã được kiểm tra riêng. Mỗi tác vụ vẫn khởi động một tiến trình ZAP riêng; bản này chưa tái sử dụng JVM giữa các nhóm.
 
 ### Màn hình live (streaming)
 

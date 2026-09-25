@@ -39,13 +39,13 @@ class Journal:
             self.data = {'version':1, 'fingerprint':fingerprint, 'status':'running',
                          'stages':{}, 'tasks':{}}
         dependencies={}
-        for key in ('zap_auth_file',):
+        for key in ('zap_auth_file', 'zap_route_groups_file'):
             path=config.get(key)
             if path:
                 dependencies[key]=hashlib.sha256(Path(path).read_bytes()).hexdigest()
         previous=self.data.get('dependencies')
         if previous is not None and previous!=dependencies:
-            raise ValueError('Resume auth profile changed; refresh discovery in a new session')
+            raise ValueError('Resume auth profile changed or route profile changed; refresh discovery in a new session')
         self.data['dependencies']=dependencies
         self.retry = bool(config.get('retry_incomplete', False))
         self.interrupted = [t for t in self.data['tasks'].values() if t['status'] == 'running']
@@ -73,7 +73,7 @@ class Journal:
 
     def start(self, key, name, args, stage):
         # Arguments stay in private checkpoint; public reports use summaries only.
-        self.data['tasks'][key] = {'tool':name, 'args':args, 'stage':stage, 'status':'running'}
+        self.data['tasks'][key] = {'tool':name, 'args':args, 'stage':stage, 'status':'running', 'started_at':time.time()}
         self.save()
 
     def finish(self, key, result):
@@ -84,6 +84,8 @@ class Journal:
         status=(coverage.get('status') if isinstance(coverage,dict) else None) or result.get('outcome','error')
         task['status'] = 'complete' if status in ('ok', 'complete') else status
         task['outcome'] = result.get('outcome', 'error')
+        task['finished_at'] = time.time()
+        task['exec_time'] = result.get('exec_time')
         self.save()
 
     def summary(self):

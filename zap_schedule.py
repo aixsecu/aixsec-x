@@ -1,5 +1,6 @@
 """Deterministic, request-backed active scheduling with a durable per-rule ledger."""
 import hashlib
+import fnmatch
 from contextlib import contextmanager
 import json
 from pathlib import Path
@@ -60,10 +61,27 @@ def family(request, auth='anonymous'):
 
 
 class ScanSchedule:
-    def __init__(self, directory, namespace='default'):
+    def __init__(self, directory, namespace='default', route_groups_file=''):
         root = Path(directory).resolve(); root.mkdir(parents=True, exist_ok=True, mode=0o700)
         self.path = root / 'scan-history.sqlite3'
         self.namespace = namespace
+        self.route_groups = []
+        if route_groups_file:
+            groups = json.loads(Path(route_groups_file).read_text())
+            if not isinstance(groups, list):
+                raise ValueError('ZAP route groups must be a JSON array')
+            for group in groups:
+                if (not isinstance(group, dict) or set(group) != {'origin', 'group', 'paths'}
+                        or not isinstance(group['group'], str) or not group['group']
+                        or not isinstance(group['origin'], str)
+                        or urlsplit(group['origin']).scheme not in ('http', 'https')
+                        or not urlsplit(group['origin']).hostname
+                        or urlsplit(group['origin']).path not in ('', '/')
+                        or urlsplit(group['origin']).query or urlsplit(group['origin']).fragment
+                        or not isinstance(group['paths'], list) or not group['paths']
+                        or any(not isinstance(v, str) or not v.startswith('/') for v in group['paths'])):
+                    raise ValueError('Invalid ZAP route group: require origin, group and absolute path globs')
+            self.route_groups = groups
         with self.connection() as db:
             db.execute('BEGIN IMMEDIATE')
             db.execute('CREATE TABLE IF NOT EXISTS attempts (namespace TEXT, family TEXT, rule INTEGER, state TEXT, artifact_ref TEXT DEFAULT "", PRIMARY KEY(namespace,family,rule))')
@@ -103,6 +121,13 @@ class ScanSchedule:
                 self.skipped_static += 1
                 continue
             shape = family(req, auth)
+            matches = [g for g in self.route_groups if same_origin(url, g['origin'])
+                       and any(fnmatch.fnmatchcase(urlsplit(url).path, pattern) for pattern in g['paths'])]
+            if len(matches) > 1:
+                raise ValueError('Captured URL matches multiple ZAP route groups')
+            if matches:
+                shape['path'] = '{operator-route:' + matches[0]['group'] + '}'
+                shape['route_policy'] = digest(matches[0])
             fid = digest(shape)
             if fid not in self.entries:
                 self.entries[fid] = {'request_id': fid, 'structure': shape,

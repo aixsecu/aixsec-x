@@ -1,3 +1,12 @@
+## ZAP parallel request groups
+
+- Added `WEBX_ZAP_WORKERS` (default 2, range 1–8), bounded active workers, serial barriers for session-bearing/non-GET requests, owner-thread evidence/checkpoint updates, progress and cancellation.
+- Allocated explicit private localhost proxy ports: some ZAP versions treat port 0 as the default port, causing simultaneous processes to collide.
+- Coordinated active-scanner request pacing across worker JVMs per origin within the session using `WEBX_ZAP_DELAY_MS`.
+- Added `WEBX_ZAP_ROUTE_GROUPS_FILE` for explicit slug route sampling, preserving method/input/auth distinctions and per-rule history. Route-file changes invalidate resume.
+- Added offline concurrency/isolation/dedup/resume tests and an opt-in two-JVM localhost pacing regression. Updated both README env tables and `docs/ZAP_WORKERS.md`.
+- Each request group still uses an isolated ZAP process; persistent JVM reuse is not part of this update.
+
 ## Captured request and authentication improvements
 
 - Added nested JSON selectors and per-occurrence query/form mutation; retained duplicate order and untouched query/form bytes.
