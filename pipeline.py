@@ -137,6 +137,8 @@ def _run(agent, user_text):
         saved = journal.cached(key) if cfg.get('resume_session') and name not in ('auth_login','auth_context_set') else None
         if saved is not None:
             saved['resumed_from_checkpoint'] = True
+            if isinstance((saved.get('data') or {}).get('coverage'),dict):
+                saved['data']['coverage']['observation_freshness']='restored_not_revalidated'
             if name == 'zap_active_scan' and args.get('request_id'):
                 schedule.finish(args['request_id'], args.get('rule_ids', []), saved)
             cache[key] = saved
@@ -289,6 +291,8 @@ def _run(agent, user_text):
                     record_result(agent, task['tool'], task['args'], saved)
                     cache[key] = saved
     llm_down, failures = False, 0
+    from planner_progress import facts
+    seen_facts=facts(agent)
     planner_reason = 'Maximum planner rounds reached'
     for round_no in range(1, int(cfg.get('max_rounds', 8)) + 1):
         if not cfg.get('planner_enabled', True):
@@ -344,18 +348,19 @@ def _run(agent, user_text):
         if not actions:
             planner_reason = 'Planner returned no further actions'
             break
-        progress = False
         for action in actions:
             name, args = action.get('name'), action.get('arguments') or {}
             if not isinstance(name, str) or not isinstance(args, dict):
                 continue
             result = execute(name, args)
-            progress |= result.get('outcome') in ('ok', 'partial') and not result.get('resumed_from_checkpoint')
         for eid in list(agent.evidence_store.records):
             agent.evidence_store.validate(eid)
         sync_graph(agent)
+        current_facts=facts(agent)
+        progress=bool(current_facts-seen_facts)
+        seen_facts |= current_facts
         if not progress:
-            planner_reason = 'No successful new action'
+            planner_reason = 'No new endpoints, evidence, authentication or validation facts'
             break
     journal.stage('planner', 'partial' if llm_down else 'complete' if cfg.get('planner_enabled', True) else 'skipped', planner_reason)
     journal.stage('report', 'running')
@@ -371,6 +376,7 @@ def _run(agent, user_text):
                         'elapsed_seconds':round(time.monotonic() - began, 2), 'max_seconds':None,
                         'estimated_requests':estimated_requests, 'max_estimated_requests':None}
     result['scanner_history'] = history.summary()
+    result['nuclei_artifacts']={name:str(journal.directory/name) for name in ('nuclei-catalog.json','nuclei-bindings.json','nuclei-resume-check.json') if (journal.directory/name).exists()}
     journal.stage('report', 'complete')
     journal.data['status'] = 'partial' if any(s['status'] in ('partial','error','timeout') for s in journal.data['stages'].values()) else 'complete'
     journal.save()
@@ -393,34 +399,53 @@ def _run_nuclei(agent, targets, schedule, history, journal, execute):
     from scan_state import atomic
     if cfg.get('resume_session') and catalog_path.exists():
         saved = json.loads(catalog_path.read_text()); templates, catalog_state = saved['templates'], saved['state']
+        changes=[]
+        for template in templates:
+            try:
+                if nuclei.template_info(template['path'])['sha256']!=template['sha256']:
+                    changes.append({'id':template['id'],'reason':'Template changed since checkpoint'})
+            except (ValueError,OSError):
+                changes.append({'id':template['id'],'reason':'Template unavailable or no longer supported'})
+        catalog_state['revision_changes']=changes
+        atomic(journal.directory/'nuclei-resume-check.json',changes)
     else:
         templates, catalog_state = nuclei.catalog(cfg)
         atomic(catalog_path, {'templates':templates, 'state':catalog_state})
     if not templates:
         journal.stage('nuclei', catalog_state['status'], catalog_state.get('reason', 'No templates'))
         return
-    # Only public GET representatives are fed to URL-based templates. Never silently
-    # downgrade an authenticated POST capture to anonymous GET.
-    inputs = {url: {'url':url, 'method':'GET'} for url in targets}
-    for entry in schedule.entries.values():
-        req = entry['_entry']['request']
-        if entry['auth_context'] == 'anonymous' and req['method'] == 'GET' and not any(
-                h.get('name','').lower() in ('cookie','authorization') for h in req.get('headers', [])):
-            inputs[req['url']] = req
-    groups = {}
-    for url, req in inputs.items():
-        p = urlsplit(url); origin = urlunsplit((p.scheme, p.netloc, '/', '', ''))
+    # Templates using AIXSECPath/AIXSECBody bind to the original captured method/body.
+    # Ordinary templates retain their own request semantics and can reuse validated auth.
+    inputs=[{'_entry':{'request':{'url':url,'method':'GET','headers':[]}},'auth_context':'anonymous','synthetic':True} for url in targets]
+    inputs.extend(schedule.entries.values())
+    groups={}; binding_gaps=[]
+    for item in inputs:
+        entry=item['_entry'];req=entry['request'];url=req['url'];auth=item['auth_context']
+        p=urlsplit(url);origin=urlunsplit((p.scheme,p.netloc,'/','',''))
         for template in templates:
-            target = origin if template['scope'] == 'origin' else url
-            fid = digest(family({'url':target, 'method':'GET'}))
-            group = groups.setdefault(fid, {'url':target, 'templates':{}})
-            rid = template['id'] + ':' + template['sha256']
-            group['templates'][rid] = template
+            bound=template['scope']=='captured'
+            if bound and (item.get('synthetic') or req['method'] not in template.get('methods',[])):
+                continue
+            if not bound and req['method']!='GET':
+                binding_gaps.append({'request_id':item.get('request_id',''),'template_id':template['id'],
+                    'reason':'POST/body capture requires a capture-bound template; not converted to GET'})
+                continue
+            target=origin if template['scope']=='origin' else url
+            shape=family(req if bound else {'url':target,'method':'GET'},auth)
+            if bound: shape['template_binding']='captured'
+            from captured_auth import credentialed, headers
+            if auth=='anonymous' and credentialed(entry):
+                shape['unverified_session']=digest({k:v for k,v in headers(req).items() if k.lower() in ('cookie','authorization')})
+            fid=digest(shape)
+            group=groups.setdefault(fid,{'url':target,'templates':{},'entry':None if item.get('synthetic') else entry,'auth_context':auth})
+            rid=template['id']+':'+template['sha256']
+            group['templates'][rid]=template
+    atomic(journal.directory/'nuclei-bindings.json',{'gaps':binding_gaps})
     for fid, group in sorted(groups.items()):
         items = sorted(group['templates'])
         for offset in range(0, len(items), 64):
             rules = items[offset:offset+64]
-            args = {'url':group['url'], 'template_ids':rules}
+            args = {'url':group['url'], 'template_ids':rules, 'auth_context':group['auth_context'], 'request_id':fid}
             key = digest(['nuclei_scan', args])
             task = journal.data['tasks'].get(key)
             saved = journal.cached(key)
@@ -433,16 +458,18 @@ def _run_nuclei(agent, targets, schedule, history, journal, execute):
                 journal.finish(key, {'name':'nuclei_scan', 'outcome':'duplicate', 'output':'Template/family pairs already attempted; see scanner history'})
                 continue
             agent._nuclei_templates = [group['templates'][r] for r in pending]
+            agent._nuclei_entry = group['entry']
             try:
                 result = execute('nuclei_scan', args, scheduled=True)
             finally:
                 agent._nuclei_templates = []
+                agent._nuclei_entry = None
             if result.get('outcome') not in ('denied','blocked','scope_rejected','duplicate'):
                 coverage = (result.get('data') or {}).get('coverage') or {}
                 history.finish('nuclei', fid, pending, coverage.get('status') or result['outcome'], coverage.get('report_path',''))
     states = [t['status'] for t in journal.data['tasks'].values() if t['stage']=='nuclei']
-    journal.stage('nuclei', 'partial' if any(s not in ('complete','duplicate') for s in states) else 'complete',
-                  f"{len(templates)} eligible templates; {catalog_state.get('excluded',0)} unsupported templates excluded; anonymous URL-based HTTP coverage")
+    journal.stage('nuclei', 'partial' if catalog_state.get('revision_changes') or any(s not in ('complete','duplicate') for s in states) else 'complete',
+                  f"{len(catalog_state.get('revision_changes',[]))} changed/unavailable template revisions; {len(templates)} eligible templates; {catalog_state.get('excluded',0)} unsupported templates excluded; template binding/auth details in catalog and coverage")
 
 
 def _verify_candidates(agent, schedule, execute, journal, history):
@@ -482,7 +509,7 @@ def _verify_candidates(agent, schedule, execute, journal, history):
             agent._verification_entry = representative['_entry']
             agent._verification_record = row
             try:
-                verify_once('sql_error_verify', {'url':req['url'], 'parameter':parameter, 'evidence_id':eid}, 'paired-error-v1:' + parameter)
+                verify_once('sql_error_verify', {'url':req['url'], 'parameter':parameter, 'evidence_id':eid}, 'paired-error-v2:' + parameter)
                 if agent.config.get('allow_sqlmap', False):
                     verify_once('sqlmap_runner', {'url':req['url'], 'parameter':parameter, 'evidence_id':eid,
                             'technique':'BE'}, 'BE:' + parameter)

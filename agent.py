@@ -522,9 +522,11 @@ class WebXAgent:
                 kw['_config'] = dict(self.config)
                 kw['_verification_entry'] = getattr(self, '_verification_entry', None)
                 kw['_verification_record'] = getattr(self, '_verification_record', None)
+                kw['_config']['_verification_auth_context'] = (kw['_verification_record'] or {}).get('auth_context','anonymous')
             if modern and name == "nuclei_scan":
                 kw["_config"] = dict(self.config)
                 kw["_templates"] = getattr(self, "_nuclei_templates", [])
+                kw["_entry"] = getattr(self, "_nuclei_entry", None)
             if name.startswith("zap_"):
                 kw["_config"] = dict(self.config)
                 if kw["_config"].get("zap_allowed_rules") == "all":

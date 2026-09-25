@@ -529,7 +529,8 @@ def _sql_error_verify(**kw):
 def _nuclei_scan(**kw):
     if kw.get('_config') is not None:
         from adapters.nuclei import run_scan
-        return run_scan(kw['_config'], kw['url'], kw.get('_templates') or [], kw.get('_timeout'))
+        return run_scan(kw['_config'], kw['url'], kw.get('_templates') or [], kw.get('_timeout'),
+                        entry=kw.get('_entry'), auth_context=kw.get('auth_context','anonymous'))
     _need("nuclei")
     args = ["nuclei", "-u", kw["url"], "-silent"]
     if kw.get("severity"):

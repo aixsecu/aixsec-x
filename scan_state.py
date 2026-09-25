@@ -38,6 +38,15 @@ class Journal:
         else:
             self.data = {'version':1, 'fingerprint':fingerprint, 'status':'running',
                          'stages':{}, 'tasks':{}}
+        dependencies={}
+        for key in ('zap_auth_file',):
+            path=config.get(key)
+            if path:
+                dependencies[key]=hashlib.sha256(Path(path).read_bytes()).hexdigest()
+        previous=self.data.get('dependencies')
+        if previous is not None and previous!=dependencies:
+            raise ValueError('Resume auth profile changed; refresh discovery in a new session')
+        self.data['dependencies']=dependencies
         self.retry = bool(config.get('retry_incomplete', False))
         self.interrupted = [t for t in self.data['tasks'].values() if t['status'] == 'running']
         for task in self.interrupted:
@@ -70,7 +79,9 @@ class Journal:
     def finish(self, key, result):
         atomic(self.directory / ('checkpoint-' + key + '.json'), result)
         task = self.data['tasks'][key]
-        status = (result.get('data') or {}).get('coverage', {}).get('status') or result.get('outcome', 'error')
+        data=result.get('data')
+        coverage=data.get('coverage') if isinstance(data,dict) else None
+        status=(coverage.get('status') if isinstance(coverage,dict) else None) or result.get('outcome','error')
         task['status'] = 'complete' if status in ('ok', 'complete') else status
         task['outcome'] = result.get('outcome', 'error')
         self.save()

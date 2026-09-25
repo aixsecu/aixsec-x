@@ -1,8 +1,10 @@
+Captured-request improvements: nested JSON and repeated parameter occurrences now have individual SQL error checks. Named authentication is rechecked before reuse; expired sessions stop the affected action. Nuclei supports scoped raw HTTP and capture-bound POST/JSON templates. Planner progress is based on new observed facts. See [configuration and limitations](docs/SEQUENTIAL_PIPELINE.md).
+
 ## Sequential ZAP + Nuclei pipeline
 
 The modern pipeline runs discovery → ZAP active → Nuclei → candidate verification → AI Planner → report. Scanner stages run without waiting for the model. Session-wide `WEBX_PIPELINE_MAX_SECONDS`, `WEBX_PIPELINE_MAX_ACTIONS`, and `WEBX_PIPELINE_MAX_REQUESTS` are retired and ignored; tool/request/model timeouts and request rates remain. A failed stage does not consume the next stage's time.
 
-Nuclei is enabled by default (`WEBX_NUCLEI_ENABLED=1`) when active scanning is allowed. It needs the executable and locally installed templates; missing dependencies appear as a skipped/error stage. The first integration supports public URL-based HTTP templates, with explicit exclusions for raw, flow, browser, code and external/OAST templates. Findings remain candidates.
+Nuclei is enabled by default (`WEBX_NUCLEI_ENABLED=1`) when active scanning is allowed. It needs the executable and locally installed templates; missing dependencies appear as a skipped/error stage. The integration supports URL-based HTTP, scoped raw HTTP, capture-bound POST/JSON and named auth with a fresh control. Flow, browser, code and OAST remain explicitly excluded. Findings remain candidates.
 
 `progress.json` in each `session-*` directory stores atomic checkpoints. To continue an interrupted session with the same configuration:
 
@@ -217,6 +219,10 @@ python3 agent.py --non-interactive                # run automatically
 
 ### Configuration via env
 
+Boolean switches use `1` (enabled) and `0` (disabled). Defaults below come from `config.py`; an empty value means no explicit setting.
+
+#### Model, agent and scope
+
 | Var | Default | Meaning |
 |---|---|---|
 | `WEBX_TARGETS` | *(empty)* | Authorized targets, comma-separated (URL/domain/CIDR) |
@@ -224,28 +230,14 @@ python3 agent.py --non-interactive                # run automatically
 | `WEBX_MODEL` | `qwen2.5:7b` | Ollama model (suggestion: `huihui_ai/qwen3.5-abliterated:9b`) |
 | `WEBX_THINK` | `0` | `1`=enable thinking mode (not recommended together with function calling) |
 | `WEBX_AUTO_EXEC` | `ask` | `ask`=prompt operator before noisy/active tools; `safe`=auto-run only safe tools; `all`=auto-run everything (risky) |
-| `WEBX_AI_NATIVE` | `0` | **v1.5.6** `1`=AI-NATIVE mode: the model analyzes vulnerabilities itself via `http_request` (no mandatory wapiti/sqlmap; final JSON requires ≥1 real `http_request` response) |
-| `WEBX_AUTONOMY` | `0` | Enable the opt-in Phase 4 autonomous runtime integration |
-| `WEBX_AUTONOMY_CHECKPOINT` | *(empty)* | Atomic checkpoint path for long-running autonomous sessions |
-| `WEBX_AUTONOMY_RESUME` | `0` | Resume the configured checkpoint when `1` |
-| `WEBX_AUTONOMY_MAX_ACTIONS` | `100` | Maximum autonomous actions |
-| `WEBX_AUTONOMY_MAX_REQUESTS` | `500` | Estimated request budget |
-| `WEBX_AUTONOMY_MAX_SECONDS` | `3600` | Runtime budget in seconds |
-| `WEBX_AUTONOMY_MAX_RISK` | `20` | Accumulated planner risk budget |
-| `WEBX_CONTEXT_OPTIMIZATION` | `1` | Enable deterministic Phase 4.1 context selection |
-| `WEBX_MAX_PROMPT_TOKENS` | `12000` | Total estimated prompt budget, including selected tool schemas |
-| `WEBX_RESERVED_COMPLETION_TOKENS` | `2048` | Tokens reserved for model completion |
-| `WEBX_CONTEXT_MAX_GRAPH_NODES` | `40` | Maximum retrieved relevant graph nodes |
-| `WEBX_CONTEXT_MAX_OBSERVATIONS` | `12` | Maximum direct observations in planner context |
-| `WEBX_CONTEXT_MAX_HISTORY` | `12` | Maximum recent history items before deterministic summarization |
-| `WEBX_CONTEXT_MAX_TOOLS` | `14` | Maximum action-relevant tool schemas sent per request |
+| `WEBX_AI_NATIVE` | `0` | Legacy AI-native loop using http_request evidence; does not replace modern deterministic scanner stages. |
 | `WEBX_LLM_FIRST_TOKEN_TIMEOUT` | `90` | Abort when Ollama does not start responding within this many seconds; allows thinking models and cold CPU loads to begin streaming |
 | `WEBX_LLM_COMPLETION_TIMEOUT` | `180` | Completion phase timeout in seconds |
 | `WEBX_LLM_OVERALL_TIMEOUT` | `210` | Overall LLM request deadline in seconds |
 | `WEBX_INVENTORY_FILE` | *(empty)* | **v1.6.0** path to save the Attack Surface Inventory JSON (`host→port→service→URL→endpoint→method→param→auth→tech`, accumulated from real tool output) after every round and on exit. Empty = do not save |
-| `WEBX_MAX_ROUNDS` | `8` | Max tool-call rounds per turn (lower = faster/cheaper; a 9B model on a 4 vCPU box can take 20–30 min per round) |
-| `WEBX_TOOL_TIMEOUT` | `90` | Per-tool timeout (seconds) |
-| `WEBX_LLM_TIMEOUT` | `300` | Max time waiting for a model reply per round (seconds); a 9B model on CPU can take 1–3 minutes |
+| `WEBX_MAX_ROUNDS` | `8` | Maximum AI Planner rounds; does not limit the deterministic scanner stages. |
+| `WEBX_TOOL_TIMEOUT` | `90` | Default tool timeout in seconds; individual adapters may use their own timeout. |
+| `WEBX_LLM_TIMEOUT` | `300` | Legacy fallback timeout (seconds) when phase-specific timeouts are unset/zero; the defaults below take precedence. |
 | `WEBX_STREAM` | `1` | `1`=stream NDJSON from Ollama: live reasoning + content + per-round elapsed time; `0`=off (wait for the full response, no live display) |
 | `WEBX_OLLAMA_URL` | `http://localhost:11434` | Ollama endpoint (local / remote / tunnel) |
 | `WEBX_OLLAMA_AUTH` | *(empty)* | Authorization header sent to Ollama: full `Bearer xyz`/`Basic abc` or just the token (auto-prepends `Bearer `) — for authenticated tunnels/proxies |
@@ -254,6 +246,94 @@ python3 agent.py --non-interactive                # run automatically
 | `WEBX_PROMPT_STYLE` | `auto` | `auto`=model-name heuristic (≤9B→compact, ≥14B→full); `compact`=short prompt for small models; `full`=full prompt |
 | `WEBX_OUTPUT_CAP` | `5000` | Max characters of tool output fed into the context |
 | `WEBX_NUM_PREDICT` | `0` | **v1.4.2** hard cap on tokens the model may generate per call. `0`=unlimited (default). Set `512-2048` if the model writes long essays that slow each round — risk: the final JSON may be cut off if set too low |
+
+#### Pipeline, scope and scan permissions
+
+| Var | Default | Meaning |
+|---|---|---|
+| `WEBX_SCAN_BACKEND` | `auto` | Backend: auto, zap, wapiti, http, none or legacy. auto prefers ZAP, otherwise HTTP baseline. |
+| `WEBX_PLANNER_ENABLED` | `1` | Run AI Planner after deterministic scanner stages. |
+| `WEBX_EVIDENCE_DIR` | `.aixsec-evidence` | Root directory for private session evidence, progress and scan history. |
+| `WEBX_RESUME_SESSION` | *(empty)* | Existing session directory inside the evidence root; resume requires matching configuration. |
+| `WEBX_RETRY_INCOMPLETE` | `0` | 1 retries recorded incomplete/error/timeout tasks when resuming; completed tasks are restored. |
+| `WEBX_ALLOW_ACTIVE_SCAN` | `1` | Permit active scanning and verification; other policy checks still apply. |
+| `WEBX_ALLOW_SQLMAP` | `0` | Opt in to sqlmap for SQLi candidates. Scheduled verification only detects, without data extraction. |
+| `WEBX_ALLOW_CONTENT_DISCOVERY` | `1` | Permit content discovery tools such as ffuf. |
+| `WEBX_ALLOW_EXTRACTION` | `0` | Permit sqlmap actions beyond detect where supported; does not enable scheduled extraction. |
+| `WEBX_FFUF_RATE` | `5` | ffuf request rate per second. |
+| `WEBX_FFUF_THREADS` | `2` | ffuf worker threads. |
+
+#### OWASP ZAP
+
+| Var | Default | Meaning |
+|---|---|---|
+| `WEBX_ZAP_EXECUTABLE` | `zap.sh` | ZAP executable name/path. Kali can use zaproxy; default discovery also searches platform-specific installations. |
+| `WEBX_ZAP_TIMEOUT` | `600` | Timeout in seconds for each ZAP process, not the whole session. |
+| `WEBX_ZAP_STRENGTH` | `Medium` | Active scan strength: Low, Medium, High or Insane; higher levels send more payloads. |
+| `WEBX_ZAP_PHASE_MINUTES` | `2` | Per-phase duration in minutes (minimum 1): spider, AJAX, passive wait, active scan/rule. |
+| `WEBX_ZAP_MAX_URLS` | `200` | Planning estimate only; not a strict limit on discovered or scanned URLs. |
+| `WEBX_ZAP_DELAY_MS` | `200` | Delay between active scan requests, in milliseconds. |
+| `WEBX_ZAP_AJAX` | `1` | Enable AJAX Spider for browser-driven discovery. |
+| `WEBX_ZAP_BROWSER` | `firefox-headless` | Selenium browser ID for AJAX Spider; requires the corresponding browser/driver. |
+| `WEBX_ZAP_SPIDER_DEPTH` | `10` | Maximum traditional/AJAX crawl depth (minimum 1). |
+| `WEBX_ZAP_SPIDER_CHILDREN` | `50` | Maximum children per node for traditional Spider. |
+| `WEBX_ZAP_AJAX_STATES` | `100` | Maximum AJAX crawl states. |
+| `WEBX_ZAP_AJAX_ELEMENTS` | `a,button,input,span,div` | Comma-separated HTML elements AJAX Spider may interact with. |
+| `WEBX_ZAP_AUTH_CONTEXT` | `anonymous` | Authentication context label used in request grouping and history; a label alone does not log in. |
+| `WEBX_ZAP_AUTH_FILE` | *(empty)* | Local JSON authentication profile; see the ZAP pipeline guide for credential_env and login verification. |
+| `WEBX_ZAP_OPENAPI_FILE` | *(empty)* | Local OpenAPI specification to import during discovery. |
+| `WEBX_ZAP_ALLOWED_RULES` | `all` | all enables available active rules; alternatively supply comma-separated numeric rule IDs. |
+| `WEBX_ZAP_AUTO_ACTIVE` | `1` | Schedule ZAP active checks after discovery; also requires active scan permission. |
+| `WEBX_ZAP_HISTORY_NAMESPACE` | `default` | History namespace shared by scanner/verification scheduling, with separate scanner keys. Change intentionally to rescan. |
+
+#### Nuclei
+
+| Var | Default | Meaning |
+|---|---|---|
+| `WEBX_NUCLEI_ENABLED` | `1` | Enable the deterministic Nuclei stage after ZAP/HTTP baseline. |
+| `WEBX_NUCLEI_EXECUTABLE` | `nuclei` | Nuclei executable name or path. |
+| `WEBX_NUCLEI_TEMPLATES` | *(empty)* | Local template paths passed to -t; empty uses installed templates subject to adapter filters. |
+| `WEBX_NUCLEI_TAGS` | *(empty)* | Comma-separated template tags; empty adds no tag filter. |
+| `WEBX_NUCLEI_SEVERITY` | `info,low,medium,high,critical` | Comma-separated template severity filter. |
+| `WEBX_NUCLEI_TIMEOUT` | `600` | Per-batch process timeout in seconds. |
+| `WEBX_NUCLEI_RATE` | `5` | Maximum Nuclei request rate per second. |
+
+#### Context and optional autonomy
+
+| Var | Default | Meaning |
+|---|---|---|
+| `WEBX_CONTEXT_OPTIMIZATION` | `1` | Enable deterministic selection of model context. |
+| `WEBX_MAX_PROMPT_TOKENS` | `12000` | Estimated prompt token budget, including selected tool schemas. |
+| `WEBX_RESERVED_COMPLETION_TOKENS` | `2048` | Tokens reserved for model completion. |
+| `WEBX_CONTEXT_MAX_GRAPH_NODES` | `40` | Maximum relevant graph nodes in context. |
+| `WEBX_CONTEXT_MAX_OBSERVATIONS` | `12` | Maximum observations in context. |
+| `WEBX_CONTEXT_MAX_HYPOTHESES` | `6` | Maximum hypotheses in context. |
+| `WEBX_CONTEXT_MAX_HISTORY` | `12` | Maximum recent history items before summarization. |
+| `WEBX_CONTEXT_MAX_EVIDENCE` | `8` | Maximum evidence items in context. |
+| `WEBX_CONTEXT_MAX_TOOLS` | `14` | Maximum selected tool schemas per model request. |
+| `WEBX_AUTONOMY` | `0` | Enable the separate opt-in autonomous runtime. |
+| `WEBX_AUTONOMY_CHECKPOINT` | *(empty)* | Atomic checkpoint path for the autonomous runtime. |
+| `WEBX_AUTONOMY_RESUME` | `0` | Resume the configured autonomy checkpoint. |
+| `WEBX_AUTONOMY_MAX_ACTIONS` | `100` | Action limit for the optional autonomous runtime. |
+| `WEBX_AUTONOMY_MAX_REQUESTS` | `500` | Estimated request limit for the optional autonomous runtime. |
+| `WEBX_AUTONOMY_MAX_SECONDS` | `3600` | Time limit in seconds for the optional autonomous runtime. |
+| `WEBX_AUTONOMY_MAX_RISK` | `20` | Accumulated risk limit for the optional autonomous runtime. |
+
+#### Proxy and database
+
+| Var | Default | Meaning |
+|---|---|---|
+| `WEBX_HTTP_PROXY` | *(empty)* | HTTP proxy for the HTTP Session Engine; empty leaves it unset. |
+| `WEBX_HTTPS_PROXY` | *(empty)* | HTTPS proxy for the HTTP Session Engine; not a global scanner proxy setting. |
+| `WEBX_DB_ENABLED` | `0` | Enable database persistence. |
+| `WEBX_DB_HOST` | `localhost` | Database host. |
+| `WEBX_DB_USER` | *(empty)* | Database username. |
+| `WEBX_DB_PASS` | *(empty)* | Database password. |
+| `WEBX_DB_NAME` | `webx` | Database name. |
+
+The sequential scan pipeline has no session-wide budget. Retired `WEBX_PIPELINE_MAX_SECONDS`, `WEBX_PIPELINE_MAX_REQUESTS` and `WEBX_PIPELINE_MAX_ACTIONS` are ignored. `WEBX_AUTONOMY_MAX_*` applies only to the separate optional autonomous runtime; tool timeouts and rate limits still apply.
+
+Nuclei selection remains limited to templates supported by the adapter; excluded templates are recorded in coverage. See [sequential pipeline](docs/SEQUENTIAL_PIPELINE.md) and [ZAP authentication/configuration](docs/ZAP_PIPELINE.md). Credential environment-variable names referenced by an authentication profile are operator-defined, not additional fixed `WEBX_*` settings. Set `NO_COLOR=1` to disable terminal colors.
 
 Make env vars permanent by appending them to `~/.zshrc` (Kali's default shell
 is zsh; use `~/.bashrc` if you are on bash):
