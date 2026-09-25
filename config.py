@@ -7,6 +7,9 @@ import os
 
 
 def load_config() -> dict:
+    cookie_mode = os.environ.get("WEBX_ZAP_COOKIE_PARALLEL", "strict").strip().lower()
+    if cookie_mode not in ("strict", "guest"):
+        raise ValueError("WEBX_ZAP_COOKIE_PARALLEL must be strict or guest")
     return {
         # ── Ollama ──
         #   WEBX_OLLAMA_URL: local (http://localhost:11434) HOẶC máy khác
@@ -38,6 +41,7 @@ def load_config() -> dict:
         "evidence_dir": os.environ.get("WEBX_EVIDENCE_DIR", ".aixsec-evidence"),
         "zap_executable": os.environ.get("WEBX_ZAP_EXECUTABLE", "zap.sh"),
         "zap_workers": max(1, min(8, int(os.environ.get("WEBX_ZAP_WORKERS", "2")))),
+        "zap_cookie_parallel": cookie_mode,
         "zap_route_groups_file": os.environ.get("WEBX_ZAP_ROUTE_GROUPS_FILE", ""),
         "zap_timeout": int(os.environ.get("WEBX_ZAP_TIMEOUT", "600")),
         "zap_strength": os.environ.get("WEBX_ZAP_STRENGTH", "Medium"),

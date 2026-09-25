@@ -180,3 +180,45 @@ class LiveWorkerTests(unittest.TestCase):
                 self.assertGreater(min(gaps),.15)  # allow local scheduling/network jitter
         finally:
             server.shutdown();server.server_close();thread.join()
+
+
+class CookiePolicyTests(unittest.TestCase):
+    def test_guest_opt_in_keeps_credential_constraints(self):
+        import copy
+        from zap_workers import scheduling_reasons
+        job=entry('products',headers=[{'name':'Cookie','value':'opaque-private-value'}])
+        original=copy.deepcopy(job)
+        self.assertEqual(scheduling_reasons(job),['cookie_requires_opt_in'])
+        self.assertTrue(parallel_safe(job,'guest'))
+        self.assertEqual(job,original)
+        for header in ['Authorization','X-CSRF-Token','X-XSRF-Token','X-API-Key']:
+            variant=copy.deepcopy(job)
+            variant['_entry']['request']['headers'].append({'name':header,'value':'secret'})
+            self.assertFalse(parallel_safe(variant,'guest'))
+        job['auth_context']='member'
+        self.assertFalse(parallel_safe(job,'guest'))
+        self.assertFalse(parallel_safe(entry('search?csrf=secret'),'guest'))
+        self.assertFalse(parallel_safe(entry('save','POST'),'guest'))
+
+    def test_har_cookie_and_summary_without_secret_values(self):
+        from zap_workers import scheduling_summary
+        job=entry('product');job['_entry']['request']['cookies']=[{'name':'sid','value':'private-token'}]
+        summary=scheduling_summary([job,entry('save','POST'),entry('public')])
+        self.assertEqual(summary['parallel_eligible'],1)
+        self.assertEqual(summary['serial_groups'],2)
+        self.assertEqual(summary['serial_reasons']['cookie_requires_opt_in'],1)
+        self.assertNotIn('private-token',json.dumps(summary))
+        self.assertEqual(scheduling_summary([job],cookie_mode='guest')['parallel_eligible'],1)
+        with self.assertRaises(ValueError): scheduling_summary([job],cookie_mode='invalid')
+
+    def test_guest_cookie_tasks_overlap_and_preserve_headers(self):
+        barrier=threading.Barrier(2)
+        jobs=[entry('a',headers=[{'name':'Cookie','value':'sid=private'}]),
+              entry('b',headers=[{'name':'Cookie','value':'sid=private'}])]
+        def start(job,cancelled):
+            def call():
+                self.assertEqual(job['_entry']['request']['headers'][0]['value'],'sid=private')
+                barrier.wait(3)
+                return {'outcome':'ok'}
+            yield call
+        drive(jobs,start,2,cookie_mode='guest')

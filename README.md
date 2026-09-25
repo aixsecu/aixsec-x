@@ -269,6 +269,7 @@ Boolean switches use `1` (enabled) and `0` (disabled). Defaults below come from 
 |---|---|---|
 | `WEBX_ZAP_EXECUTABLE` | `zap.sh` | ZAP executable name/path. Kali can use zaproxy; default discovery also searches platform-specific installations. |
 | `WEBX_ZAP_WORKERS` | `2` | Active ZAP workers (1–8). Anonymous GET/HEAD groups without credentials run concurrently; session-bearing requests and other methods run serially. |
+| `WEBX_ZAP_COOKIE_PARALLEL` | `strict` | `strict` serializes cookie-bearing captures. `guest` allows anonymous GET/HEAD cookies when the operator has verified independent guest sessions; cookies remain intact. Named auth, credential/CSRF headers, sensitive queries and request bodies remain serial. |
 | `WEBX_ZAP_ROUTE_GROUPS_FILE` | *(empty)* | Operator-owned JSON route groups for slug deduplication; empty preserves default structural grouping. See the worker guide below. |
 | `WEBX_ZAP_TIMEOUT` | `600` | Timeout in seconds for each ZAP process, not the whole session. |
 | `WEBX_ZAP_STRENGTH` | `Medium` | Active scan strength: Low, Medium, High or Insane; higher levels send more payloads. |
