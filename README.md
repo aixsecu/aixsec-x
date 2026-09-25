@@ -269,7 +269,8 @@ Boolean switches use `1` (enabled) and `0` (disabled). Defaults below come from 
 |---|---|---|
 | `WEBX_ZAP_EXECUTABLE` | `zap.sh` | ZAP executable name/path. Kali can use zaproxy; default discovery also searches platform-specific installations. |
 | `WEBX_ZAP_WORKERS` | `2` | Active ZAP workers (1–8). Anonymous GET/HEAD groups without credentials run concurrently; session-bearing requests and other methods run serially. |
-| `WEBX_ZAP_COOKIE_PARALLEL` | `strict` | `strict` serializes cookie-bearing captures. `guest` allows anonymous GET/HEAD cookies when the operator has verified independent guest sessions; cookies remain intact. Named auth, credential/CSRF headers, sensitive queries and request bodies remain serial. |
+| `WEBX_ZAP_CONCURRENCY_FILE` | *(empty)* | JSON policy by origin, auth_context and path: `parallel_read` for declared independent reads including authenticated captures; `serial` takes precedence. Does not create new sessions; see worker guide. |
+| `WEBX_ZAP_COOKIE_PARALLEL` | `auto` | `auto`: fresh controls, one worker/origin initially, up to two after a stable trial, back to one on instability. `strict`: serialize cookies; `guest`: operator opt-in for guest cookies. Explicit policy takes precedence. |
 | `WEBX_ZAP_ROUTE_GROUPS_FILE` | *(empty)* | Operator-owned JSON route groups for slug deduplication; empty preserves default structural grouping. See the worker guide below. |
 | `WEBX_ZAP_TIMEOUT` | `600` | Timeout in seconds for each ZAP process, not the whole session. |
 | `WEBX_ZAP_STRENGTH` | `Medium` | Active scan strength: Low, Medium, High or Insane; higher levels send more payloads. |
@@ -356,6 +357,8 @@ export WEBX_LLM_TIMEOUT=300
 ```
 
 ### ZAP workers and route groups
+
+The new default is `auto`: no policy file is required for automatically eligible requests. Two fresh controls preserve cookies and disable redirects; concurrency increases only after a stable trial. Uncertain groups still scan serially. See the worker guide for limits and `auto-concurrency.json`. Previously exported settings still take precedence; use `unset WEBX_ZAP_COOKIE_PARALLEL` to use the new default in a new session.
 
 Set `WEBX_ZAP_WORKERS=2` for up to two independent request groups at once, or `1` for serial execution. `WEBX_ZAP_DELAY_MS` is coordinated across workers per origin for active scanner requests, so each worker does not multiply the configured rate. Journal and evidence updates remain serial, with `[zap] x/y` progress.
 

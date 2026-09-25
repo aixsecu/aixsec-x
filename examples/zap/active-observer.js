@@ -54,7 +54,10 @@ function responseReceived(msg, initiator, helper) {
     }
     var row = {url: String(msg.getRequestHeader().getURI()).split('?')[0].split('#')[0],
         method: String(msg.getRequestHeader().getMethod()), parameters: parameters,
-        rule_id: String(rule), status: msg.getResponseHeader().getStatusCode()};
+        rule_id: String(rule), status: msg.getResponseHeader().getStatusCode(),
+        set_cookie: msg.getResponseHeader().getHeader('Set-Cookie') !== null,
+        redirect: msg.getResponseHeader().getHeader('Location') !== null,
+        elapsed_ms: msg.getTimeElapsedMillis()};
     lock.lock();
     try {
         Files.writeString(output, JSON.stringify(row) + '\n', Options.CREATE, Options.APPEND);
