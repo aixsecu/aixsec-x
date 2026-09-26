@@ -15,6 +15,7 @@ from .goal_planner import Goal, GoalDrivenPlanner
 from .knowledge_graph import KnowledgeGraph, NodeKind
 from .planner_memory import PlannerMemory
 from .workflow_model import WorkflowModel
+from tool_orchestrator import OrchestrationRequest, ToolOrchestrator
 
 
 def _hash(value: Any) -> str:
@@ -78,8 +79,11 @@ class AutonomousRuntime:
         cost = self.cost_model.estimate(action)
         self.memory.learn(action, success, gain, cost.weighted,
                           str(result.get("error") or result.get("output") or ""))
+        providers = [attempt["provider"] for stage in result.get("orchestration", [])
+                     for attempt in stage.get("attempts", [])]
         observation = self.graph.add_node(NodeKind.OBSERVATION, {
-            "action_id": action["action_id"], "tool": action["tool"],
+            "action_id": action["action_id"], "capability": action["capability"],
+            "providers": providers,
             "outcome": outcome, "channel": "execution", "result_hash": _hash(result),
         })
         arguments = action.get("arguments") or {}
@@ -91,7 +95,7 @@ class AutonomousRuntime:
             if endpoints:
                 self.graph.add_edge(endpoints[0].node_id, "has_observation", observation.node_id)
                 data = result.get("data") or {}
-                if action["tool"] == "auth_compare":
+                if action["capability"] == "authorization_replay":
                     for value in data.get("observations") or []:
                         auth_observation = self.graph.add_node(
                             NodeKind.OBSERVATION, copy.deepcopy(value))
@@ -101,11 +105,11 @@ class AutonomousRuntime:
                         if evidence is not None:
                             evidence_node = self.graph.add_node(NodeKind.EVIDENCE,
                                 {"value": copy.deepcopy(evidence),
-                                 "source": "auth_compare"})
+                                 "source": action["capability"]})
                             self.graph.add_edge(auth_observation.node_id, "supported_by",
                                                 evidence_node.node_id)
         data = result.get("data") or {}
-        if success and action["tool"] in {"crawler", "api_discovery", "api_import"}:
+        if success and action["capability"] in {"crawler", "api_discovery", "openapi_import"}:
             discovered: list[tuple[str, list[str]]] = []
             for page in data.get("pages") or []:
                 if isinstance(page, dict) and page.get("url"):
@@ -126,7 +130,7 @@ class AutonomousRuntime:
                 if not self.graph.query(NodeKind.ENDPOINT, url=url):
                     self.graph.add_node(NodeKind.ENDPOINT, {
                         "url": url, "methods": methods, "auth_hints": [],
-                        "sources": [action["tool"]]})
+                        "sources": [action["capability"]]})
         for value in data.get("hypotheses") or []:
             if isinstance(value, dict):
                 self.graph.add_node(NodeKind.HYPOTHESIS, copy.deepcopy(value),
@@ -148,7 +152,14 @@ class AutonomousRuntime:
             raise RuntimeError("autonomous runtime has no executor")
         cost = self.cost_model.estimate(action)
         started = time.monotonic()
-        result = self.executor(copy.deepcopy(action))
+        orchestrator = ToolOrchestrator(available_tools=self.capabilities)
+        request = OrchestrationRequest(action["capability"], action.get("arguments") or {},
+            confirmation=bool(action.get("confirmation")))
+        def dispatch(tool, arguments):
+            execution = copy.deepcopy(action)
+            execution.update(tool=tool, arguments=arguments)
+            return self.executor(execution)
+        result = orchestrator.execute(request, dispatch)
         elapsed = time.monotonic() - started
         if not isinstance(result, dict):
             result = {"outcome": "error", "error": "executor returned non-object"}

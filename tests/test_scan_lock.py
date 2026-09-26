@@ -5,7 +5,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 from scan_state import RunLock, ScanBusyError
-from test_sequential_pipeline import config
+from tests.test_sequential_pipeline import config
 from agent import WebXAgent
 
 class LockTests(unittest.TestCase):

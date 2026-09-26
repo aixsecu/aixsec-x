@@ -101,7 +101,7 @@ Tools mới:
 ## Kiểm thử
 
 ```sh
-python3 -B -m unittest test_agent test_api_discovery test_auth_context test_security_analysis bench.test_bench -q
+python3 -B -m unittest tests.test_agent tests.test_api_discovery tests.test_auth_context tests.test_security_analysis bench.test_bench -q
 ```
 
 Integration tests dùng localhost, không gửi traffic tới bên thứ ba. Chúng kiểm

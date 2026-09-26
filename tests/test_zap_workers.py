@@ -8,7 +8,7 @@ import unittest
 from unittest.mock import patch
 from zap_workers import drive, parallel_safe
 from zap_schedule import ScanSchedule
-from test_sequential_pipeline import config, baseline, URL
+from tests.test_sequential_pipeline import config, baseline, URL
 from tools import TOOL_INDEX
 from agent import WebXAgent
 from scan_state import Journal
@@ -87,17 +87,17 @@ class WorkersTests(unittest.TestCase):
             rows=json.loads(har.read_text())
             rows['log']['entries'][1]['request']['url']=URL+'other?q=two'
             har.write_text(json.dumps(rows))
-            barrier=threading.Barrier(2)
             seen=[]
             def active(**kw):
                 self.assertEqual(kw['url'],kw['_config']['_zap_seed_entry']['request']['url'])
-                barrier.wait(3)
-                seen.append(kw['url'])
+                seeds=kw['_config'].get('_zap_seed_entries') or [kw['_config']['_zap_seed_entry']]
+                seen.extend(row['request']['url'] for row in seeds)
                 return 'ok',{'coverage':{'status':'complete'}}
             cfg=config(root,nuclei_enabled=False,zap_workers=2)
             with patch.object(TOOL_INDEX['zap_baseline'],'exec_fn',return_value=seed),patch.object(TOOL_INDEX['zap_active_scan'],'exec_fn',side_effect=active):
                 result=WebXAgent(cfg).run('scan')
             self.assertEqual(len(seen),2)
+            self.assertEqual(result['zap_performance']['jobs'],0)  # mocked legacy adapter omits metrics
             cfg['resume_session']=str(Path(result['progress']['path']).parent)
             with patch.object(TOOL_INDEX['zap_active_scan'],'exec_fn',side_effect=AssertionError('repeated')):
                 result=WebXAgent(cfg).run('scan')

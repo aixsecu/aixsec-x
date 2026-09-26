@@ -281,7 +281,7 @@ If the observer cannot run, active coverage remains unverified/partial.
 To verify your Kali browser/driver setup against a local form/AJAX fixture:
 
 ```bash
-WEBX_TEST_LIVE_ZAP=1 python3 -m unittest test_zap_live -v
+WEBX_TEST_LIVE_ZAP=1 python3 -m unittest tests.test_zap_live -v
 ```
 
 The opt-in test starts only a localhost server and checks an AJAX click, POST
@@ -388,4 +388,4 @@ every run if you want deduplication across runs. Internal requests made by a ZAP
 are not individual scheduler campaigns and can include related URLs.
 
 Local integration check without a browser or external target:
-`WEBX_TEST_LIVE_EVIDENCE=1 python3 -m unittest test_zap_live.LiveEvidenceTests -v`.
+`WEBX_TEST_LIVE_EVIDENCE=1 python3 -m unittest tests.test_zap_live.LiveEvidenceTests -v`.

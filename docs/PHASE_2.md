@@ -108,7 +108,7 @@ này. `Inventory.api_inventory()` tiếp tục cung cấp operation inventory Ph
 ## Kiểm thử
 
 ```sh
-python3 -B -m unittest test_agent test_api_discovery test_auth_context bench.test_bench -q
+python3 -B -m unittest tests.test_agent tests.test_api_discovery tests.test_auth_context bench.test_bench -q
 ```
 
 Integration tests dùng HTTP server localhost để kiểm tra login cookie, token

@@ -17,6 +17,7 @@ from urllib.parse import urljoin
 
 from http_engine import EvidenceRedactor
 from ledger import Finding
+from evidence_normalizer import normalize, validate_schema, SUPPORTED_TOOLS
 
 RANK = {'info': 0, 'low': 1, 'medium': 2, 'high': 3, 'critical': 4}
 
@@ -37,6 +38,7 @@ class EvidenceStore:
     def __init__(self, ledger, directory=None):
         self.ledger = ledger
         self.records = {}
+        self.normalized = {}
         self.candidates = {}
         self.coverage = []
         self.observations = []
@@ -71,13 +73,16 @@ class EvidenceStore:
         self.observations.append({'tool': name, 'outcome': result.get('outcome'),
             'url': EvidenceRedactor().redact_url(str(args.get('url') or '')),
             'data_sha256': stable_id('data', public(data)), 'artifact_ref': raw_artifact, 'time': time.time()})
+        normalized_rows = normalize(result, raw_artifact) if name in SUPPORTED_TOOLS else []
+        for normalized_row in normalized_rows:
+            validate_schema(normalized_row)
+            self.normalized[normalized_row['evidence_id']]=normalized_row
         if result.get('outcome') not in ('ok', 'partial', 'timeout'):
             self.persist()
             return
-        rows = []
-        if name in ('zap_baseline', 'zap_active_scan', 'nuclei_scan', 'sql_error_verify'):
-            rows = data.get('alerts') or []
-        elif name == 'wapiti_scan':
+        rows = normalized_rows
+        normalized = bool(name in SUPPORTED_TOOLS)
+        if name == 'wapiti_scan':
             for f in data.get('findings') or []:
                 rows.append({'category': f.get('category'), 'rule_id': f.get('category'),
                     'url': urljoin(str(data.get('target') or args.get('url') or ''), str(f.get('path') or '')),
@@ -90,37 +95,37 @@ class EvidenceStore:
                      'url': args.get('url'), 'parameter': args.get('param', ''),
                      'method': args.get('method', 'GET'), 'severity': 'high',
                      'description': 'Manual SQLi oracle reported a positive result.'}]
-        elif name in ('sqlmap_runner', 'sqlmap_check'):
-            output = str(result.get('output') or '')
-            for param, method in re.findall(r'^Parameter:\s*(\S+)\s*\((GET|POST|URI|Cookie|HEADER)\)', output, re.M):
-                if re.search(r'^\s+Type:\s*\S', output, re.M):
-                    rows.append({'category': 'SQL Injection', 'rule_id': 'sqli',
-                        'url': args.get('url'), 'parameter': param, 'method': method,
-                        'severity': 'high', 'description': 'sqlmap reported an injection point; validation required.'})
         for row in rows:
             if not isinstance(row, dict) or not row.get('category') or not row.get('url'):
                 continue
             row = dict(row)
-            row['source_tool'] = name
-            if not row.get('artifact_ref'):
-                row['artifact_ref'] = raw_artifact
-            row.setdefault('auth_context', args.get('auth_context', 'anonymous'))
-            row['url'] = EvidenceRedactor().redact_url(str(row['url']))
-            row['method'] = str(row.get('method') or 'GET').upper()
-            eid = stable_id('ev', [name, row.get('scan_id'), row.get('rule_id'), row['url'],
-                row['method'], row.get('parameter'), row['auth_context'], row.get('request_sha256'), row.get('response_sha256')])
-            row['evidence_id'] = eid
+            if normalized:
+                validate_schema(row)
+                eid=row['evidence_id']
+                self.normalized[eid]=row
+                if not row.get('_candidate'):
+                    continue
+            else:
+                row['source_tool'] = name
+                if not row.get('artifact_ref'):
+                    row['artifact_ref'] = raw_artifact
+                row.setdefault('auth_context', args.get('auth_context', 'anonymous'))
+                row['url'] = EvidenceRedactor().redact_url(str(row['url']))
+                row['method'] = str(row.get('method') or 'GET').upper()
+                eid = stable_id('ev', [name, row.get('scan_id'), row.get('rule_id'), row['url'],
+                    row['method'], row.get('parameter'), row['auth_context'], row.get('request_sha256'), row.get('response_sha256')])
+                row['evidence_id'] = eid
             self.records[eid] = row
             # Same tool/rule repeated is provenance, not independent confirmation.
             category = str(row['category']).lower()
             if category in ('sql injection', 'sqli'):
                 category = 'sqli'
-            key = stable_id('finding', [category, row['url'], row['method'],
+            key = row.get('finding_id') or stable_id('finding', [category, row['url'], row['method'],
                             row.get('parameter', ''), row['auth_context']])
             if key not in self.candidates:
                 finding = Finding(name=row['category'], url=row['url'],
                     severity=row.get('severity') if row.get('severity') in RANK else 'info',
-                    description=row.get('description', ''), fix=row.get('fix', ''),
+                    description=row.get('description') or row.get('evidence', ''), fix=row.get('fix', ''),
                     source_tool=name, sources=[name], parameter=str(row.get('parameter') or ''),
                     evidence=[eid], status='candidate', evidence_gaps=['Needs rule-specific validation'],
                     method=row['method'], auth_context=row['auth_context'], finding_id=key)
@@ -138,12 +143,16 @@ class EvidenceStore:
         row = self.records.get(evidence_id)
         if row is None:
             raise ValueError('Unknown evidence_id in this session')
+        if row.get('_normalized_schema'):
+            validate_schema(row)
         finding = next(f for f in self.candidates.values() if evidence_id in f.evidence)
         verdict, reason = 'needs_validation', 'No deterministic validator for this rule; replay/control evidence required'
         if row.get('auth_state') == 'unverified':
             reason = 'Requested authentication identity was not verified; configure auth verification before replay'
-        headers_raw = row.get('_response_header') or ''
-        request_raw = row.get('_request_header') or ''
+        private = row.get('_verification') or {}
+        headers_raw = private.get('response_header') if row.get('_normalized_schema') else row.get('_response_header')
+        request_raw = private.get('request_header') if row.get('_normalized_schema') else row.get('_request_header')
+        headers_raw=headers_raw or '';request_raw=request_raw or ''
         # Validate only clearly defined missing-header facts on successful HTML
         # responses. Do not infer XSS/CORS/SQLi from a reflected string or HTTP 200.
         match = re.match(r'HTTP/\S+\s+(\d{3})', headers_raw)
@@ -175,6 +184,7 @@ class EvidenceStore:
             else:
                 finding.evidence_gaps = [reason]
         row['validation'] = {'status': verdict, 'reason': reason, 'validator': 'headers-v1'}
+        row['verification_state'] = verdict
         self.persist()
         return {'evidence_id': evidence_id, 'finding_id': finding.finding_id,
                 'status': finding.status, 'reason': reason}
@@ -183,9 +193,11 @@ class EvidenceStore:
         import auth_context
         import http_engine as he
         row = self.records.get(evidence_id)
-        if not row or not row.get('_request_header'):
+        private=(row or {}).get('_verification') or {}
+        request_header=private.get('request_header') if (row or {}).get('_normalized_schema') else (row or {}).get('_request_header')
+        if not row or not request_header:
             raise ValueError('Evidence has no captured request to replay')
-        url = str(row.get('_url') or row['url'])
+        url = str((private.get('url') if row.get('_normalized_schema') else row.get('_url')) or row['url'])
         if not policy.in_scope_url(url):
             raise ValueError('Replay URL outside current scope')
         if EvidenceRedactor().redact_url(url) != url:
@@ -193,13 +205,13 @@ class EvidenceStore:
         context_name = row.get('auth_context', 'anonymous')
         headers = {}
         # Do not copy stale credentials, cookies, Host, or hop-by-hop headers.
-        for line in row['_request_header'].splitlines()[1:]:
+        for line in request_header.splitlines()[1:]:
             if ':' in line:
                 key, value = line.split(':', 1)
                 if key.lower().strip() in ('content-type', 'accept'):
                     headers[key.strip()] = value.strip()
         spec = {'url': url, 'method': row['method'], 'headers': headers,
-                'body': row.get('_request_body') or None,
+                'body': (private.get('request_body') if row.get('_normalized_schema') else row.get('_request_body')) or None,
                 'follow_redirects': False, 'timeout': min(30, max(1, timeout))}
         if context_name != 'anonymous':
             context = auth_context.manager().get(context_name)
@@ -217,7 +229,8 @@ class EvidenceStore:
         digest = hashlib.sha256(response.content).hexdigest()
         value = {'evidence_id': evidence_id, 'auth_context': context_name,
                  'status': response.status_code, 'url': row['url'],
-                 'body_sha256': digest, 'body_matches_capture': digest == row.get('_body_sha256'),
+                 'body_sha256': digest, 'body_matches_capture': digest == (
+                     private.get('body_sha256') if row.get('_normalized_schema') else row.get('_body_sha256')),
                  'interpretation': 'facts_only', 'verdict': False}
         row.setdefault('replays', []).append(value)
         self.persist()
@@ -227,8 +240,15 @@ class EvidenceStore:
         return {'coverage': self.coverage,
                 'discovery': self.discovery,
                 'evidence': [public(v) for v in self.records.values()],
+                'normalized_evidence': [public(v) for v in self.normalized.values()],
                 'findings': [asdict(f) for f in self.candidates.values()],
                 'observations': self.observations}
+
+    def planner_records(self):
+        """Provider-neutral normalized candidates for planning."""
+        denied={'tool','tool_version','source_tool','artifact_ref','raw_result_reference'}
+        return [{k:v for k,v in public(row).items() if k not in denied}
+                for row in self.records.values()]
 
     def persist(self):
         if self.directory:

@@ -10,7 +10,7 @@ from typing import Any
 def strategy_fingerprint(action: dict) -> str:
     args = action.get("arguments") or {}
     # Values can contain credentials; only stable argument shape and target are retained.
-    safe = {"tool": action.get("tool"), "goal": action.get("goal"),
+    safe = {"capability": action.get("capability") or action.get("tool"), "goal": action.get("goal"),
             "hypothesis_id": action.get("hypothesis_id"),
             "argument_keys": sorted(args),
             "target": args.get("url") or args.get("target") or ""}
@@ -28,6 +28,7 @@ class PlannerMemory:
               cost: float = 0.0, reason: str = "") -> dict:
         key = strategy_fingerprint(action)
         record = self.records.setdefault(key, {"strategy_id": key,
+            "capability": action.get("capability") or action.get("tool", ""),
             "tool": action.get("tool", ""), "attempts": 0, "successes": 0,
             "failures": 0, "information_gain": 0.0, "cost": 0.0,
             "last_failure_reason": "",
@@ -44,7 +45,11 @@ class PlannerMemory:
 
     def should_attempt(self, action: dict, retry_failed: bool = False) -> bool:
         record = self.records.get(strategy_fingerprint(action))
-        return not record or record["failures"] == 0 or record["successes"] > 0 or retry_failed
+        if not record:
+            return True
+        if record["successes"] > 0:
+            return False
+        return retry_failed and record["failures"] > 0
 
     def utility_adjustment(self, action: dict) -> float:
         record = self.records.get(strategy_fingerprint(action))
