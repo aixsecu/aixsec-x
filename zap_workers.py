@@ -167,8 +167,10 @@ def drive(jobs, start, workers=2, cookie_mode='strict', policy=None, auto=None):
                     continue
                 reasons = scheduling_reasons(entry, cookie_mode, policy)
                 width = auto.limit(target_origin, entry) if auto and not (policy and policy.match(entry)) else workers
+                serial = bool(reasons) or bool(auto and not (policy and policy.match(entry))
+                                               and auto.bootstrap_serial(entry))
                 saturated = sum(active_origin == target_origin for _, active_origin, _ in pending.values()) >= width
-                conflicts = saturated or any(active_origin == target_origin and (reasons or active_serial)
+                conflicts = saturated or any(active_origin == target_origin and (serial or active_serial)
                                 for _, active_origin, active_serial in pending.values())
                 if conflicts:
                     waiting_origins.add(target_origin)
@@ -180,8 +182,10 @@ def drive(jobs, start, workers=2, cookie_mode='strict', policy=None, auto=None):
                 continue
             entry, target_origin, _ = queue.pop(index)
             reasons = scheduling_reasons(entry, cookie_mode, policy)
-            if reasons:
-                print('[zap] serial group (origin): ' + ', '.join(reasons), flush=True)
+            serial = bool(reasons) or bool(auto and not (policy and policy.match(entry))
+                                           and auto.bootstrap_serial(entry))
+            if serial:
+                print('[zap] serial group (origin): ' + ', '.join(reasons or ['bootstrap_neutral']), flush=True)
             generator = start(entry, cancelled)
             try:
                 call = next(generator)
@@ -194,10 +198,12 @@ def drive(jobs, start, workers=2, cookie_mode='strict', policy=None, auto=None):
             # Preparation may downgrade a group after fresh controls. Drain that
             # origin before starting its now-serial scan; other origins continue.
             reasons = scheduling_reasons(entry, cookie_mode, policy)
-            if reasons:
+            serial = bool(reasons) or bool(auto and not (policy and policy.match(entry))
+                                           and auto.bootstrap_serial(entry))
+            if serial:
                 while any(active_origin == target_origin for _, active_origin, _ in pending.values()):
                     collect()
-            pending[pool.submit(call)] = (generator, target_origin, bool(reasons))
+            pending[pool.submit(call)] = (generator, target_origin, serial)
         while pending:
             collect()
         return stop_reason
