@@ -94,7 +94,7 @@ No network test was performed against a third-party target.
 ## Validation
 
 ```sh
-python3 -m unittest test_agent test_api_discovery bench.test_bench -q
+python3 -m unittest tests.test_agent tests.test_api_discovery bench.test_bench -q
 ```
 
 Tests require permission to bind ephemeral localhost ports. They cover parser

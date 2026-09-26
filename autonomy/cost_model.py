@@ -19,6 +19,10 @@ class CostModel:
     """Estimates existing tools; it never introduces tools or payloads."""
 
     DEFAULTS = {
+        "http_observation": ActionCost(1, 1, .1),
+        "crawler": ActionCost(10, 15, .2),
+        "authorization_replay": ActionCost(2, 2, .2),
+        "sql_injection_verification": ActionCost(3, 4, .8),
         "zap_baseline": ActionCost(400, 300, .5),
         "zap_active_scan": ActionCost(2000, 300, 2),
         "evidence_validate": ActionCost(0, .01, 0),
@@ -44,7 +48,8 @@ class CostModel:
             self.profiles[name] = value if isinstance(value, ActionCost) else ActionCost(**value)
 
     def estimate(self, action: dict) -> ActionCost:
-        return self.profiles.get(str(action.get("tool", "")), ActionCost(1, 2, .5))
+        key = str(action.get("capability") or action.get("tool") or "")
+        return self.profiles.get(key, ActionCost(1, 2, .5))
 
 
 @dataclass

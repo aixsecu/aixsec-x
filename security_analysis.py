@@ -15,6 +15,7 @@ from typing import Any
 
 import auth_context
 import http_engine as he
+from capability_registry import Capability, registry
 from autonomy import (ExecutionBudget, Goal, GoalDrivenPlanner, KnowledgeGraph,
                       PlannerMemory, WorkflowModel)
 
@@ -99,10 +100,11 @@ class SecurityAnalysisState:
         max_actions = max(1, min(int(max_actions), 50))
         actions = []
 
-        def add(priority, tool, args, reason, hypothesis="", blocked_by=None):
-            if tool not in self.capabilities:
+        def add(priority, capability, args, reason, hypothesis="", blocked_by=None):
+            provider = registry().resolve(capability, self.capabilities, confirmation=True)
+            if provider is None:
                 state = "blocked"
-                blocked = ["tool_unavailable"]
+                blocked = ["capability_unavailable"]
             else:
                 state = "planned"
                 blocked = list(blocked_by or [])
@@ -110,15 +112,18 @@ class SecurityAnalysisState:
                     state = "blocked"
             endpoint = str(args.get("url") or "")
             param = str(args.get("param") or "")
-            vuln = {"auth_compare": "authorization", "authorization_reason": "authorization",
-                    "sqli_manual_test": "sqli", "http_request": "recon",
-                    "api_discovery": "recon"}.get(tool, "")
+            vuln = {Capability.AUTHORIZATION_REPLAY: "authorization",
+                    Capability.AUTHORIZATION_ANALYSIS: "authorization",
+                    Capability.SQL_INJECTION_VERIFICATION: "sqli",
+                    Capability.HTTP_OBSERVATION: "recon",
+                    Capability.API_DISCOVERY: "recon"}.get(capability, "")
             if endpoint and self.test_history.already_tested(endpoint, param, vuln):
                 state, blocked = "completed", ["already_tested"]
-            action = {"priority": priority, "tool": tool, "arguments": args,
+            action = {"priority": priority, "arguments": args,
                       "reason": reason, "hypothesis_id": hypothesis,
                       "state": state, "blocked_by": blocked}
             action["action_id"] = _id("act", action)
+            action["capability"] = capability
             actions.append(action)
 
         for evidence in self.inventory.analysis.get("scanner_evidence") or []:
@@ -126,10 +131,10 @@ class SecurityAnalysisState:
             if not eid or (evidence.get("validation") or {}).get("status") == "confirmed":
                 continue
             if not evidence.get("validation"):
-                add(90, "evidence_validate", {"evidence_id": eid},
+                add(90, Capability.EVIDENCE_VALIDATION, {"evidence_id": eid},
                     "Scanner candidate needs deterministic validation", eid)
             elif not evidence.get("replays"):
-                add(65, "evidence_replay", {"evidence_id": eid},
+                add(65, Capability.EVIDENCE_REPLAY, {"evidence_id": eid},
                     "Collect replay facts for scanner candidate; replay alone does not confirm exploitability", eid)
 
         for operation in self.inventory.api_inventory():
@@ -142,7 +147,7 @@ class SecurityAnalysisState:
                 configured = {item["name"] for item in auth_context.manager().list()}
                 missing = [name for name in ("anonymous", "user_A")
                            if name not in configured]
-                add(95, "auth_compare", {"contexts": ["anonymous", "user_A"],
+                add(95, Capability.AUTHORIZATION_REPLAY, {"contexts": ["anonymous", "user_A"],
                     "request": {"url": url, "method": method}},
                     "Protected API operation has no cross-context observation yet",
                     blocked_by=(["configure_contexts:" + ",".join(missing)] if missing else []))
@@ -154,13 +159,13 @@ class SecurityAnalysisState:
                         blockers.append("provide_control_form_or_json_body")
                     if "{" in url:
                         blockers.append("substitute_observed_path_parameters")
-                    add(55, "sqli_manual_test", {"url": url, "param": parameter,
+                    add(55, Capability.SQL_INJECTION_VERIFICATION, {"url": url, "param": parameter,
                         "method": method.lower()},
                         "Discovered input has no SQL injection validation record",
                         blocked_by=blockers)
             if not any(o.get("state") == "observed" for o in observations):
                 blockers = ["substitute_observed_path_parameters"] if "{" in url else []
-                add(35, "http_request", {"url": url, "method": method.lower()},
+                add(35, Capability.HTTP_OBSERVATION, {"url": url, "method": method.lower()},
                     "Declared/candidate operation has not been directly observed",
                     blocked_by=blockers)
 
@@ -168,13 +173,13 @@ class SecurityAnalysisState:
             for endpoint in host.endpoints.values():
                 if endpoint.auth_observations:
                     hid = _id("hyp", [endpoint.url, "authorization"])
-                    add(100, "authorization_reason", {"url": endpoint.url},
+                    add(100, Capability.AUTHORIZATION_ANALYSIS, {"url": endpoint.url},
                         "Authorization observations are ready for evidence-bound reasoning", hid)
 
         for correlation in self.correlate(max_results=50)["correlations"]:
             validation = correlation.get("validation") or {}
-            if validation.get("tool"):
-                add(85, validation["tool"], validation.get("arguments") or {},
+            if validation.get("capability"):
+                add(85, validation["capability"], validation.get("arguments") or {},
                     "SAST sink correlates with a discovered DAST operation",
                     correlation["correlation_id"], validation.get("blocked_by"))
 
@@ -188,10 +193,10 @@ class SecurityAnalysisState:
         intelligent = GoalDrivenPlanner(
             graph, self.planner_memory, self.workflow_model,
             capabilities=self.capabilities).plan(Goal(goal), budget, max_actions=50)
-        known = {(item["tool"], json.dumps(item["arguments"], sort_keys=True,
+        known = {(item["capability"], json.dumps(item["arguments"], sort_keys=True,
                                            default=str)) for item in actions}
         for candidate in intelligent["actions"]:
-            key = (candidate["tool"], json.dumps(candidate["arguments"],
+            key = (candidate["capability"], json.dumps(candidate["arguments"],
                                                   sort_keys=True, default=str))
             if key not in known:
                 candidate["priority"] = int(candidate["score"] * 10)
@@ -203,6 +208,8 @@ class SecurityAnalysisState:
         selected = actions[:max_actions]
         result = {"plan_id": _id("plan", [goal, selected]), "goal": goal,
                   "generated_at": round(time.time(), 2), "actions": selected,
+                  "stop_reason": ("evidence_sufficient" if not any(
+                      action["state"] == "planned" for action in selected) else ""),
                   "counts": {state: sum(a["state"] == state for a in selected)
                              for state in ("planned", "blocked", "completed")}}
         self._sync("latest_plan", result)
@@ -441,10 +448,12 @@ class SecurityAnalysisState:
     def _validation(category, url, method, parameters):
         parameter = parameters[0] if parameters else ""
         if category == "sqli" and parameter:
-            return {"tool": "sqli_manual_test", "arguments": {
+            capability=Capability.SQL_INJECTION_VERIFICATION
+            return {"capability":capability,"arguments": {
                     "url": url, "method": str(method or "GET").lower(), "param": parameter},
                     "blocked_by": []}
-        return {"tool": "http_request", "arguments": {
+        capability=Capability.HTTP_OBSERVATION
+        return {"capability":capability,"arguments": {
                 "url": url, "method": str(method or "GET").lower()},
                 "blocked_by": ["manual_payload_and_control_required"],
                 "note": "Correlation is a lead; preserve a control/payload pair and do not infer exploitability from SAST alone"}

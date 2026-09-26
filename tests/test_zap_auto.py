@@ -9,7 +9,7 @@ from unittest.mock import patch
 from zap_auto import AutoConcurrency, controls, classify_cookies, classify_redirect
 from zap_concurrency import ConcurrencyPolicy
 from zap_workers import drive, scheduling_reasons
-from test_zap_workers import entry
+from tests.test_zap_workers import entry
 
 
 def job(path):

@@ -891,7 +891,7 @@ class TestFindFormsRemoved(unittest.TestCase):
         self.assertIn("http_probe", names)
 
     def test_source_clean(self):
-        base = os.path.dirname(__file__)
+        base = os.path.dirname(os.path.dirname(__file__))
         for mod in ("tools.py", "prompts.py", "agent.py", "ledger.py"):
             with open(os.path.join(base, mod), encoding="utf-8") as fh:
                 src_mod = fh.read()

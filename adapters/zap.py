@@ -159,10 +159,15 @@ def _openapi_file(config, target, workdir):
 def build_plan(config, target, workdir, *, active=False, rule_ids=(), auth_context='anonymous', ajax=False):
     target = canonical_url(target)
     context, user = _operator_context(config, target, auth_context)
+    seed_entries = list(config.get('_zap_seed_entries') or [])
     if active:
         # URL-only active jobs can select just the GET node and miss POST nodes.
         # Scan the context instead, constrained to exactly this endpoint path.
-        context['includePaths'] = [re.escape(origin(target) + (urlsplit(target).path or '/')) + r'(?:\?.*)?$']
+        targets = [str((entry.get('request') or {}).get('url') or '') for entry in seed_entries] or [target]
+        if any(not within(value, target) for value in targets):
+            raise ValueError('Batched ZAP seeds must remain within one origin')
+        context['includePaths'] = sorted({re.escape(origin(value) + (urlsplit(value).path or '/')) + r'(?:\?.*)?$'
+                                          for value in targets})
     minutes = max(1, int(config.get('zap_phase_minutes', 2)))
     common = {'context': 'aixsec', **({'user': user} if user else {})}
     depth = max(1, int(config.get('zap_spider_depth', 10)))
@@ -180,11 +185,13 @@ def build_plan(config, target, workdir, *, active=False, rule_ids=(), auth_conte
     # selected endpoint so active scans are not limited to a fresh GET crawl.
     seed_entry = config.get('_zap_seed_entry') if active else None
     seed = config.get('_zap_seed_har') if active else None
-    if seed_entry:
+    if seed_entries or seed_entry:
         seed_path = Path(workdir) / 'seed.har'
-        entry = copy.deepcopy(seed_entry)
-        entry['request']['headers'] = [h for h in entry['request'].get('headers', []) if h.get('name', '').lower() != 'x-zap-scan-id']
-        seed_path.write_text(json.dumps({'log': {'version': '1.2', 'creator': {'name': 'AIXSEC-X', 'version': '1'}, 'entries': [entry]}}))
+        entries = copy.deepcopy(seed_entries or [seed_entry])
+        for entry in entries:
+            entry['request']['headers'] = [h for h in entry['request'].get('headers', [])
+                                           if h.get('name', '').lower() != 'x-zap-scan-id']
+        seed_path.write_text(json.dumps({'log': {'version': '1.2', 'creator': {'name': 'AIXSEC-X', 'version': '1'}, 'entries': entries}}))
         seed_path.chmod(0o600)
         jobs.append({'type': 'import', 'parameters': {'type': 'har', 'fileName': str(seed_path)}})
         seed = None
@@ -211,17 +218,17 @@ def build_plan(config, target, workdir, *, active=False, rule_ids=(), auth_conte
             seed_path.chmod(0o600)
             jobs.append({'type': 'import', 'parameters': {'type': 'har',
                          'fileName': str(seed_path)}})  # default: import only; older add-ons lack sendRequests
-    spec = _openapi_file(config, target, workdir) if not seed_entry else None
+    spec = _openapi_file(config, target, workdir) if not (seed_entry or seed_entries) else None
     if spec:
         # Older bundled OpenAPI add-ons reject maxMessages. Keep the plan
         # compatible; zap_max_urls is only a planning estimate, not an import cap.
         jobs.append({'type': 'openapi', 'parameters': {**common, 'apiFile': spec,
                      'targetUrl': origin(target)}})
-    if not seed_entry:
+    if not (seed_entry or seed_entries):
         jobs.append({'type': 'spider', 'parameters': {**common, 'url': target,
             'maxDuration': minutes, 'maxDepth': depth,
             'maxChildren': max(1, int(config.get('zap_spider_children', 50))), 'logoutAvoidance': True}})
-    if ajax and not seed_entry:
+    if ajax and not (seed_entry or seed_entries):
         jobs.append({'type': 'spiderAjax', 'parameters': {**common, 'url': target,
             'maxDuration': minutes, 'maxCrawlDepth': depth, 'numberOfBrowsers': 1,
             'inScopeOnly': True, 'scopeCheck': 'Strict',
@@ -508,6 +515,7 @@ def run_scan(config, url, *, active=False, rule_ids=(), auth_context='anonymous'
         gaps.append('No captured request attributed to the selected active rules')
         if state == 'complete':
             state = 'partial'
+    batch_size = len(config.get('_zap_seed_entries') or []) or 1
     coverage = {'scan_id': scan_id, 'tool': 'zap_active_scan' if active else 'zap_baseline',
         'target': EvidenceRedactor().redact_url(canonical_url(url)), 'status': state,
         'auth_context': auth_context, 'auth_state': auth_state,
@@ -515,7 +523,11 @@ def run_scan(config, url, *, active=False, rule_ids=(), auth_context='anonymous'
         'requested_rule_ids': sorted(set(rule_ids)), 'ajax_requested': ajax,
         'openapi_requested': bool(config.get('zap_openapi_file')), 'returncode': code,
         'duration': round(time.monotonic() - started, 2), 'report_path': str(report_path),
-        'log_path': str(log_path), 'error': parse_error, **metadata}
+        'log_path': str(log_path), 'error': parse_error, **metadata,
+        'performance': {'job_duration': round(time.monotonic() - started, 2),
+                        'batch_size': batch_size, 'rules_executed': len(set(rule_ids)),
+                        'requests_executed': inventory['test_request_count'],
+                        'jvm_reused': max(0, batch_size - 1), 'jvm_launches': 1}}
     coverage['active_evidence'] = diagnostics
     coverage.update(status_meaning='execution_only_not_full_coverage', phases=phases, gaps=gaps,
                     inventory_path=str(inventory_path), har_path=str(har_path),

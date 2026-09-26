@@ -64,14 +64,14 @@ class SecurityAnalysisTests(unittest.TestCase):
         self.inventory.ingest([{"name": "api_import", "outcome": "ok",
                                 "data": api_data(url)}])
         first = security_analysis.manager().plan(max_actions=20)
-        auth = next(a for a in first["actions"] if a["tool"] == "auth_compare")
+        auth = next(a for a in first["actions"] if a["capability"] == "authorization_replay")
         self.assertEqual(auth["state"], "blocked")
         self.assertIn("configure_contexts", auth["blocked_by"][0])
-        sql = next(a for a in first["actions"] if a["tool"] == "sqli_manual_test")
+        sql = next(a for a in first["actions"] if a["capability"] == "sql_injection_verification")
         self.assertEqual(sql["state"], "planned")
         self.history.add(url, "id", "sqli", "sqli_manual_test", "ok")
         second = security_analysis.manager().plan(max_actions=20)
-        sql2 = next(a for a in second["actions"] if a["tool"] == "sqli_manual_test")
+        sql2 = next(a for a in second["actions"] if a["capability"] == "sql_injection_verification")
         self.assertEqual(sql2["state"], "completed")
         self.assertNotEqual(first["plan_id"], second["plan_id"])
         self.assertEqual(self.inventory.analysis["latest_plan"], second)
@@ -81,7 +81,7 @@ class SecurityAnalysisTests(unittest.TestCase):
         data = api_data(url); data["operations"][0]["method"] = "POST"
         self.inventory.ingest([{"name": "api_import", "outcome": "ok", "data": data}])
         plan = security_analysis.manager().plan(max_actions=20)
-        sql = next(a for a in plan["actions"] if a["tool"] == "sqli_manual_test")
+        sql = next(a for a in plan["actions"] if a["capability"] == "sql_injection_verification")
         self.assertEqual(sql["state"], "blocked")
         self.assertEqual(set(sql["blocked_by"]),
                          {"provide_control_form_or_json_body", "substitute_observed_path_parameters"})
@@ -174,7 +174,8 @@ class SecurityAnalysisTests(unittest.TestCase):
         result = security_analysis.manager().correlate()
         correlation = result["correlations"][0]
         self.assertGreaterEqual(correlation["score"], .8)
-        self.assertEqual(correlation["validation"]["tool"], "sqli_manual_test")
+        self.assertEqual(correlation["validation"]["capability"], "sql_injection_verification")
+        self.assertNotIn("tool", correlation["validation"])
         self.assertEqual(correlation["validation"]["arguments"]["param"], "id")
         self.assertFalse(correlation["verdict"])
 
