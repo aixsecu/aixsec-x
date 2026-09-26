@@ -118,6 +118,8 @@ def candidate_reasons(entry, config):
 def bootstrap_eligible(entry):
     """Return whether a group is safe for the bounded two-worker bootstrap."""
     from zap_workers import has_request_body
+    if entry.get('_auto_reasons'):
+        return False
     req = entry['_entry']['request']
     if req.get('method', 'GET').upper() not in ('GET', 'HEAD'):
         return False
@@ -256,6 +258,9 @@ class AutoConcurrency:
              'unstable_groups':{},'groups_since_change':0,'bootstrap_groups':{}})
     def _bootstrap_active(self,entry):
         return self._state(entry).get('mode')=='bootstrap' and bootstrap_eligible(entry)
+    def bootstrap_serial(self,entry):
+        """A neutral bootstrap group still requires exclusive origin execution."""
+        return self._state(entry).get('mode')=='bootstrap' and not bootstrap_eligible(entry)
     def _bootstrap_fail(self,entry,reason):
         state=self._state(entry)
         state.update(mode='steady',level=1,bootstrap_result='unstable',
@@ -333,26 +338,28 @@ class AutoConcurrency:
     def prepare(self,entry):
         # Called only after scope/approval, and only for a task not restored/skipped.
         from zap_workers import scheduling_reasons
-        if self.policy.match(entry) or scheduling_reasons(entry,'auto',self.policy): return
+        if self.policy.match(entry) or self.bootstrap_serial(entry) or scheduling_reasons(entry,'auto',self.policy): return
         group=self.data['groups'].get(entry['request_id'],{})
         if group.get('quarantined'):
             entry['_auto_reasons']=['auto_group_quarantine'];return
+        bootstrap=self._bootstrap_active(entry)
         try: decision=controls(self.config,entry,self.path.parent)
         except Exception:
             decision={'stable':False,'reason':'control_request_error'}
         self.data['decisions'][entry['request_id']]=decision
         if not decision['stable']:
-            entry['_auto_reasons']=[decision['reason']]
-            if self._bootstrap_active(entry):
+            if bootstrap:
                 self._bootstrap_fail(entry,decision['reason'])
+            entry['_auto_reasons']=[decision['reason']]
             self._quarantine(entry,decision['reason'],-2,'unstable control pair')
         self.save()
     def observe(self,entry,result):
         if self.policy.match(entry): return
         state=self._state(entry)
         if state.get('mode')=='bootstrap' and not bootstrap_eligible(entry):
-            # Unsafe groups retain the pre-bootstrap, one-worker learning path.
-            state['mode']='steady';self.save()
+            # Scheduling constraints are neutral evidence: execute them safely,
+            # but do not advance, fail, or terminate the bootstrap learner.
+            return
         bootstrap=self._bootstrap_active(entry)
         coverage=(result.get('data') or {}).get('coverage') or {}
         decision=self.data['decisions'].get(entry['request_id'],{})
