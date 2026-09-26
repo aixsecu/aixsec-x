@@ -30,7 +30,7 @@ class Journal:
         self.directory = Path(directory)
         self.path = self.directory / 'progress.json'
         # Resume cannot silently move old observations into another target/configuration.
-        ignored = {'resume_session', 'retry_incomplete'}
+        ignored = {'resume_session', 'retry_incomplete', '_zap_worker_pool'}
         fingerprint = digest({k:v for k,v in config.items() if k not in ignored})
         if self.path.exists():
             self.data = json.loads(self.path.read_text())

@@ -1,6 +1,7 @@
 """Bounded ZAP workers; all journal/evidence mutations stay on the caller thread."""
 from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
 import threading
+import time
 
 
 def batch_jobs(jobs, max_size=1, cookie_mode='strict', policy=None):
@@ -117,7 +118,7 @@ def scheduling_summary(jobs, workers=2, cookie_mode='strict', policy=None):
             'serial_reasons':dict(counts), 'policy_matches':dict(policy_counts), 'groups':rows}
 
 
-def drive(jobs, start, workers=2, cookie_mode='strict', policy=None, auto=None):
+def drive(jobs, start, workers=2, cookie_mode='strict', policy=None, auto=None, metrics=None):
     """start returns a generator: yield a callable, receive its result on caller thread."""
     from adapters.zap import origin
     # Classify before dispatch so malformed/ambiguous policy cannot partly run.
@@ -126,19 +127,44 @@ def drive(jobs, start, workers=2, cookie_mode='strict', policy=None, auto=None):
     cancelled = threading.Event()
     pool = ThreadPoolExecutor(max_workers=workers, thread_name_prefix='zap')
     pending = {}
+    enqueued = {id(entry): time.perf_counter_ns() for entry, _, _ in queue}
+    waiting = {}
+    submitted = {}
+    completed_at = {}
+    metrics_started = time.perf_counter_ns()
+    scheduler_idle_ns = 0
     completed = 0
     stop = False
     stop_reason = ''
 
+    def mark_wait(entry, kind):
+        now = time.perf_counter_ns();state = waiting.get(id(entry))
+        if state and state[0] == kind:
+            return
+        if state:
+            entry.setdefault('_scheduler_performance', {})[state[0]] = \
+                entry.setdefault('_scheduler_performance', {}).get(state[0], 0) + (now-state[1])/1_000_000
+        waiting[id(entry)] = (kind, now)
+
+    def finish_wait(entry):
+        state = waiting.pop(id(entry), None)
+        if state:
+            now=time.perf_counter_ns();perf=entry.setdefault('_scheduler_performance', {})
+            perf[state[0]]=perf.get(state[0],0)+(now-state[1])/1_000_000
+
     def collect(block=True):
-        nonlocal completed, stop, stop_reason
+        nonlocal completed, stop, stop_reason, scheduler_idle_ns
         if not pending:
             return
+        wait_started=time.perf_counter_ns()
         done, _ = wait(pending, timeout=30 if block else 0, return_when=FIRST_COMPLETED)
+        if block:
+            scheduler_idle_ns += time.perf_counter_ns()-wait_started
         if not done and block:
             print(f'[zap] {completed}/{len(jobs)} groups finished; {len(pending)} running', flush=True)
         for future in done:
             generator, _, _ = pending.pop(future)
+            completed_at[future] = getattr(future, '_aixsec_finished_ns', time.perf_counter_ns())
             result = future.result()
             try:
                 generator.send(result)
@@ -160,10 +186,11 @@ def drive(jobs, start, workers=2, cookie_mode='strict', policy=None, auto=None):
                 collect()
                 continue
             index = None
-            waiting_origins = set()
+            waiting_origins = {}
             for i, (entry, target_origin, reasons) in enumerate(queue):
                 # Preserve dispatch order within an origin, including barriers.
                 if target_origin in waiting_origins:
+                    mark_wait(entry, waiting_origins[target_origin])
                     continue
                 reasons = scheduling_reasons(entry, cookie_mode, policy)
                 width = auto.limit(target_origin, entry) if auto and not (policy and policy.match(entry)) else workers
@@ -173,7 +200,16 @@ def drive(jobs, start, workers=2, cookie_mode='strict', policy=None, auto=None):
                 conflicts = saturated or any(active_origin == target_origin and (serial or active_serial)
                                 for _, active_origin, active_serial in pending.values())
                 if conflicts:
-                    waiting_origins.add(target_origin)
+                    if any(active_origin == target_origin and active_serial
+                           for _, active_origin, active_serial in pending.values()) or serial:
+                        kind='serial_barrier_wait_ms'
+                    elif auto and auto.data.get('origins',{}).get(target_origin,{}).get('mode')=='bootstrap':
+                        kind='bootstrap_wait_ms'
+                    elif auto:
+                        kind='auto_concurrency_wait_ms'
+                    else:
+                        kind='origin_saturation_ms'
+                    waiting_origins[target_origin]=kind;mark_wait(entry,kind)
                     continue
                 index = i
                 break
@@ -181,12 +217,15 @@ def drive(jobs, start, workers=2, cookie_mode='strict', policy=None, auto=None):
                 collect()
                 continue
             entry, target_origin, _ = queue.pop(index)
+            finish_wait(entry)
+            perf=entry.setdefault('_scheduler_performance', {})
+            perf['scheduler_wait_ms']=(time.perf_counter_ns()-enqueued[id(entry)])/1_000_000
             reasons = scheduling_reasons(entry, cookie_mode, policy)
             serial = bool(reasons) or bool(auto and not (policy and policy.match(entry))
                                            and auto.bootstrap_serial(entry))
             if serial:
                 print('[zap] serial group (origin): ' + ', '.join(reasons or ['bootstrap_neutral']), flush=True)
-            generator = start(entry, cancelled)
+            dispatch_started=time.perf_counter_ns();generator = start(entry, cancelled)
             try:
                 call = next(generator)
             except StopIteration as finished:
@@ -203,9 +242,26 @@ def drive(jobs, start, workers=2, cookie_mode='strict', policy=None, auto=None):
             if serial:
                 while any(active_origin == target_origin for _, active_origin, _ in pending.values()):
                     collect()
-            pending[pool.submit(call)] = (generator, target_origin, serial)
+            perf['scheduler_dispatch_ms']=(time.perf_counter_ns()-dispatch_started)/1_000_000-float(perf.get('prepare_ms',0))
+            future=pool.submit(call);submitted[future]=time.perf_counter_ns()
+            future.add_done_callback(lambda value:setattr(value,'_aixsec_finished_ns',time.perf_counter_ns()))
+            pending[future] = (generator, target_origin, serial)
         while pending:
             collect()
+        if metrics is not None:
+            elapsed=max(1,time.perf_counter_ns()-metrics_started)
+            busy=sum(max(0,completed_at.get(future,time.perf_counter_ns())-started)
+                     for future,started in submitted.items())
+            rows=[entry.get('_scheduler_performance',{}) for entry in jobs]
+            metrics.update(workers=workers,elapsed_ms=elapsed/1_000_000,
+                worker_utilization=min(1.0,busy/(elapsed*max(1,workers))),
+                scheduler_idle_ms=scheduler_idle_ns/1_000_000,
+                scheduler_wait_ms=sum(float(row.get('scheduler_wait_ms',0)) for row in rows),
+                scheduler_dispatch_ms=sum(float(row.get('scheduler_dispatch_ms',0)) for row in rows),
+                serial_barrier_wait_ms=sum(float(row.get('serial_barrier_wait_ms',0)) for row in rows),
+                bootstrap_wait_ms=sum(float(row.get('bootstrap_wait_ms',0)) for row in rows),
+                auto_concurrency_wait_ms=sum(float(row.get('auto_concurrency_wait_ms',0)) for row in rows),
+                origin_saturation_ms=sum(float(row.get('origin_saturation_ms',0)) for row in rows))
         return stop_reason
     finally:
         cancelled.set()

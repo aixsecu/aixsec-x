@@ -20,6 +20,20 @@ def entry(path, method='GET', headers=None):
 
 
 class WorkersTests(unittest.TestCase):
+    def test_drive_exposes_scheduler_metrics_without_changing_results(self):
+        metrics={};results=[]
+        def start(job,cancelled):
+            value=yield lambda: job['request_id']
+            results.append(value)
+        jobs=[entry('a'),entry('b')]
+        for index,job in enumerate(jobs): job['request_id']=str(index)
+        drive(jobs,start,2,metrics=metrics)
+        self.assertCountEqual(results,['0','1'])
+        self.assertEqual(metrics['workers'],2)
+        self.assertIn('worker_utilization',metrics)
+        self.assertIn('scheduler_idle_ms',metrics)
+        self.assertIn('origin_saturation_ms',metrics)
+
     def test_overlap_and_serial_barrier_and_owner_thread(self):
         main = threading.get_ident()
         barrier = threading.Barrier(2)
@@ -97,7 +111,7 @@ class WorkersTests(unittest.TestCase):
             with patch.object(TOOL_INDEX['zap_baseline'],'exec_fn',return_value=seed),patch.object(TOOL_INDEX['zap_active_scan'],'exec_fn',side_effect=active):
                 result=WebXAgent(cfg).run('scan')
             self.assertEqual(len(seen),2)
-            self.assertEqual(result['zap_performance']['jobs'],0)  # mocked legacy adapter omits metrics
+            self.assertEqual(result['zap_performance']['jobs'],1)  # fallback timing covers legacy adapters
             cfg['resume_session']=str(Path(result['progress']['path']).parent)
             with patch.object(TOOL_INDEX['zap_active_scan'],'exec_fn',side_effect=AssertionError('repeated')):
                 result=WebXAgent(cfg).run('scan')

@@ -37,6 +37,169 @@ Final findings and risk are assembled from the evidence store, not from your tex
 '''
 
 
+def _active_performance(rows, scheduler, representatives, request_groups, workers):
+    def total(key): return sum(float(row.get(key, 0) or 0) for row in rows)
+    def average(key): return total(key) / len(rows) if rows else 0
+    phases = {'Scheduler': total('scheduler_wait_ms') + total('scheduler_dispatch_ms'),
+        'Preparation': total('prepare_ms'), 'Startup': total('zap_startup_ms'),
+        'Add-on loading': total('addon_load_ms'),
+        'Context': total('context_create_ms') + total('policy_load_ms') + total('context_import_ms'),
+        'Passive Wait': total('passive_wait_ms'), 'Active Scan': total('active_scan_ms'),
+        'Evidence Parse': total('evidence_parse_ms'), 'Report': total('report_generation_ms'),
+        'Shutdown': total('shutdown_ms'), 'Unattributed ZAP': total('unattributed_zap_ms')}
+    denominator = sum(phases.values()) or 1
+    percentages = {name: round(value * 100 / denominator, 2) for name, value in phases.items()}
+    causes = {'Scheduler':'queue capacity, same-origin barriers and concurrency limits',
+        'Preparation':'controls, policy checks and dispatch setup', 'Startup':'new JVM initialization',
+        'Add-on loading':'ZAP add-on initialization', 'Context':'context, policy and seed import jobs',
+        'Passive Wait':'passive scanner drain', 'Active Scan':'scanner rules and target response time',
+        'Evidence Parse':'HAR, observer and alert parsing', 'Report':'ZAP export and report jobs',
+        'Shutdown':'JVM termination', 'Unattributed ZAP':'ZAP did not emit timestamped phase markers'}
+    levels = {'Scheduler':('high','high'), 'Preparation':('medium','medium'),
+        'Startup':('high','high'), 'Add-on loading':('high','high'), 'Context':('medium','medium'),
+        'Passive Wait':('medium','medium'), 'Active Scan':('high','high'),
+        'Evidence Parse':('low','low'), 'Report':('medium','medium'),
+        'Shutdown':('medium','medium'), 'Unattributed ZAP':('unknown','unknown')}
+    bottlenecks = [{'phase':name, 'percentage':value, 'root_cause':causes[name],
+        'expected_optimization_gain_percent':round(value * .7, 1),
+        'implementation_complexity':levels[name][0], 'regression_risk':levels[name][1]}
+        for name,value in sorted(percentages.items(), key=lambda item:item[1], reverse=True) if value > 0]
+    overhead = percentages['Startup'] + percentages['Add-on loading'] + percentages['Shutdown']
+    context_share = percentages['Context']; scheduler_share = percentages['Scheduler']
+    average_batch = average('batch_size')
+    startup_keys=('process_spawn_ms','java_boot_ms','proxy_bind_ms','api_ready_ms','addon_load_ms','network_setup_ms',
+        'script_load_ms','context_create_ms','policy_load_ms','context_import_ms',
+        'authentication_setup_ms','scan_configuration_ms','startup_unattributed_ms','startup_total_ms')
+    active_keys=('spider_wait_ms','passive_wait_ms','active_scan_ms','alerts_download_ms',
+        'report_export_ms','evidence_parse_ms')
+    shutdown_keys=('stop_scan_ms','passive_flush_ms','report_finalize_ms','api_shutdown_ms',
+        'process_wait_ms','workspace_cleanup_ms','temporary_file_cleanup_ms','shutdown_total_ms')
+    lifecycle_keys=startup_keys+active_keys+shutdown_keys
+    lifecycle_averages={key:round(average(key),3) for key in lifecycle_keys}
+    internal_keys=tuple(key for key in lifecycle_keys if key not in
+        ('startup_total_ms','shutdown_total_ms','evidence_parse_ms'))+('evidence_parse_ms',)
+    # Lifecycle percentages describe one executing ZAP job. Queue residence is
+    # reported by the scheduler separately and must not dilute JVM phase costs.
+    lifecycle_denominator=(average('total_job_ms')-average('scheduler_wait_ms')-
+        average('scheduler_dispatch_ms')-average('prepare_ms')) or 1
+    lifecycle_causes={'process_wait_ms':'JVM teardown after the automation plan completes',
+        'passive_wait_ms':'Automation Framework waits for the passive queue to drain',
+        'active_scan_ms':'selected active rule execution and target response latency',
+        'java_boot_ms':'Java launcher and ZAP bootstrap before the first ZAP timestamp',
+        'addon_load_ms':'installed extension discovery and loading',
+        'network_setup_ms':'root-CA generation exposed by the Network extension',
+        'startup_unattributed_ms':'startup intervals without a distinct ZAP log marker',
+        'report_finalize_ms':'traditional-json-plus report generation',
+        'context_create_ms':'ZAP startup/context initialization markers',
+        'context_import_ms':'HAR seed import automation job',
+        'report_export_ms':'HAR and URL export automation jobs',
+        'evidence_parse_ms':'local report, HAR and active-evidence parsing',
+        'policy_load_ms':'active scan policy automation job',
+        'process_spawn_ms':'operating-system process creation',
+        'scan_configuration_ms':'passive scanner automation configuration',
+        'script_load_ms':'HTTP sender observer script registration',
+        'temporary_file_cleanup_ms':'credential-bearing plan removal',
+        'passive_flush_ms':'post-active passive queue drain','spider_wait_ms':'spider automation job',
+        'stop_scan_ms':'timeout/cancellation termination path'}
+    lifecycle_levels={'process_wait_ms':('medium','medium'),'passive_wait_ms':('medium','high'),
+        'active_scan_ms':('high','high'),'java_boot_ms':('high','high'),'addon_load_ms':('high','high'),
+        'network_setup_ms':('medium','medium'),'startup_unattributed_ms':('unknown','unknown'),
+        'report_finalize_ms':('medium','medium'),'context_create_ms':('medium','medium'),
+        'context_import_ms':('medium','medium'),'report_export_ms':('low','low'),
+        'evidence_parse_ms':('low','low'),'policy_load_ms':('medium','medium'),
+        'process_spawn_ms':('high','high'),'scan_configuration_ms':('low','low'),
+        'script_load_ms':('low','medium'),'temporary_file_cleanup_ms':('low','high'),
+        'passive_flush_ms':('medium','high'),'spider_wait_ms':('high','high'),
+        'stop_scan_ms':('high','high')}
+    lifecycle_bottlenecks=[{'phase':key.removesuffix('_ms'),
+        'average_ms':round(average(key),3),'percentage':round(average(key)*100/lifecycle_denominator,2),
+        'root_cause':lifecycle_causes.get(key,'measured lifecycle operation'),
+        'expected_optimization_gain_percent':round(average(key)*100/lifecycle_denominator,2),
+        'implementation_complexity':lifecycle_levels.get(key,('unknown','unknown'))[0],
+        'regression_risk':lifecycle_levels.get(key,('unknown','unknown'))[1]}
+        for key in sorted(internal_keys,key=average,reverse=True) if average(key)>0]
+    removable=(average('process_spawn_ms')+average('java_boot_ms')+average('addon_load_ms')+
+        average('network_setup_ms')+average('process_wait_ms'))
+    persistent_share=round(removable*100/lifecycle_denominator,2)
+    decisions = {
+        'persistent_zap_workers': {'decision':'YES' if overhead >= 15 else 'NO',
+            'evidence':f'JVM startup/add-on/shutdown account for {overhead:.2f}% of measured phase time'},
+        'context_reuse': {'decision':'YES' if context_share >= 10 else 'NO',
+            'evidence':f'context/policy/import account for {context_share:.2f}% of measured phase time'},
+        'route_clustering': {'decision':'YES' if len(rows)>1 and average_batch<2 and overhead>=10 else 'NO',
+            'evidence':f'{len(rows)} jobs for {request_groups} groups; average batch size {average_batch:.2f}'},
+        'scheduler_redesign': {'decision':'YES' if scheduler_share>=20 and float(scheduler.get('worker_utilization',0))<.5 else 'NO',
+            'evidence':f'scheduler share {scheduler_share:.2f}%; worker utilization {float(scheduler.get("worker_utilization",0))*100:.2f}%'}}
+    keys = ('scheduler_wait_ms','scheduler_dispatch_ms','prepare_ms','zap_startup_ms','addon_load_ms',
+        'context_create_ms','policy_load_ms','context_import_ms','passive_wait_ms','active_scan_ms',
+        'evidence_parse_ms','report_generation_ms','shutdown_ms','total_job_ms')
+    return {'workers':workers, 'representative_requests':representatives, 'request_groups':request_groups,
+        'scan_jobs':len(rows), 'jvm_started':sum(int(row.get('jvm_launches',0)) for row in rows),
+        'contexts_created':sum(int(row.get('contexts_created',0)) for row in rows),
+        'policies_created':sum(int(row.get('policies_created',0)) for row in rows),
+        'averages_ms':{key:round(average(key),3) for key in keys},
+        'worker_utilization':round(float(scheduler.get('worker_utilization',0)),4),
+        'scheduler':{key:round(float(value),3) if isinstance(value,(int,float)) else value
+                     for key,value in scheduler.items()}, 'percentages':percentages,
+        'bottlenecks':bottlenecks, 'decisions':decisions,
+        'lifecycle':{'startup':{key:lifecycle_averages[key] for key in startup_keys},
+            'active':{key:lifecycle_averages[key] for key in active_keys},
+            'shutdown':{key:lifecycle_averages[key] for key in shutdown_keys},
+            'blocking_operations':_aggregate_blocking(rows),
+            'observability':rows[0].get('lifecycle_observability',{}) if rows else {},
+            'ranked_internal_phases':lifecycle_bottlenecks,
+            'persistent_worker_removable_ms':round(removable,3),
+            'persistent_worker_removable_percent':persistent_share,
+            'unchanged_percent':round(max(0,100-persistent_share),2)}}
+
+
+def _aggregate_blocking(rows):
+    keys=set()
+    for row in rows: keys.update((row.get('blocking_operations') or {}).keys())
+    result={}
+    for key in sorted(keys):
+        values=[float((row.get('blocking_operations') or {}).get(key,0) or 0) for row in rows]
+        result[key]=round(sum(values)/len(values),3) if rows else 0
+    return result
+
+
+def _print_active_performance(report):
+    print('\nACTIVE SCAN PERFORMANCE', flush=True)
+    for label,key in (('Workers','workers'),('Representative Requests','representative_requests'),
+            ('Request Groups','request_groups'),('Scan Jobs','scan_jobs'),('JVM Started','jvm_started'),
+            ('Contexts Created','contexts_created'),('Policies Created','policies_created')):
+        print(f'{label}: {report[key]}', flush=True)
+    for label,key in (('Average Startup','zap_startup_ms'),('Average Context','context_create_ms'),
+            ('Average Active Scan','active_scan_ms'),('Average Report','report_generation_ms'),
+            ('Average Shutdown','shutdown_ms')):
+        print(f'{label}: {report["averages_ms"][key]:.3f} ms', flush=True)
+    print(f'Worker Utilization: {report["worker_utilization"]*100:.2f}%', flush=True)
+    for label,key in (('Scheduler Idle','scheduler_idle_ms'),('Barrier Wait','serial_barrier_wait_ms'),
+            ('AutoConcurrency Wait','auto_concurrency_wait_ms'),('Bootstrap Wait','bootstrap_wait_ms')):
+        print(f'{label}: {report["scheduler"].get(key,0):.3f} ms', flush=True)
+    print('\nBREAKDOWN', flush=True)
+    for name,value in report['percentages'].items(): print(f'{name:.<24} {value:.2f}%', flush=True)
+    print('\nBOTTLENECKS', flush=True)
+    for index,row in enumerate(report['bottlenecks'],1):
+        print(f'{index}. {row["phase"]}: {row["percentage"]:.2f}% — {row["root_cause"]}; '
+              f'potential gain {row["expected_optimization_gain_percent"]:.1f}%; '
+              f'complexity={row["implementation_complexity"]}; risk={row["regression_risk"]}', flush=True)
+    print('\nMEASURED DECISIONS', flush=True)
+    for name,row in report['decisions'].items(): print(f'{name}: {row["decision"]} — {row["evidence"]}', flush=True)
+    lifecycle=report.get('lifecycle')
+    if lifecycle:
+        print('\nZAP LIFECYCLE', flush=True)
+        for section in ('startup','active','shutdown'):
+            print(f'\n{section.upper()}', flush=True)
+            for key,value in lifecycle[section].items():
+                print(f'{key.removesuffix("_ms").replace("_"," ").title():.<28} {value:.3f} ms',flush=True)
+        print('\nBLOCKING OPERATIONS',flush=True)
+        for key,value in lifecycle['blocking_operations'].items(): print(f'{key:.<32} {value}',flush=True)
+        print('\nINTERNAL PHASE RANKING',flush=True)
+        for index,row in enumerate(lifecycle['ranked_internal_phases'],1):
+            print(f'{index}. {row["phase"]}: {row["average_ms"]:.3f} ms ({row["percentage"]:.2f}%)',flush=True)
+
+
 def sync_graph(agent):
     import auth_context
     snapshot = agent.evidence_store.summary()
@@ -67,16 +230,26 @@ def record_result(agent, name, args, result, *, baseline=False):
 def run(agent, user_text):
     cfg = agent.config
     agent._scan_journal = None
+    pool=None;result=None
     try:
         with RunLock(cfg.get('evidence_dir', '.aixsec-evidence'), cfg.get('zap_history_namespace', 'default')):
             try:
-                return _run(agent, user_text)
+                backend=cfg.get('scan_backend','auto')
+                if (backend=='zap' or backend=='auto') and executable(cfg):
+                    from adapters.zap import worker_pool
+                    pool=worker_pool(cfg);cfg['_zap_worker_pool']=pool
+                result=_run(agent, user_text)
+                if pool and isinstance(result,dict): result['zap_worker_pool']=pool.snapshot()
+                return result
             except BaseException:
                 journal = getattr(agent, '_scan_journal', None)
                 if journal:
                     journal.data['status'] = 'interrupted'
                     journal.save()
                 raise
+            finally:
+                cfg.pop('_zap_worker_pool',None)
+                if pool: pool.close()
     except ScanBusyError as exc:
         return {'status':'busy', 'busy':True, 'calls':0, 'findings':[],
                 'lock_path':exc.path, 'lock_owner':exc.owner,
@@ -109,6 +282,8 @@ def _run(agent, user_text):
     began = time.monotonic()
     calls, cache, estimated_requests = 0, {}, 0
     zap_performance = []
+    zap_scheduler_performance = {}
+    active_performance_report = None
     agent._pipeline_deadline = None
     if cfg.get('resume_session'):
         resume = Path(cfg['resume_session']).expanduser().resolve()
@@ -222,6 +397,7 @@ def _run(agent, user_text):
             agent._zap_active_entries = [member['_entry'] for member in batch_members]
         trigger = 'baseline' if baseline else 'scheduler' if scheduled else 'planner'
         print(f'[→] {name} ({trigger})', flush=True)
+        execution_started=0
         if cancelled is not None:
             # Approvals and snapshots happen on the owner thread. Workers never
             # mutate the live agent's seed, journal, graph or evidence store.
@@ -240,12 +416,17 @@ def _run(agent, user_text):
             if approved and auto_concurrency and representative:
                 scope_error = agent.policy.check_param(name, 'url', args['url'])
                 if not scope_error:
+                    prepare_started=time.perf_counter_ns()
                     auto_concurrency.prepare(representative)
+                    representative.setdefault('_scheduler_performance', {})['prepare_ms'] = \
+                        (time.perf_counter_ns()-prepare_started)/1_000_000
             agent._zap_active_entry = None
             agent._zap_active_entries = None
+            execution_started=time.perf_counter_ns()
             result = yield lambda: worker._dispatch(name, args)
         else:
             try:
+                execution_started=time.perf_counter_ns()
                 result = agent._dispatch(name, args)
             finally:
                 agent._zap_active_entry = None
@@ -257,8 +438,20 @@ def _run(agent, user_text):
             for member in batch_members:
                 schedule.finish(member['request_id'], args['rule_ids'], result)
             performance = (((result.get('data') or {}).get('coverage') or {}).get('performance'))
-            if isinstance(performance, dict):
-                zap_performance.append(performance)
+            scheduler_row=representative.get('_scheduler_performance',{})
+            if not isinstance(performance, dict):
+                elapsed=(time.perf_counter_ns()-execution_started)/1_000_000
+                performance={key:0 for key in ('zap_startup_ms','addon_load_ms','context_create_ms',
+                    'policy_load_ms','context_import_ms','passive_wait_ms','active_scan_ms',
+                    'evidence_parse_ms','report_generation_ms','shutdown_ms')}
+                performance.update(total_job_ms=elapsed,unattributed_zap_ms=elapsed,
+                    batch_size=len(batch_members) or 1,rules_executed=len(args.get('rule_ids',[])),
+                    requests_executed=0,jvm_launches=0,contexts_created=0,policies_created=0)
+            performance.update({key:float(value) for key,value in scheduler_row.items()})
+            performance['total_job_ms']=float(performance.get('total_job_ms',0))+sum(
+                float(scheduler_row.get(key,0)) for key in ('scheduler_wait_ms','scheduler_dispatch_ms','prepare_ms'))
+            performance['job_duration']=performance['total_job_ms']/1000
+            zap_performance.append(performance)
         result['trigger'] = trigger
         # Coverage failure is retained even if no scanner process was launched.
         if baseline and not isinstance((result.get('data') or {}).get('coverage'), dict):
@@ -359,7 +552,15 @@ def _run(agent, user_text):
                     'request_id':representative['request_id'], 'auth_context':representative['auth_context'],
                     'rule_ids':active_rules}, scheduled=True, cancelled=cancelled,
                     batch=representative.get('_batch_members'))
-            schedule.stop_reason = drive(dispatch_jobs, start, workers, cookie_mode, concurrency_policy, auto_concurrency) or schedule.stop_reason
+            schedule.stop_reason = drive(dispatch_jobs, start, workers, cookie_mode, concurrency_policy,
+                auto_concurrency, zap_scheduler_performance) or schedule.stop_reason
+            active_performance_report = _active_performance(zap_performance, zap_scheduler_performance,
+                len(representatives), sum(len(row.get('_batch_members') or [row]) for row in dispatch_jobs), workers)
+            if cfg.get('_zap_worker_pool'):
+                active_performance_report['worker_pool']=cfg['_zap_worker_pool'].snapshot()
+                active_performance_report['jvm_started']=active_performance_report['worker_pool']['jvm_created']
+            _print_active_performance(active_performance_report)
+            atomic(journal.directory/'active-scan-performance.json', active_performance_report)
     elif backend == 'zap':
         schedule.stop_reason = 'Automatic active scanning disabled by operator configuration'
     if auto_concurrency:
@@ -492,6 +693,9 @@ def _run(agent, user_text):
         'requests_executed': sum(int(row.get('requests_executed', 0)) for row in zap_performance),
         'jvm_reuse_ratio': round((total_batch - launches) / total_batch, 4) if total_batch else 0,
     }
+    if active_performance_report:
+        result['active_scan_performance']=active_performance_report
+        result['active_scan_performance_path']=str(journal.directory/'active-scan-performance.json')
     schedule_path = agent.evidence_store.directory / 'active-schedule.json'
     schedule_path.write_text(json.dumps(result['active_schedule'], ensure_ascii=False, indent=2))
     schedule_path.chmod(0o600)
