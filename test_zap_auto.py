@@ -6,7 +6,7 @@ import threading
 from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
-from zap_auto import AutoConcurrency, controls
+from zap_auto import AutoConcurrency, controls, classify_cookies, classify_redirect
 from zap_concurrency import ConcurrencyPolicy
 from zap_workers import drive, scheduling_reasons
 from test_zap_workers import entry
@@ -23,19 +23,23 @@ class AutoTests(unittest.TestCase):
     def setUp(self):
         self.temp=tempfile.TemporaryDirectory();self.addCleanup(self.temp.cleanup)
         self.root=Path(self.temp.name);self.policy=ConcurrencyPolicy()
-    def controller(self,jobs):return AutoConcurrency({'zap_delay_ms':0},self.root,jobs,self.policy)
+    def controller(self,jobs,**config):return AutoConcurrency({'zap_delay_ms':0,'zap_workers':4,**config},self.root,jobs,self.policy)
     def result(self,status=200,**changes):
         path=self.root/'observer.jsonl';path.write_text(json.dumps({'status':status,**changes})+'\n')
         return {'outcome':'ok','data':{'coverage':{'active_requests_path':str(path)}}}
-    def test_warmup_promotes_then_backoff_persists(self):
-        item=job('catalog');auto=self.controller([item])
+    def test_gradual_promotion_temporary_backoff_and_recovery(self):
+        items=[job(str(v)) for v in range(12)];auto=self.controller(items)
+        item=items[0]
         with patch('zap_auto.controls',return_value={'stable':True,'observations':[{'elapsed':.1}]}): auto.prepare(item)
         self.assertEqual(auto.limit('https://example.test'),1)
-        auto.observe(item,self.result());self.assertEqual(auto.limit('https://example.test'),2)
-        auto.observe(item,self.result(429));self.assertEqual(auto.limit('https://example.test'),1)
-        restored=self.controller([item]);self.assertEqual(restored.limit('https://example.test'),1)
-        with patch('zap_auto.controls',side_effect=AssertionError('backoff reprobed')):restored.prepare(item)
-        self.assertIn('auto_origin_backoff',item['_auto_reasons'])
+        for clean in items[:4]: auto.observe(clean,self.result())
+        self.assertEqual(auto.limit('https://example.test'),2)
+        auto.observe(items[4],self.result(429));auto.observe(items[5],self.result(403))
+        self.assertEqual(auto.limit('https://example.test'),2)
+        auto.observe(items[6],self.result(500));self.assertEqual(auto.limit('https://example.test'),1)
+        for clean in items[7:11]: auto.observe(clean,self.result())
+        self.assertEqual(auto.limit('https://example.test'),2)
+        restored=self.controller([item]);self.assertEqual(restored.limit('https://example.test'),2)
     def test_unknown_auth_and_workflow_not_probed(self):
         items=[job('checkout'),job('products')];items[1]['auth_context']='member'
         auto=self.controller(items)
@@ -50,28 +54,34 @@ class AutoTests(unittest.TestCase):
             self.assertTrue(result['stable']);self.assertEqual(session.return_value.request.call_count,2)
             kw=session.return_value.request.call_args.kwargs
             self.assertEqual(kw['headers']['Cookie'],'sid=private');self.assertFalse(kw['follow_redirects'])
-            fake.headers={'Set-Cookie':'secret=changed'}
+            fake.headers={'Set-Cookie':'PHPSESSID=changed'}
             self.assertFalse(controls({'zap_delay_ms':0},item,self.root)['stable'])
-    def test_timeout_and_session_signals_reduce_parallelism(self):
-        for result in ({'outcome':'timeout'},self.result(200,set_cookie=True),self.result(200,redirect=True)):
-            item=job('products');auto=self.controller([item]);auto.observe(item,result)
-            self.assertEqual(auto.limit('https://example.test'),1)
-            self.assertTrue(auto.data['origins']['https://example.test']['backoff'])
+            fake.status_code=301;fake.headers={'Location':'/products/'}
+            self.assertTrue(controls({'zap_delay_ms':0},item,self.root)['stable'])
+    def test_group_local_quarantine_then_origin_escalation(self):
+        items=[job('products'),job('orders')];auto=self.controller(items)
+        auto.data['origins']['https://example.test']={'level':4,'score':8,'stable_groups':0,
+            'unstable_groups':{},'groups_since_change':3}
+        auto.observe(items[0],self.result(302,redirect=True,location='/login'))
+        self.assertEqual(auto.limit('https://example.test'),4)
+        self.assertTrue(auto.data['groups']['products']['quarantined'])
+        auto.observe(items[1],self.result(302,redirect=True,location='/login'))
+        self.assertEqual(auto.limit('https://example.test'),2)
     def test_two_worker_trial_after_first_success(self):
-        items=[job('a'),job('b'),job('c')];auto=self.controller(items)
+        items=[job(v) for v in ('a','b','c','d','e','f')];auto=self.controller(items)
         barrier=threading.Barrier(2);started=[]
         good=self.result()
         def start(item,cancelled):
             auto.prepare(item)
             def work():
                 started.append(item['request_id'])
-                if item['request_id']!='a':barrier.wait(3)
+                if item['request_id'] in ('e','f'):barrier.wait(3)
                 return good
             result=yield work
             auto.observe(item,result)
         with patch('zap_auto.controls',return_value={'stable':True}):
             drive(items,start,workers=4,cookie_mode='auto',policy=self.policy,auto=auto)
-        self.assertEqual(started[0],'a');self.assertEqual(len(started),3)
+        self.assertEqual(started[:4],['a','b','c','d']);self.assertEqual(len(started),6)
     def test_changed_controls_downgrade_without_skipping_scan(self):
         items=[job('a'),job('b')];auto=self.controller(items);called=[]
         def start(item,cancelled):
@@ -81,6 +91,42 @@ class AutoTests(unittest.TestCase):
         with patch('zap_auto.controls',return_value={'stable':False,'reason':'control_changed_or_slow'}):
             drive(items,start,cookie_mode='auto',policy=self.policy,auto=auto)
         self.assertEqual(called,['a','b']);self.assertEqual(auto.limit('https://example.test'),1)
+
+    def test_redirect_classification(self):
+        base={'status':302,'redirect':True,'url':'http://example.test/products'}
+        cases=[('/products/',('canonical',0)),('/login',('login',-4)),('/logout',('logout',-4)),
+               ('/cart',('same_origin',0)),('https://other.test/x',('cross_origin',-3)),
+               ('https://example.test/products',('http_to_https',0)),('/en/products',('language',0))]
+        for location,expected in cases:
+            self.assertEqual(classify_redirect({**base,'location':location}),expected)
+        self.assertEqual(classify_redirect({**base,'status':200,'location':'/login'}),('none',0))
+
+    def test_captured_canonical_redirect_remains_parallel_candidate(self):
+        item=job('products');item['_entry']['response']={'status':308,
+            'headers':[{'name':'Location','value':'/products/'}]}
+        auto=self.controller([item])
+        self.assertEqual(item['_auto_reasons'],[])
+        self.assertFalse(scheduling_reasons(item,'auto',self.policy))
+
+    def test_cookie_classification(self):
+        self.assertEqual(classify_cookies({'set_cookie_names':['sid'],'request_cookie_names':['sid']}),('session_refresh',-1))
+        self.assertEqual(classify_cookies({'set_cookie_names':['XSRF-TOKEN']}),('csrf_rotation',-1))
+        self.assertEqual(classify_cookies({'set_cookie_names':['AWSALB']}),('affinity',0))
+        self.assertEqual(classify_cookies({'set_cookie_names':['_ga']}),('analytics',0))
+
+    def test_benign_cookie_and_redirect_do_not_quarantine(self):
+        item=job('products');auto=self.controller([item])
+        auto.observe(item,self.result(301,url='https://example.test/products',redirect=True,location='/products/',set_cookie=True,
+            set_cookie_names=['AWSALB'],request_cookie_names=['sid']))
+        self.assertNotIn('products',auto.data['groups'])
+
+    def test_alternating_workload_is_damped(self):
+        items=[job(str(v)) for v in range(8)];auto=self.controller(items)
+        auto.data['origins']['https://example.test']={'level':2,'score':6,'stable_groups':0,
+            'unstable_groups':{},'groups_since_change':0}
+        for index,item in enumerate(items):
+            auto.observe(item,self.result(429) if index%2 == 0 else self.result())
+        self.assertEqual(auto.limit('https://example.test'),2)
 
 
 @unittest.skipUnless(__import__('os').environ.get('WEBX_TEST_LIVE_AUTO')=='1','opt-in localhost control requests')
