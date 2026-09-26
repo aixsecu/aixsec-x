@@ -41,6 +41,8 @@ def load_config() -> dict:
         "evidence_dir": os.environ.get("WEBX_EVIDENCE_DIR", ".aixsec-evidence"),
         "zap_executable": os.environ.get("WEBX_ZAP_EXECUTABLE", "zap.sh"),
         "zap_workers": max(1, min(8, int(os.environ.get("WEBX_ZAP_WORKERS", "2")))),
+        "zap_worker_max_jobs": max(1, int(os.environ.get("WEBX_ZAP_WORKER_MAX_JOBS", "100"))),
+        "zap_worker_memory_mb": max(0, int(os.environ.get("WEBX_ZAP_WORKER_MEMORY_MB", "0"))),
         "zap_batch_size": max(1, min(32, int(os.environ.get("WEBX_ZAP_BATCH_SIZE", "8")))),
         "zap_cookie_parallel": cookie_mode,
         "zap_concurrency_file": os.environ.get("WEBX_ZAP_CONCURRENCY_FILE", ""),
