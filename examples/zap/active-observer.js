@@ -52,11 +52,30 @@ function responseReceived(msg, initiator, helper) {
                 parameters = parameters.concat(Object.keys(body));
         } catch (ignored) {}
     }
+    function cookieNames(value) {
+        if (value === null) return [];
+        return String(value).split(';').map(function(part) {
+            var at = part.indexOf('=');
+            return (at < 0 ? part : part.slice(0, at)).trim();
+        }).filter(function(name) { return name.length > 0; });
+    }
+    var setCookies = msg.getResponseHeader().getHeaderValues('Set-Cookie');
+    var setCookieNames = [];
+    if (setCookies !== null) {
+        var cookieIt = setCookies.iterator();
+        while (cookieIt.hasNext()) {
+            var setCookie = String(cookieIt.next());
+            setCookieNames = setCookieNames.concat(cookieNames(setCookie.split(';')[0]));
+        }
+    }
     var row = {url: String(msg.getRequestHeader().getURI()).split('?')[0].split('#')[0],
         method: String(msg.getRequestHeader().getMethod()), parameters: parameters,
         rule_id: String(rule), status: msg.getResponseHeader().getStatusCode(),
         set_cookie: msg.getResponseHeader().getHeader('Set-Cookie') !== null,
         redirect: msg.getResponseHeader().getHeader('Location') !== null,
+        set_cookie_names: setCookieNames,
+        request_cookie_names: cookieNames(msg.getRequestHeader().getHeader('Cookie')),
+        location: String(msg.getResponseHeader().getHeader('Location') || ''),
         elapsed_ms: msg.getTimeElapsedMillis()};
     lock.lock();
     try {
