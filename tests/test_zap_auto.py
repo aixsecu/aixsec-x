@@ -6,7 +6,7 @@ import threading
 from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
-from zap_auto import AutoConcurrency, controls, classify_cookies, classify_redirect
+from zap_auto import AutoConcurrency, bootstrap_eligible, controls, classify_cookies, classify_redirect
 from zap_concurrency import ConcurrencyPolicy
 from zap_workers import drive, scheduling_reasons
 from tests.test_zap_workers import entry
@@ -14,6 +14,13 @@ from tests.test_zap_workers import entry
 
 def job(path):
     value=entry(path,headers=[{'name':'Cookie','value':'sid=private'}])
+    value['request_id']=path
+    value['_entry']['response']={'status':200}
+    return value
+
+
+def bootstrap_job(path, method='GET', headers=None):
+    value=entry(path,method=method,headers=headers)
     value['request_id']=path
     value['_entry']['response']={'status':200}
     return value
@@ -31,7 +38,7 @@ class AutoTests(unittest.TestCase):
         items=[job(str(v)) for v in range(12)];auto=self.controller(items)
         item=items[0]
         with patch('zap_auto.controls',return_value={'stable':True,'observations':[{'elapsed':.1}]}): auto.prepare(item)
-        self.assertEqual(auto.limit('https://example.test'),1)
+        self.assertEqual(auto.limit('https://example.test',item),1)
         for clean in items[:4]: auto.observe(clean,self.result())
         self.assertEqual(auto.limit('https://example.test'),2)
         auto.observe(items[4],self.result(429));auto.observe(items[5],self.result(403))
@@ -40,6 +47,52 @@ class AutoTests(unittest.TestCase):
         for clean in items[7:11]: auto.observe(clean,self.result())
         self.assertEqual(auto.limit('https://example.test'),2)
         restored=self.controller([item]);self.assertEqual(restored.limit('https://example.test'),2)
+
+    def test_bootstrap_eligibility_is_strictly_low_risk(self):
+        self.assertTrue(bootstrap_eligible(bootstrap_job('products')))
+        self.assertTrue(bootstrap_eligible(bootstrap_job('products',method='HEAD')))
+        cases=[bootstrap_job('products',method='POST'),
+               bootstrap_job('products',headers=[{'name':'Cookie','value':'sid=x'}]),
+               bootstrap_job('products',headers=[{'name':'Authorization','value':'Bearer x'}]),
+               bootstrap_job('products',headers=[{'name':'X-CSRF-Token','value':'x'}]),
+               bootstrap_job('products?session=x'),bootstrap_job('checkout')]
+        body=bootstrap_job('products');body['_entry']['request']['postData']={'text':'x'};cases.append(body)
+        authenticated=bootstrap_job('products');authenticated['auth_context']='member';cases.append(authenticated)
+        for item in cases:
+            self.assertFalse(bootstrap_eligible(item),item['request_id'])
+
+    def test_two_clean_bootstrap_groups_run_together_and_promote(self):
+        items=[bootstrap_job('public-a'),bootstrap_job('public-b')]
+        auto=self.controller(items);barrier=threading.Barrier(2);started=[]
+        good=self.result()
+        def start(item,cancelled):
+            auto.prepare(item)
+            def work():
+                started.append(item['request_id']);barrier.wait(3);return good
+            result=yield work
+            auto.observe(item,result)
+        with patch('zap_auto.controls',return_value={'stable':True}):
+            drive(items,start,workers=4,cookie_mode='auto',policy=self.policy,auto=auto)
+        state=auto.data['origins']['https://example.test']
+        self.assertCountEqual(started,['public-a','public-b'])
+        self.assertEqual((state['mode'],state['level'],state['bootstrap_result']),('steady',2,'clean'))
+
+    def test_one_unstable_bootstrap_group_falls_back_to_one(self):
+        items=[bootstrap_job('public-a'),bootstrap_job('public-b')];auto=self.controller(items)
+        with patch('zap_auto.controls',return_value={'stable':False,'reason':'control_changed_or_slow'}):
+            auto.prepare(items[0])
+        state=auto.data['origins']['https://example.test']
+        self.assertEqual((state['mode'],auto.limit('https://example.test'),state['bootstrap_result']),
+                         ('steady',1,'unstable'))
+
+    def test_pre_bootstrap_persisted_origin_remains_steady(self):
+        path=self.root/'auto-concurrency.json'
+        path.write_text(json.dumps({'version':2,'origins':{'https://example.test':{
+            'level':4,'score':9,'stable_groups':1,'unstable_groups':{},'groups_since_change':2}},
+            'groups':{},'decisions':{}}))
+        auto=self.controller([bootstrap_job('public')])
+        state=auto.data['origins']['https://example.test']
+        self.assertEqual((state['mode'],auto.limit('https://example.test')),('steady',4))
     def test_unknown_auth_and_workflow_not_probed(self):
         items=[job('checkout'),job('products')];items[1]['auth_context']='member'
         auto=self.controller(items)
@@ -155,7 +208,7 @@ class LocalControlTests(unittest.TestCase):
 
 class AutoPipelineTests(unittest.TestCase):
     def test_controls_are_not_repeated_on_resume(self):
-        from test_sequential_pipeline import baseline,config
+        from tests.test_sequential_pipeline import baseline,config
         from tools import TOOL_INDEX
         from agent import WebXAgent
         with tempfile.TemporaryDirectory() as root:

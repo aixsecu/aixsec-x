@@ -115,6 +115,31 @@ def candidate_reasons(entry, config):
     return reasons
 
 
+def bootstrap_eligible(entry):
+    """Return whether a group is safe for the bounded two-worker bootstrap."""
+    from zap_workers import has_request_body
+    req = entry['_entry']['request']
+    if req.get('method', 'GET').upper() not in ('GET', 'HEAD'):
+        return False
+    if has_request_body(req) or entry.get('auth_context', 'anonymous') != 'anonymous':
+        return False
+    parsed = urlsplit(req.get('url', ''))
+    if WORKFLOW.search(unquote(parsed.path)):
+        return False
+    for key, value in parse_qsl(parsed.query, keep_blank_values=True):
+        if re.search(r'csrf|xsrf|token|session|password|secret|api.?key', key, re.I):
+            return False
+        if key.lower() in ('action', 'act', 'task', 'operation', 'op') and WORKFLOW.search('/' + value):
+            return False
+    names = {str(h.get('name', '')).lower() for h in req.get('headers', [])}
+    if req.get('cookies') or 'cookie' in names:
+        return False
+    if any(re.search(r'authorization|api.?key|token|secret|auth|csrf|xsrf', name, re.I)
+           for name in names):
+        return False
+    return True
+
+
 def pace(root, url, delay_ms):
     # Java FileChannel locks and POSIX record locks coordinate across JVM/Python.
     import fcntl
@@ -204,20 +229,53 @@ class AutoConcurrency:
             state.setdefault('score',-3 if state.get('reason') else 0)
             state.setdefault('stable_groups',0);state.setdefault('unstable_groups',{})
             state.setdefault('groups_since_change',0)
+            # State written before bootstrap existed is already steady-state.
+            state.setdefault('mode','steady')
         for entry in entries:
             entry['_auto_reasons']=candidate_reasons(entry,config)
+            target_origin=origin(entry['_entry']['request']['url'])
+            self.data['origins'].setdefault(target_origin,
+                {'mode':'bootstrap','level':1,'score':0,'stable_groups':0,
+                 'unstable_groups':{},'groups_since_change':0,'bootstrap_groups':{}})
         self.save()
     def save(self): atomic(self.path,self.data)
     def summary(self):
         return {'path':str(self.path), 'assessed_groups':len(self.data['decisions']),
                 'stable_controls':sum(bool(d.get('stable')) for d in self.data['decisions'].values()),
                 'origins':self.data['origins']}
-    def limit(self,target_origin):
+    def limit(self,target_origin,entry=None):
         state=self.data['origins'].get(target_origin,{})
+        if state.get('mode')=='bootstrap':
+            if entry is not None and not bootstrap_eligible(entry):
+                return 1
+            return min(self.max_workers,2)
         return min(self.max_workers,max(1,int(state.get('level',1))))
     def _state(self,entry):
         return self.data['origins'].setdefault(origin(entry['_entry']['request']['url']),
-            {'level':1,'score':0,'stable_groups':0,'unstable_groups':{},'groups_since_change':0})
+            {'mode':'bootstrap','level':1,'score':0,'stable_groups':0,
+             'unstable_groups':{},'groups_since_change':0,'bootstrap_groups':{}})
+    def _bootstrap_active(self,entry):
+        return self._state(entry).get('mode')=='bootstrap' and bootstrap_eligible(entry)
+    def _bootstrap_fail(self,entry,reason):
+        state=self._state(entry)
+        state.update(mode='steady',level=1,bootstrap_result='unstable',
+                     bootstrap_reason=reason)
+        state.setdefault('bootstrap_groups',{})[entry['request_id']]='unstable'
+        self.save()
+    def _bootstrap_clean(self,entry):
+        state=self._state(entry);groups=state.setdefault('bootstrap_groups',{})
+        groups[entry['request_id']]='clean'
+        if sum(value=='clean' for value in groups.values()) >= 2:
+            previous=int(state.get('level',1));current=min(self.max_workers,2)
+            state.update(mode='steady',level=current,bootstrap_result='clean',
+                         reason='bootstrap_complete',stable_groups=0,
+                         unstable_groups={},groups_since_change=0)
+            self.save()
+            if current != previous:
+                self._log_change(entry,previous,current,'bootstrap_complete',
+                                 'two clean low-risk read-only groups')
+            return
+        self.save()
     def _next_level(self,level,up):
         if up: return min(self.max_workers,2 if level<2 else level*2)
         return max(1,level//2)
@@ -285,15 +343,24 @@ class AutoConcurrency:
         self.data['decisions'][entry['request_id']]=decision
         if not decision['stable']:
             entry['_auto_reasons']=[decision['reason']]
+            if self._bootstrap_active(entry):
+                self._bootstrap_fail(entry,decision['reason'])
             self._quarantine(entry,decision['reason'],-2,'unstable control pair')
         self.save()
     def observe(self,entry,result):
         if self.policy.match(entry): return
+        state=self._state(entry)
+        if state.get('mode')=='bootstrap' and not bootstrap_eligible(entry):
+            # Unsafe groups retain the pre-bootstrap, one-worker learning path.
+            state['mode']='steady';self.save()
+        bootstrap=self._bootstrap_active(entry)
         coverage=(result.get('data') or {}).get('coverage') or {}
         decision=self.data['decisions'].get(entry['request_id'],{})
         if result.get('outcome') in ('error','timeout','partial'):
+            if bootstrap: self._bootstrap_fail(entry,'scanner_incomplete')
             self._quarantine(entry,'scanner_incomplete',-3,result.get('outcome'));return
         if entry.get('auth_context','anonymous')!='anonymous' and coverage.get('auth_state')!='verified':
+            if bootstrap: self._bootstrap_fail(entry,'scanner_auth_unverified')
             self._quarantine(entry,'scanner_auth_unverified',-5,'authenticated scan was not verified');return
         # Inspect status-only observer records; no bodies/cookies enter diagnostics.
         path=coverage.get('active_requests_path')
@@ -321,8 +388,15 @@ class AutoConcurrency:
                             value=(-5,'active_http_error_or_rate_limit',f'status={status}',cookie_class,redirect_class)
                             worst=value if worst is None or value[0]<worst[0] else worst
             except (ValueError,OSError,TypeError):
+                if bootstrap: self._bootstrap_fail(entry,'observer_unreadable')
                 self._quarantine(entry,'observer_unreadable',-3,'invalid active observer record');return
         if worst:
+            if bootstrap: self._bootstrap_fail(entry,worst[1])
             self._quarantine(entry,worst[1],worst[0],worst[2],worst[3],worst[4]);return
         if result.get('outcome')=='ok' and seen>0:
-            self._stable(entry)
+            if bootstrap: self._bootstrap_clean(entry)
+            else: self._stable(entry)
+        elif bootstrap:
+            self._bootstrap_fail(entry,'bootstrap_no_request_evidence')
+            self._quarantine(entry,'bootstrap_no_request_evidence',-3,
+                             'clean completion lacked active request evidence')

@@ -166,7 +166,7 @@ def drive(jobs, start, workers=2, cookie_mode='strict', policy=None, auto=None):
                 if target_origin in waiting_origins:
                     continue
                 reasons = scheduling_reasons(entry, cookie_mode, policy)
-                width = auto.limit(target_origin) if auto and not (policy and policy.match(entry)) else workers
+                width = auto.limit(target_origin, entry) if auto and not (policy and policy.match(entry)) else workers
                 saturated = sum(active_origin == target_origin for _, active_origin, _ in pending.values()) >= width
                 conflicts = saturated or any(active_origin == target_origin and (reasons or active_serial)
                                 for _, active_origin, active_serial in pending.values())
