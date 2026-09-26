@@ -23,6 +23,7 @@ class AutonomousRuntimeTests(unittest.TestCase):
             result = runtime.run("coverage", checkpoint_path=path)
             self.assertEqual(result["status"], "complete")
             self.assertEqual([item["tool"] for item in calls], ["http_request"])
+            self.assertTrue(all(item["capability"] == "http_observation" for item in calls))
             resumed = AutonomousRuntime.resume(path, lambda action: {"outcome": "ok"})
             self.assertEqual(resumed.graph.to_dict(), runtime.graph.to_dict())
             self.assertEqual(resumed.journal, runtime.journal)

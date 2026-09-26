@@ -41,19 +41,19 @@ The console prints group/rule/worker counts, completed groups and a heartbeat wh
 Offline concurrency, serial barrier, seed isolation, cancellation, route deduplication and resume tests:
 
 ```bash
-python3 -m unittest test_zap_workers test_sequential_pipeline test_zap_schedule
+python3 -m unittest tests.test_zap_workers tests.test_sequential_pipeline tests.test_zap_schedule
 ```
 
 Optional real localhost ZAP/Nuclei integration (requires installed binaries/templates):
 
 ```bash
-WEBX_TEST_LIVE_SEQUENTIAL=1 python3 -m unittest test_sequential_pipeline.LiveSequentialTests
+WEBX_TEST_LIVE_SEQUENTIAL=1 python3 -m unittest tests.test_sequential_pipeline.LiveSequentialTests
 ```
 
 The two-JVM regression also checks that both scans produce rule evidence and share request pacing:
 
 ```bash
-WEBX_TEST_LIVE_ZAP_WORKERS=1 python3 -m unittest test_zap_workers.LiveWorkerTests
+WEBX_TEST_LIVE_ZAP_WORKERS=1 python3 -m unittest tests.test_zap_workers.LiveWorkerTests
 ```
 
 ## Another scan is using this history namespace
@@ -111,7 +111,7 @@ The policy declares independence; the tool does not prove it from GET or cookie 
 Tests:
 
 ```bash
-python3 -m unittest test_zap_concurrency test_zap_workers test_sequential_pipeline test_scan_lock test_zap_schedule
+python3 -m unittest tests.test_zap_concurrency tests.test_zap_workers tests.test_sequential_pipeline tests.test_scan_lock tests.test_zap_schedule
 ```
 
 ## Automatic concurrency (default)
@@ -133,5 +133,5 @@ This is evidence-based scheduling, not proof of independence. It does not create
 Optional localhost validation:
 
 ```bash
-WEBX_TEST_LIVE_AUTO=1 python3 -m unittest test_zap_auto
+WEBX_TEST_LIVE_AUTO=1 python3 -m unittest tests.test_zap_auto
 ```

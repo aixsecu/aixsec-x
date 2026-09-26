@@ -392,8 +392,14 @@ class WebXAgent:
         try:
             import security_analysis as _security_analysis
             plan = _security_analysis.manager().plan("coverage", max_actions=10)
-            names.update(item["tool"] for item in plan.get("actions") or []
-                         if item.get("state") in {"planned", "blocked"})
+            from capability_registry import registry as _capability_registry
+            for item in plan.get("actions") or []:
+                if item.get("state") not in {"planned", "blocked"}:
+                    continue
+                provider = _capability_registry().resolve(
+                    item.get("capability", ""), self.available, confirmation=True)
+                if provider:
+                    names.add(provider.tool)
         except (ValueError, TypeError):
             pass
         maximum = max(4, int(self.config.get("context_max_tools", 14)))
@@ -533,6 +539,8 @@ class WebXAgent:
                     kw["_config"]["zap_allowed_rules"] = [r['id'] for r in getattr(getattr(self, 'evidence_store', None), 'active_rules', [])]
                 if name == "zap_active_scan" and getattr(self, "_zap_active_entry", None):
                     kw["_config"]["_zap_seed_entry"] = self._zap_active_entry
+                if name == "zap_active_scan" and getattr(self, "_zap_active_entries", None):
+                    kw["_config"]["_zap_seed_entries"] = self._zap_active_entries
                 if name == "zap_active_scan" and getattr(self, "evidence_store", None):
                     from adapters.zap import within
                     from pathlib import Path
@@ -925,7 +933,7 @@ class WebXAgent:
             try:
                 live_plan = _security_analysis.manager().plan("coverage", max_actions=8)
                 plan_rows = [
-                    f"- {a['state']} P{a['priority']} {a['tool']} "
+                    f"- {a['state']} P{a['priority']} capability={a['capability']} "
                     f"reason={a['reason']}"
                     + (f" blocked_by={','.join(a['blocked_by'])}" if a["blocked_by"] else "")
                     for a in live_plan["actions"]]

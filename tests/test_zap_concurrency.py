@@ -7,7 +7,7 @@ import threading
 import unittest
 from zap_concurrency import ConcurrencyPolicy
 from zap_workers import drive, parallel_safe, scheduling_summary
-from test_zap_workers import entry
+from tests.test_zap_workers import entry
 from scan_state import Journal
 
 

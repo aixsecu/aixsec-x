@@ -13,7 +13,7 @@ from agent import WebXAgent, _LiveDisplay
 from config import load_config
 from llm import ollama_chat
 from tools import _wapiti_parse_report
-from test_agent import cfg, FakeChat
+from tests.test_agent import cfg, FakeChat
 
 
 class ScanContractTests(unittest.TestCase):

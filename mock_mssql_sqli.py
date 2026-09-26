@@ -30,7 +30,7 @@ API (giống target):
   GET|POST /WebTinTuc/TimKiem     → alias như /search
 
 Cốt lõi là hàm PURE `_decide(kw, waf)` → (status|None, body|None, delay_secs)
-— KHÔNG sleep/IO, unit-test được trực tiếp (xem test_agent.py). Evaluator
+— KHÔNG sleep/IO, unit-test được trực tiếp (xem tests/test_agent.py). Evaluator
 SQL mini giữ nguyên cho chế độ --waf legacy (conversion/time-based).
 
 Chạy:

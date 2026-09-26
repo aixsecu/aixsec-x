@@ -3,6 +3,35 @@ from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
 import threading
 
 
+def batch_jobs(jobs, max_size=1, cookie_mode='strict', policy=None):
+    """Coalesce only groups that share an explicit isolation boundary.
+
+    Auto-mode groups without an operator parallel_read rule remain individual so
+    their control/observation feedback continues to drive AutoConcurrency.
+    """
+    from adapters.zap import origin
+    max_size = max(1, int(max_size))
+    batches = []
+    for entry in jobs:
+        reasons = scheduling_reasons(entry, cookie_mode, policy)
+        rule = policy.match(entry) if policy else None
+        safe = not reasons and (cookie_mode != 'auto' or (rule and rule['mode'] == 'parallel_read'))
+        key = (origin(entry['_entry']['request']['url']), entry.get('auth_context', 'anonymous'),
+               rule['id'] if rule else '', tuple(reasons))
+        target = next((batch for batch in reversed(batches)
+                       if batch['_batch_key'] == key and batch['_batch_safe'] and safe
+                       and len(batch['_batch_members']) < max_size), None)
+        if target is None:
+            target = dict(entry)
+            target['_batch_members'] = [entry]
+            target['_batch_key'] = key
+            target['_batch_safe'] = safe
+            batches.append(target)
+        else:
+            target['_batch_members'].append(entry)
+    return batches
+
+
 def has_request_body(request):
     """HAR exporters can emit postData metadata for an empty GET body."""
     post = request.get('postData')

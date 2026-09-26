@@ -152,8 +152,8 @@ against a synthetic localhost fixture, verifies candidate ingestion and resumes
 without invoking completed tools:
 
 ```bash
-python3 -m unittest test_sequential_pipeline test_nuclei_adapter test_verification
-WEBX_TEST_LIVE_SEQUENTIAL=1 python3 -m unittest test_sequential_pipeline.LiveSequentialTests -v
+python3 -m unittest tests.test_sequential_pipeline tests.test_nuclei_adapter tests.test_verification
+WEBX_TEST_LIVE_SEQUENTIAL=1 python3 -m unittest tests.test_sequential_pipeline.LiveSequentialTests -v
 ```
 
 
@@ -163,8 +163,8 @@ WEBX_TEST_LIVE_SEQUENTIAL=1 python3 -m unittest test_sequential_pipeline.LiveSeq
 # Offline regression tests (external scanners disabled/mocked):
 WEBX_NUCLEI_ENABLED=0 python3 -m unittest discover
 # Actual local scanners only; synthetic localhost, not an external target:
-WEBX_TEST_LIVE_CAPTURE=1 python3 -m unittest test_capture_expansion.LiveCaptureTests -v
-WEBX_TEST_LIVE_SEQUENTIAL=1 python3 -m unittest test_sequential_pipeline.LiveSequentialTests -v
+WEBX_TEST_LIVE_CAPTURE=1 python3 -m unittest tests.test_capture_expansion.LiveCaptureTests -v
+WEBX_TEST_LIVE_SEQUENTIAL=1 python3 -m unittest tests.test_sequential_pipeline.LiveSequentialTests -v
 ```
 
 The capture fixture verifies raw POST JSON, cookie and CSRF propagation, named auth,
