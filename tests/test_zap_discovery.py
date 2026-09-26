@@ -116,16 +116,19 @@ class DiscoveryTests(unittest.TestCase):
 
     def test_browser_failure_cannot_report_complete_even_if_zap_exits_zero(self):
         with tempfile.TemporaryDirectory() as root:
-            def launch(argv, **kwargs):
-                dest = Path(argv[-1]).parent
+            worker=MagicMock(worker_id=0,jobs=1,startup_ms=1)
+            worker.workspace=Path(root)/'worker';(worker.workspace/'home').mkdir(parents=True)
+            def execute(plan_path,timeout,cancelled):
+                dest = plan_path.parent
                 (dest/'report.json').write_text(json.dumps({'site':[{'@name':URL,'alerts':[]}]}))
                 (dest/'urls.txt').write_text(URL)
                 write_har(dest,[entry()])
-                (dest/'home'/'zap.log').write_text('Failed to start browser firefox-headless')
-                kwargs['stdout'].write('Job spiderAjax started\nJob spiderAjax finished\n')
-                kwargs['stdout'].flush()
-                return MagicMock(wait=MagicMock(return_value=0))
-            with patch('adapters.zap.executable',return_value='/fake/zap'),patch('adapters.zap.subprocess.Popen',side_effect=launch):
+                (worker.workspace/'home'/'zap.log').write_text('Failed to start browser firefox-headless')
+                return {'returncode':0,'job_ms':1,'progress':{'finished':True}}
+            worker.run_plan.side_effect=execute
+            lease=MagicMock();lease.__enter__.return_value=worker
+            pool=MagicMock();pool.acquire.return_value=lease;pool.metrics={'worker_busy_ms':0}
+            with patch('adapters.zap.executable',return_value='/fake/zap'),patch('adapters.zap.default_worker_pool',return_value=pool):
                 _, data = run_scan({'evidence_dir':root}, URL, ajax=True)
             self.assertEqual(data['coverage']['status'],'partial')
             self.assertEqual(data['coverage']['phases']['spiderAjax'],'failed')

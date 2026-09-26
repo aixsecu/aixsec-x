@@ -18,7 +18,7 @@ from ledger import Ledger
 from pipeline import record_result
 from scope import ScopePolicy
 from tools import TOOL_INDEX
-from adapters.zap import build_plan, parse_report, run_scan, within
+from adapters.zap import _log_milliseconds, build_plan, parse_report, run_scan, within
 
 URL = 'https://example.test/'
 
@@ -51,6 +51,31 @@ def scanner_data(directory, fixture=None):
 
 
 class ZapPlanTests(unittest.TestCase):
+    def test_timestamped_phase_metrics_are_non_overlapping(self):
+        log='\n'.join([
+            '2026-01-01 00:00:01,000 Job import started',
+            '2026-01-01 00:00:01,250 Job import finished',
+            '2026-01-01 00:00:02,000 Job activeScan-policy started',
+            '2026-01-01 00:00:02,100 Job activeScan-policy finished',
+            '2026-01-01 00:00:03,000 Job activeScan started',
+            '2026-01-01 00:00:05,000 Job activeScan finished',
+            '2026-01-01 00:00:05,100 Job passiveScan-wait started',
+            '2026-01-01 00:00:05,300 Job passiveScan-wait finished',
+            '2026-01-01 00:00:05,400 Job passiveScan-wait started',
+            '2026-01-01 00:00:05,700 Job passiveScan-wait finished',
+            '2026-01-01 00:00:05,750 Job export started',
+            '2026-01-01 00:00:05,900 Job export finished',
+            '2026-01-01 00:00:06,000 Job report started',
+            '2026-01-01 00:00:06,500 Job report finished'])
+        timing=_log_milliseconds(log)
+        self.assertEqual(timing['context_import_ms'],250)
+        self.assertEqual(timing['policy_load_ms'],100)
+        self.assertEqual(timing['active_scan_ms'],2000)
+        self.assertEqual(timing['passive_wait_ms'],200)
+        self.assertEqual(timing['passive_flush_ms'],300)
+        self.assertEqual(timing['report_export_ms'],150)
+        self.assertEqual(timing['report_finalize_ms'],500)
+        self.assertEqual(timing['report_generation_ms'],650)
     def test_baseline_jobs_and_no_active_scan(self):
         with tempfile.TemporaryDirectory() as root:
             plan = build_plan(config(root), URL, root, ajax=True)
@@ -258,39 +283,47 @@ class ZapPipelineTests(unittest.TestCase):
 
 
 class ZapExecutorTests(unittest.TestCase):
+    def fake_pool(self,root,runner):
+        worker=MagicMock(worker_id=0,jobs=1,startup_ms=5)
+        worker.workspace=Path(root)/'worker';(worker.workspace/'home').mkdir(parents=True)
+        worker.run_plan.side_effect=runner
+        lease=MagicMock();lease.__enter__.return_value=worker
+        pool=MagicMock();pool.acquire.return_value=lease;pool.metrics={'worker_busy_ms':0}
+        return pool
+
     def test_process_report_lifecycle_and_secret_plan_cleanup(self):
         with tempfile.TemporaryDirectory() as root:
-            def launch(argv, **kwargs):
-                plan_path = Path(argv[-1])
+            def execute(plan_path,timeout,cancelled):
                 plan = json.loads(plan_path.read_text())
                 dest = plan_path.parent
                 (dest / 'report.json').write_text(json.dumps(report()))
                 (dest / 'urls.txt').write_text(URL + '\n')
                 (dest / 'traffic.har').write_text(json.dumps({'log': {'entries': []}}))
-                self.assertTrue(kwargs['start_new_session'])
                 self.assertNotIn('activeScan', [j['type'] for j in plan['jobs']])
-                process = MagicMock()
-                process.wait.return_value = 0
-                return process
-            with patch('adapters.zap.executable', return_value='/fake/zap'), patch('adapters.zap.subprocess.Popen', side_effect=launch):
+                return {'returncode':0,'job_ms':1,'progress':{'finished':True}}
+            pool=self.fake_pool(root,execute)
+            with patch('adapters.zap.executable', return_value='/fake/zap'), patch('adapters.zap.default_worker_pool',return_value=pool):
                 text, data = run_scan(config(root), URL)
             self.assertEqual(data['coverage']['status'], 'complete')
             self.assertEqual(len(data['alerts']), 1)
             self.assertEqual(list(Path(root).glob('*/plan.yaml')), [])
             self.assertEqual(Path(data['coverage']['report_path']).stat().st_mode & 0o777, 0o600)
+            performance=data['coverage']['performance']
+            self.assertEqual(performance['blocking_operations']['subprocess_wait_calls'],0)
+            self.assertEqual(performance['blocking_operations']['http_polling_calls'],0)
+            self.assertEqual(performance['api_shutdown_ms'],0)
+            self.assertEqual(performance['lifecycle_observability']['api_shutdown'],
+                             'not_applicable_process_exit')
 
     def test_timeout_stops_owned_process_and_keeps_partial_report(self):
-        import subprocess
         with tempfile.TemporaryDirectory() as root:
-            proc = MagicMock(pid=12345, returncode=-15)
-            proc.wait.side_effect = [subprocess.TimeoutExpired('zap', 1), -15]
-            def launch(argv, **kwargs):
-                dest = Path(argv[-1]).parent
+            def execute(plan_path,timeout,cancelled):
+                dest = plan_path.parent
                 (dest / 'report.json').write_text(json.dumps(report()))
-                return proc
-            with patch('adapters.zap.executable', return_value='/fake/zap'), patch('adapters.zap.subprocess.Popen', side_effect=launch), patch('adapters.zap.os.killpg') as kill:
+                raise TimeoutError('deadline')
+            pool=self.fake_pool(root,execute)
+            with patch('adapters.zap.executable', return_value='/fake/zap'), patch('adapters.zap.default_worker_pool',return_value=pool):
                 _, data = run_scan(config(root), URL, timeout=1)
-            kill.assert_called_once()
             self.assertEqual(data['coverage']['status'], 'timeout')
             self.assertEqual(len(data['alerts']), 1)
 
@@ -317,12 +350,13 @@ class ZapAdditionalContracts(unittest.TestCase):
 
     def test_unverified_auth_prevents_complete_coverage(self):
         with tempfile.TemporaryDirectory() as root:
-            def launch(argv, **kwargs):
-                dest = Path(argv[-1]).parent
+            def execute(plan_path,timeout,cancelled):
+                dest = plan_path.parent
                 (dest / 'report.json').write_text(json.dumps(report()))
                 (dest / 'urls.txt').write_text(URL)
-                return MagicMock(wait=MagicMock(return_value=0))
-            with patch('adapters.zap.executable', return_value='/fake/zap'), patch('adapters.zap.build_plan', return_value={'env': {}, 'jobs': []}), patch('adapters.zap.subprocess.Popen', side_effect=launch):
+                return {'returncode':0,'job_ms':1,'progress':{'finished':True}}
+            pool=ZapExecutorTests().fake_pool(root,execute)
+            with patch('adapters.zap.executable', return_value='/fake/zap'), patch('adapters.zap.build_plan', return_value={'env': {}, 'jobs': []}), patch('adapters.zap.default_worker_pool',return_value=pool):
                 _, data = run_scan(config(root), URL, auth_context='user_A')
             self.assertEqual(data['coverage']['auth_state'], 'unverified')
             self.assertEqual(data['coverage']['status'], 'partial')

@@ -193,8 +193,9 @@ class MsSqlErrorOracle:
             m = self.VALUE_RX.search(body)
             if m:
                 self.shape = i
+                sample = m.group(1).replace("''", "'")[:60]
                 print(f"[+] MSSQL error-based oracle OK (shape {i}): "
-                      f"{m.group(1).replace("''", "'")[:60]}")
+                      f"{sample}")
                 return True
         if resets >= 2:
             self.waf_suspected = True
