@@ -97,7 +97,7 @@ class PolicyTests(unittest.TestCase):
         self.assertEqual(order[:2],['https://example.test/write','https://other.test/write'])
     def test_pipeline_uses_policy_and_retains_stage_diagnostics(self):
         from unittest.mock import patch
-        from test_sequential_pipeline import baseline,config
+        from tests.test_sequential_pipeline import baseline,config
         from tools import TOOL_INDEX
         from agent import WebXAgent
         self.policy(rule(auth_context='anonymous',paths=['/*']))

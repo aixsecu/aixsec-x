@@ -118,11 +118,32 @@ python3 -m unittest tests.test_zap_concurrency tests.test_zap_workers tests.test
 
 A new session now defaults to `WEBX_ZAP_COOKIE_PARALLEL=auto`; no policy file is required. Previously exported values retain precedence. Start a new session with the env variable unset (or set to `auto`); do not change an existing checkpoint's configuration. Explicit concurrency policy matches bypass automatic trials and retain their declared behavior.
 
-Automatic classification excludes non-GET/HEAD methods, actual bodies, CSRF/sensitive query fields, common account/payment/state-changing route/action names, and captures without a successful response. Named authentication requires an existing profile with login/logout verification markers. Unlabelled credential headers and HAR-only cookies without a replayable Cookie header remain serial. Cookie presence alone does not prohibit a trial; it is not classified as a guest cookie.
+Bootstrap eligibility is deliberately narrower than steady-state scheduling. It excludes non-GET/HEAD methods, actual bodies, every authenticated context, cookies or credential headers, CSRF/sensitive query fields, common account/payment/state-changing route/action names, captures without a successful response, and any otherwise unknown automatic classification. These groups remain serial bootstrap-neutral work; they are not evidence that the origin is unstable.
 
-For a new, approved and in-scope eligible task, the coordinator sends two sequential controls preserving captured headers, with redirects disabled, 10-second request timeouts and a 1 MiB response limit. Both must succeed, match authentication markers when applicable, have identical body hashes/status/content type, finish within five seconds each and show no cookie setting, redirect, password-field or CSRF signals. These control requests share the active-scan per-origin pacing file. Controls add up to two read requests per assessed group; failures cause serial execution, not a skipped scan. Probe metadata/hashes are stored without bodies or credential values.
+For a new, approved and in-scope eligible task, the coordinator sends two sequential controls preserving its non-credential headers, with redirects disabled, 10-second request timeouts and a 1 MiB response limit. Both must succeed, have identical body hashes/status/content type, finish within five seconds each and show no session mutation, unsafe redirect, password-field or CSRF signals. These control requests share the active-scan per-origin pacing file. Controls add up to two read requests per assessed group; failures cause serial execution, not a skipped scan. Probe metadata/hashes are stored without bodies or credential values.
 
-Each origin starts with one active worker. After a stable control pair and a successful scan with observed active requests, that origin may use up to two workers (also bounded by `WEBX_ZAP_WORKERS`). Auto mode deliberately does not jump to four simply because four workers are configured; other origins can occupy spare workers. Missing observer evidence does not promote concurrency.
+Each new origin starts with a bootstrap learner that permits up to two concurrent eligible low-risk reads (also bounded by `WEBX_ZAP_WORKERS`). Only eligible groups contribute evidence. Two clean eligible completions enter steady state at level two; runtime instability from either eligible group enters steady state at level one. Missing observer evidence is instability for an eligible bootstrap group and cannot promote concurrency.
+
+Serial, workflow, authenticated, body-bearing and otherwise unknown groups are neutral to bootstrap learning. They execute alone behind the existing same-origin barrier, do not change the stability score or learned level, and do not erase clean bootstrap progress. The learner resumes when another eligible group is available. A serial-only application therefore remains in bootstrap with an effective width of one instead of being labelled unstable.
+
+```text
+                           eligible + runtime unstable
+                          ┌────────────────────────────► steady(level=1)
+                          │
+bootstrap(clean=0) ── eligible + clean ──► bootstrap(clean=1)
+       ▲                                      │
+       │ serial / unknown                     │ eligible + clean
+       └──────── neutral ──────────────────────┴────────► steady(level=2)
+
+steady(level=N) ── existing promotion/demotion, cooldown and hysteresis ──► steady
+```
+
+Scheduling and learning are independent:
+
+```text
+group classification ──► parallel slot or same-origin serial barrier
+runtime observation  ──► bootstrap evidence or steady-state feedback
+```
 
 Scanner error/partial/timeout, unverified named auth, observed 401/403/429/5xx, Set-Cookie/Location or slow active responses cause sticky backoff to one worker for the rest of that session. Queued tasks wait for existing same-origin scans before serial dispatch; already running scans finish under their existing timeouts. Feedback is applied at task completion, not continuously during a ZAP process. Scanner payloads can themselves cause these signals, so backoff is conservative, not a diagnosis of server overload or a vulnerability verdict.
 

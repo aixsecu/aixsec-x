@@ -3,6 +3,7 @@ import json
 from pathlib import Path
 import tempfile
 import threading
+import time
 from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
@@ -37,6 +38,7 @@ class AutoTests(unittest.TestCase):
     def test_gradual_promotion_temporary_backoff_and_recovery(self):
         items=[job(str(v)) for v in range(12)];auto=self.controller(items)
         item=items[0]
+        auto.data['origins']['https://example.test']['mode']='steady'
         with patch('zap_auto.controls',return_value={'stable':True,'observations':[{'elapsed':.1}]}): auto.prepare(item)
         self.assertEqual(auto.limit('https://example.test',item),1)
         for clean in items[:4]: auto.observe(clean,self.result())
@@ -85,6 +87,71 @@ class AutoTests(unittest.TestCase):
         self.assertEqual((state['mode'],auto.limit('https://example.test'),state['bootstrap_result']),
                          ('steady',1,'unstable'))
 
+    def test_eligible_serial_eligible_continues_bootstrap(self):
+        first=bootstrap_job('public-a');serial=bootstrap_job('checkout');last=bootstrap_job('public-b')
+        auto=self.controller([first,serial,last])
+        auto.observe(first,self.result())
+        before=json.loads(json.dumps(auto.data['origins']['https://example.test']))
+        auto.observe(serial,{'outcome':'error','data':{}})
+        after=auto.data['origins']['https://example.test']
+        self.assertEqual(after,before)
+        auto.observe(last,self.result())
+        self.assertEqual((after['mode'],after['level'],after['bootstrap_result']),('steady',2,'clean'))
+        self.assertEqual(after['bootstrap_groups'],{'public-a':'clean','public-b':'clean'})
+
+    def test_serial_only_application_stays_neutral_and_serial(self):
+        items=[bootstrap_job('checkout'),bootstrap_job('save',method='POST')]
+        authenticated=bootstrap_job('account');authenticated['auth_context']='member';items.append(authenticated)
+        auto=self.controller(items);active=0;maximum=0;guard=threading.Lock()
+        def start(item,cancelled):
+            def work():
+                nonlocal active,maximum
+                with guard: active+=1;maximum=max(maximum,active)
+                time.sleep(.01)
+                with guard: active-=1
+                return {'outcome':'ok'}
+            result=yield work
+            auto.observe(item,result)
+        drive(items,start,workers=4,cookie_mode='auto',policy=self.policy,auto=auto)
+        state=auto.data['origins']['https://example.test']
+        self.assertEqual(maximum,1)
+        self.assertEqual((state['mode'],state['level'],state['bootstrap_groups']),('bootstrap',1,{}))
+        self.assertEqual((state['score'],state['stable_groups'],state['groups_since_change']),(0,0,0))
+
+    def test_one_eligible_group_preserves_progress_across_resume(self):
+        eligible=bootstrap_job('public');serial=bootstrap_job('checkout')
+        auto=self.controller([eligible,serial]);auto.observe(eligible,self.result());auto.observe(serial,self.result(500))
+        restored=self.controller([eligible,serial]);state=restored.data['origins']['https://example.test']
+        self.assertEqual((state['mode'],state['level']),('bootstrap',1))
+        self.assertEqual(state['bootstrap_groups'],{'public':'clean'})
+        self.assertEqual(state['score'],0)
+
+    def test_unknown_capture_is_neutral_to_bootstrap(self):
+        eligible=bootstrap_job('public');unknown=bootstrap_job('unknown')
+        unknown['_entry']['response']={'status':0}
+        auto=self.controller([eligible,unknown]);auto.observe(eligible,self.result())
+        before=json.loads(json.dumps(auto.data['origins']['https://example.test']))
+        auto.observe(unknown,{'outcome':'error','data':{}})
+        self.assertEqual(auto.data['origins']['https://example.test'],before)
+
+    def test_mixed_workflow_then_reads_resume_two_worker_bootstrap(self):
+        workflow=bootstrap_job('checkout');reads=[bootstrap_job('public-a'),bootstrap_job('public-b')]
+        items=[workflow,*reads];auto=self.controller(items);barrier=threading.Barrier(2);overlapped=[]
+        good=self.result()
+        def start(item,cancelled):
+            auto.prepare(item)
+            def work():
+                if item in reads:
+                    overlapped.append(item['request_id']);barrier.wait(3)
+                return good
+            result=yield work
+            auto.observe(item,result)
+        with patch('zap_auto.controls',return_value={'stable':True}):
+            drive(items,start,workers=4,cookie_mode='auto',policy=self.policy,auto=auto)
+        state=auto.data['origins']['https://example.test']
+        self.assertCountEqual(overlapped,['public-a','public-b'])
+        self.assertEqual((state['mode'],state['level']),('steady',2))
+
     def test_pre_bootstrap_persisted_origin_remains_steady(self):
         path=self.root/'auto-concurrency.json'
         path.write_text(json.dumps({'version':2,'origins':{'https://example.test':{
@@ -122,6 +189,7 @@ class AutoTests(unittest.TestCase):
         self.assertEqual(auto.limit('https://example.test'),2)
     def test_two_worker_trial_after_first_success(self):
         items=[job(v) for v in ('a','b','c','d','e','f')];auto=self.controller(items)
+        auto.data['origins']['https://example.test']['mode']='steady'
         barrier=threading.Barrier(2);started=[]
         good=self.result()
         def start(item,cancelled):
@@ -136,7 +204,7 @@ class AutoTests(unittest.TestCase):
             drive(items,start,workers=4,cookie_mode='auto',policy=self.policy,auto=auto)
         self.assertEqual(started[:4],['a','b','c','d']);self.assertEqual(len(started),6)
     def test_changed_controls_downgrade_without_skipping_scan(self):
-        items=[job('a'),job('b')];auto=self.controller(items);called=[]
+        items=[bootstrap_job('a'),bootstrap_job('b')];auto=self.controller(items);called=[]
         def start(item,cancelled):
             auto.prepare(item)
             result=yield lambda: called.append(item['request_id']) or {'outcome':'ok'}
