@@ -337,7 +337,7 @@ def _run(agent, user_text):
             if cookie_mode == 'auto':
                 from zap_auto import AutoConcurrency
                 auto_concurrency = AutoConcurrency(cfg, journal.directory, representatives, concurrency_policy)
-                print('[zap:auto] one worker per origin initially; stable trials permit up to two', flush=True)
+                print('[zap:auto] bootstrap permits up to two low-risk read-only groups per origin', flush=True)
             scheduling = scheduling_summary(representatives, workers, cookie_mode, concurrency_policy)
             atomic(journal.directory / 'zap-scheduling.json', scheduling)
             journal.data['stages']['zap_active']['scheduling'] = {
