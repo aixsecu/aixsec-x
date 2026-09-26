@@ -1,0 +1,20 @@
+{
+  "user_A": {
+    "origin": "https://your-authorized-target.example",
+    "authentication": {
+      "method": "form",
+      "parameters": {
+        "loginPageUrl": "https://your-authorized-target.example/login",
+        "loginRequestUrl": "https://your-authorized-target.example/login",
+        "loginRequestBody": "username={%username%}&password={%password%}"
+      },
+      "verification": {
+        "method": "response",
+        "loggedInRegex": "REPLACE_WITH_REAL_LOGGED_IN_MARKER",
+        "loggedOutRegex": "REPLACE_WITH_REAL_LOGGED_OUT_MARKER"
+      }
+    },
+    "sessionManagement": {"method": "cookie"},
+    "credential_env": {"username": "AIXSEC_USER_A", "password": "AIXSEC_PASS_A"}
+  }
+}

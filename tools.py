@@ -7,6 +7,7 @@ Chỉ chạy lệnh đã được allowlist trong registry (không dispatch chu�
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import re
 import shutil
@@ -92,23 +93,23 @@ _MISSING_HINT: dict[str, str] = {
 # run_cmd giết giữa chừng trước khi kịp in findings); _nikto_scan truyền
 # -maxtime = _timeout-10 để nikto tự kết thúc đúng hạn.
 TOOL_TIMEOUTS: dict[str, int] = {
+    "api_discovery": 100,
     "param_discovery": 60,   # arjun -q có thể chạy rất lâu
     "detect_cms": 90,        # whatweb -a 3 chậm trên site lớn
     "subdomain_enum": 90,    # subfinder brute từ từ
     "nikto_scan": 180,       # nikto vốn chậm — cap đủ cho scan trung bình
     "sqlmap_runner": 300,   # v1.4.7: sqlmap bounded — đủ cho 1 lần chạy technique set
-    "wapiti_scan": 600,      # v1.5.0: scan cả website (crawler+attack) — operator tăng WEBX_TOOL_TIMEOUT nếu cần
+    "wapiti_scan": 600,      # hard cap mặc định; dispatcher cấp max_scan_time + 90s cleanup
     "crawler": 120,          # v1.9.1: BFS crawl GET-only (hint có method thật; UNKNOWN không ép GET; time_budget tự dừng)
 }
 
-# v1.5.1: tool QUÉT DÀI — _dispatch dùng SÀN max(tool_timeout, cap) thay vì trần
-# min(). Lý do (Bug 2): min() chặn wapiti_scan ở tool_timeout mặc định 90s →
-# wapiti bị giết giữa chừng (chưa kịp ghi report JSON), vòng chạy mà như không
-# chạy. Cap 600s là mức TỐI THIỂU; operator muốn lâu hơn thì tăng WEBX_TOOL_TIMEOUT.
+# Tool quét dài được dispatcher cấp budget riêng. Wapiti dùng
+# max_scan_time + 90 giây cho cleanup/report, tối đa 600 giây mặc định; operator
+# có thể chủ động tăng WEBX_TOOL_TIMEOUT cho mục tiêu lớn.
 LONG_RUN_TOOLS: frozenset = frozenset({"wapiti_scan"})
 
 
-def available_tools() -> tuple[set, dict]:
+def available_tools(config=None) -> tuple[set, dict]:
     """(set tool khả dụng, dict {tool_name: binary thiếu}) — gọi 1 lần lúc khởi động.
     Chỉ các tool cần binary NGOÀI mới được liệt kê; tool thuần Python
     (http_probe, headers_recon, dns_lookup, sqli_manual_test, ...) luôn khả dụng."""
@@ -120,6 +121,15 @@ def available_tools() -> tuple[set, dict]:
             avail.add(name)
         else:
             missing[name] = binary
+    from adapters.nuclei import executable as nuclei_executable
+    if nuclei_executable(config or {}):
+        avail.add('nuclei_scan'); missing.pop('nuclei_scan', None)
+    else:
+        avail.discard('nuclei_scan')
+        missing['nuclei_scan'] = (config or {}).get('nuclei_executable', 'nuclei')
+    from adapters.zap import executable
+    if not executable(config or {}):
+        avail.difference_update({"zap_baseline", "zap_active_scan"})
     return avail, missing
 
 
@@ -259,6 +269,12 @@ def _http_request(**kw):
                              for h in resp.history],
                 "cookies": he.redact_cookies(resp.cookies or {}),
                 "evidence": rec.evidence_dict()}
+        if any('json' in str(v).lower() for k, v in resp.headers.items() if k.lower() == 'content-type') and len(resp.content) <= 2_000_000:
+            from api_discovery import infer_schema
+            try:
+                data['response_schema'] = infer_schema(json.loads(resp.text))
+            except (ValueError, RecursionError):
+                pass
         out = (f"{resp.method} {url} → {resp.status_code} "
                f"({len(resp.content)} bytes, {dt}s)\n"
                f"headers:\n" + "\n".join(f"  {k}: {v}" for k, v in hdrs.items()))
@@ -300,6 +316,148 @@ def _crawl(**kw):
         return result.render(), result.to_data()
     except ValueError as e:
         return f"[!] crawler: {e}", None
+
+
+def _api_discovery(**kw):
+    from api_discovery import discover
+    try:
+        result = discover(kw['url'], max_requests=int(kw.get('max_requests', 24)),
+                          time_budget=min(90, max(1, int(kw.get('_timeout', 95)) - 5)))
+        return f"API discovery: {len(result['operations'])} operation observations; {len(result['warnings'])} warnings", result
+    except (ValueError, TypeError) as exc:
+        return f"[!] api_discovery: {exc}", None
+
+
+def _api_import(**kw):
+    from api_discovery import import_document
+    try:
+        result = import_document(kw['document'], kw['url'])
+        return f"API import: {len(result['operations'])} declared operations; {len(result['warnings'])} warnings", result
+    except (ValueError, TypeError, AttributeError, RecursionError):
+        return "[!] api_import: invalid or unsupported document", None
+
+
+def _auth_context_set(**kw):
+    import auth_context
+    try:
+        data = auth_context.manager().configure(
+            kw["name"], kw["origin"], transport=kw.get("transport"),
+            login_steps=kw.get("login_steps"), logout_step=kw.get("logout_step"),
+            replace=bool(kw.get("replace", False)))
+        return f"Auth context {data['name']}: {data['state']}", data
+    except (ValueError, TypeError) as exc:
+        return f"[!] auth_context_set: {exc}", None
+
+
+def _auth_context_list(**kw):
+    import auth_context
+    data = {"contexts": auth_context.manager().list()}
+    return f"Auth contexts: {len(data['contexts'])}", data
+
+
+def _auth_login(**kw):
+    import auth_context
+    try:
+        data = auth_context.manager().get(kw["name"]).login()
+        return f"Auth login {kw['name']}: {data['state']}", data
+    except (ValueError, TypeError, json.JSONDecodeError) as exc:
+        return f"[!] auth_login: {exc}", None
+
+
+def _auth_logout(**kw):
+    import auth_context
+    try:
+        data = auth_context.manager().get(kw["name"]).logout()
+        return f"Auth logout {kw['name']}: {data['state']}", data
+    except (ValueError, TypeError) as exc:
+        return f"[!] auth_logout: {exc}", None
+
+
+def _auth_context_remove(**kw):
+    import auth_context
+    removed = auth_context.manager().remove(kw["name"])
+    data = {"name": kw["name"], "removed": removed}
+    return f"Auth context {kw['name']}: {'removed' if removed else 'not found'}", data
+
+
+def _auth_compare(**kw):
+    import auth_context
+    try:
+        request = dict(kw["request"])
+        data = auth_context.manager().compare(list(kw["contexts"]), request)
+        changed = sum(not pair["same_body_hash"] for pair in data["comparisons"])
+        return (f"Auth comparison: {len(data['observations'])} contexts, "
+                f"{changed}/{len(data['comparisons'])} body pairs differ; facts only"), data
+    except (ValueError, TypeError, json.JSONDecodeError) as exc:
+        return f"[!] auth_compare: {exc}", None
+
+
+def _dynamic_plan(**kw):
+    import security_analysis
+    try:
+        data = security_analysis.manager().plan(
+            kw.get("goal") or "coverage", int(kw.get("max_actions", 12)))
+        return (f"Dynamic plan {data['plan_id']}: {len(data['actions'])} actions "
+                f"({data['counts']['planned']} planned, {data['counts']['blocked']} blocked, "
+                f"{data['counts']['completed']} completed)"), data
+    except (ValueError, TypeError) as exc:
+        return f"[!] dynamic_plan: {exc}", None
+
+
+def _authorization_reason(**kw):
+    import security_analysis
+    try:
+        data = security_analysis.manager().reason_authorization(
+            kw.get("url") or "", kw.get("resource_owner") or "",
+            kw.get("expected_allowed_contexts") or [])
+        return f"Authorization reasoning: {len(data['hypotheses'])} hypotheses; no verdicts", data
+    except (ValueError, TypeError) as exc:
+        return f"[!] authorization_reason: {exc}", None
+
+
+def _business_rule_set(**kw):
+    import security_analysis
+    try:
+        data = security_analysis.manager().set_rule(kw["workflow"], kw["rule"])
+        return f"Business rule {data['rule_id']} configured", data
+    except (ValueError, TypeError) as exc:
+        return f"[!] business_rule_set: {exc}", None
+
+
+def _business_workflow_test(**kw):
+    import security_analysis
+    try:
+        data = security_analysis.manager().execute_workflow(
+            kw["workflow"], kw["context"], kw["steps"])
+        return f"Workflow run {data['run_id']}: {len(data['observations'])} observed steps", data
+    except (ValueError, TypeError) as exc:
+        return f"[!] business_workflow_test: {exc}", None
+
+
+def _business_reason(**kw):
+    import security_analysis
+    try:
+        data = security_analysis.manager().reason_business(kw["workflow"])
+        return f"Business reasoning: {len(data['hypotheses'])} hypotheses; no verdicts", data
+    except (ValueError, TypeError) as exc:
+        return f"[!] business_reason: {exc}", None
+
+
+def _sast_dast_correlate(**kw):
+    import security_analysis
+    try:
+        data = security_analysis.manager().correlate(int(kw.get("max_results", 30)))
+        return (f"SAST→DAST: {len(data['correlations'])} candidate correlations from "
+                f"{data['sast_findings']} SAST findings; no verdicts"), data
+    except (ValueError, TypeError) as exc:
+        return f"[!] sast_dast_correlate: {exc}", None
+
+
+def _phase3_status(**kw):
+    import security_analysis
+    data = security_analysis.manager().status()
+    return (f"Phase 3 state: rules={data['rules']}, runs={data['workflow_runs']}, "
+            f"SAST findings={data['sast_findings']}"), data
 
 
 def _dns_lookup(**kw):
@@ -360,7 +518,19 @@ def _nikto_scan(**kw):
 # TOOLS — active exploitation layer
 # ─────────────────────────────────────────────
 
+def _sql_error_verify(**kw):
+    from verification import paired
+    if not kw.get('_verification_entry') or not kw.get('_verification_record'):
+        raise ValueError('Verification requires an executor-selected captured request and candidate')
+    return paired(kw['_config'], kw['_verification_entry'], kw['parameter'],
+                  kw['_verification_record'], kw.get('_timeout',60))
+
+
 def _nuclei_scan(**kw):
+    if kw.get('_config') is not None:
+        from adapters.nuclei import run_scan
+        return run_scan(kw['_config'], kw['url'], kw.get('_templates') or [], kw.get('_timeout'),
+                        entry=kw.get('_entry'), auth_context=kw.get('auth_context','anonymous'))
     _need("nuclei")
     args = ["nuclei", "-u", kw["url"], "-silent"]
     if kw.get("severity"):
@@ -490,7 +660,8 @@ def _ffuf_dir(**kw):
         # tránh URL-gate nuốt hết ffuf_dir chỉ vì đường dẫn sai
         raise ValueError(str(e))
     args = ["ffuf", "-u", kw["url"].rstrip("/") + "/FUZZ",
-            "-w", wl, "-mc", "200,204,301,302,307,401,403", "-t", "30",
+            "-w", wl, "-mc", "200,204,301,302,307,401,403", "-t", str(kw.get("_threads", 30)),
+            "-rate", str(kw.get("_rate", 0)),
             "-timeout", "10", "-maxtime", str(int(kw.get("maxtime") or 90)),
             "-s"]
     if kw.get("extensions"):
@@ -524,6 +695,9 @@ def _sqlmap_runner(**kw):
     không ra dấu hiệu (vd template CONTAINS hấp thụ payload) → model ghi nhận
     và hạ cấp kỳ vọng / chuyển manual, KHÔNG spam lại cùng url (bị blocked).
     """
+    if kw.get('_verification_entry'):
+        from verification import sqlmap_probe
+        return sqlmap_probe(kw['_config'], kw['_verification_entry'], kw['parameter'], kw.get('_timeout',240))
     _need("sqlmap")
     url = kw["url"]
     # technique: allowlist B/E/U/S/T/Q, dedupe, giữ thứ tự (dict.fromkeys)
@@ -700,6 +874,9 @@ def _wapiti_parse_report(report_path: str) -> dict:
     """Parse report JSON của wapiti → dict chuẩn + dedupe finding."""
     with open(report_path, encoding="utf-8") as f:
         rep = json.load(f)
+    if (not isinstance(rep, dict) or not isinstance(rep.get("infos"), dict)
+            or not isinstance(rep.get("vulnerabilities"), dict)):
+        raise ValueError("Wapiti report missing infos/vulnerabilities objects")
     infos = rep.get("infos") or {}
     vulns: dict = rep.get("vulnerabilities") or {}
     findings = []
@@ -952,7 +1129,7 @@ def _form_sweep(base_url: str, session_dir: str, budget: int, req_timeout: int,
     t0 = t.monotonic()
     engine = _sweep_engine(base_url, req_timeout)
     if engine:
-        logs.append(f"[i] form sweep: engine ước lượng từ headers = {engine}")
+        logs.append(f"[i] form sweep: engine ước lượng từ headers = {engine} (heuristic only; NOT confirmed DBMS or vulnerability)")
     seen: set[tuple] = set()
     for db in dbs:
         try:
@@ -1105,9 +1282,8 @@ def _wapiti_scan(**kw):
     # v1.5.1 (Bug 2): truyền NGUYÊN budget thay vì min(budget, scan_time+60) —
     # trước đây run_cmd giết wapiti khi scan_time+60 trôi qua dù budget còn dư,
     # wapiti chưa kịp ghi report JSON nên outcome=error 'thiếu report' mọi lần.
-    # Budget giờ = max(tool_timeout, 600) nhờ LONG_RUN_TOOLS trong _dispatch, còn
-    # wapiti tự kết thúc khi hết --max-scan-time (nhỏ hơn budget) nên run_cmd chỉ
-    # là lưới an toàn cuối, không cắt ngang scan giữa chừng.
+    # Dispatcher cấp max_scan_time + cleanup grace (bounded); run_cmd là lưới
+    # an toàn nếu Wapiti không tự thoát sau thời hạn scan/report.
     out = run_cmd(args, budget, max_chars=6000)
     # 1) lỗi thực thi (timeout / thiếu binary /...) — KHÔNG kết luận gì từ lần chạy này
     if out.startswith("[!]"):
@@ -1155,6 +1331,7 @@ def _wapiti_scan(**kw):
     # v1.7.0 (structured ToolResult): data = findings giảm còn shape khai báo
     # (hostile-safe: .get, không truyền dict gốc từ report).
     wdata = {"target": rep.get("target") or url, "scope": rep.get("scope") or scope,
+             "crawled": craw, "report_path": report_path,
              "findings": [{"category": str(f.get("category") or ""),
                             "level": str(f.get("level") or "info"),
                             "method": str(f.get("method") or "GET"),
@@ -1936,7 +2113,43 @@ def _sast_scan(**kw):
         out.append("\n── gitleaks ──\n" + _gitleaks_scan(src))
     elif engine == "gitleaks":
         out.append("\n[gitleaks] chưa cài → pipx install gitleaks")
-    return "\n".join(out)
+    secret_names = {item[0] for item in SECRET_PATTERNS}
+    structured = []
+    for sev, path, lineno, name, hint, snippet in findings:
+        params = set(re.findall(
+            r"(?:GET|POST|REQUEST|COOKIE)\s*\[\s*['\"]([^'\"]+)|"
+            r"(?:args|form|json|query|body|params)(?:\.get)?\s*\(?\s*['\"]?([A-Za-z_][\w-]*)",
+            snippet, re.I))
+        flat_params = sorted({value for pair in params for value in pair if value})
+        route_match = re.search(r"['\"](/(?:api/)?[A-Za-z0-9_./{}:-]+)(?:\s|['\"])", snippet)
+        rel = os.path.relpath(path, relbase)
+        structured.append({
+            "finding_id": hashlib.sha256(
+                f"{rel}:{lineno}:{name}".encode()).hexdigest()[:16],
+            "name": name, "severity": sev, "category": _sast_category(name),
+            "file": rel, "line": lineno, "hint": hint,
+            "parameters": flat_params,
+            "route": route_match.group(1) if route_match else "",
+            "snippet_sha256": hashlib.sha256(snippet.encode()).hexdigest(),
+            "secret": name in secret_names,
+        })
+    data = {"src_path": src, "files_scanned": len(files), "total_hits": total_hits,
+            "truncated": total_hits > len(findings), "languages": lang_counts,
+            "findings": structured}
+    return "\n".join(out), data
+
+
+def _sast_category(name: str) -> str:
+    value = (name or "").lower()
+    for marker, category in (("sql", "sqli"), ("xss", "xss"),
+                             ("command", "command_injection"), ("rce", "rce"),
+                             ("ssrf", "ssrf"), ("lfi", "path_traversal"),
+                             ("file", "path_traversal"),
+                             ("deserial", "deserialization"), ("ssti", "ssti"),
+                             ("upload", "file_upload")):
+        if marker in value:
+            return category
+    return "other"
 
 
 def _semgrep_scan(src: str) -> str:
@@ -1987,7 +2200,52 @@ def _gitleaks_scan(src: str) -> str:
 # TOOL REGISTRY
 # ─────────────────────────────────────────────
 
+def _zap_baseline(**kw):
+    from adapters.zap import run_scan
+    return run_scan(kw["_config"], kw["url"], timeout=kw.get("_timeout"),
+                    auth_context=kw.get("auth_context", "anonymous"), ajax=bool(kw.get("ajax", False)))
+
+
+def _zap_active_scan(**kw):
+    from adapters.zap import run_scan
+    return run_scan(kw["_config"], kw["url"], active=True, rule_ids=kw.get("rule_ids", []),
+                    timeout=kw.get("_timeout"), auth_context=kw.get("auth_context", "anonymous"))
+
+
+def _evidence_validate(**kw):
+    value = kw["_evidence_store"].validate(kw["evidence_id"])
+    return json.dumps(value), value
+
+
+def _evidence_replay(**kw):
+    value = kw["_evidence_store"].replay(kw["evidence_id"], kw["_scope_policy"], kw.get("_timeout", 15))
+    return json.dumps(value), value
+
+
+def _evidence_status(**kw):
+    value = kw["_evidence_store"].summary()
+    return json.dumps(value, ensure_ascii=False), value
+
+
 TOOL_REGISTRY: list[ToolSpec] = [
+    ToolSpec("zap_baseline", "Isolated ZAP spider/OpenAPI/passive scan. Alerts are candidates, not confirmed findings.",
+             {"type": "object", "properties": {"url": {"type": "string"},
+               "auth_context": {"type": "string", "description": "Operator-configured ZAP auth profile; anonymous by default"},
+               "ajax": {"type": "boolean"}}, "required": ["url"]}, _zap_baseline, risk="noisy"),
+    ToolSpec("zap_active_scan", "Targeted ZAP active scan with explicit operator-allowed rule IDs and time budget.",
+             {"type": "object", "properties": {"url": {"type": "string"},
+               "request_id": {"type": "string"}, "method": {"type": "string"},
+               "auth_context": {"type": "string"},
+               "rule_ids": {"type": "array", "items": {"type": "integer"}}},
+               "required": ["url", "rule_ids"]}, _zap_active_scan, risk="active"),
+    ToolSpec("evidence_validate", "Validate stored evidence with deterministic rules. Unsupported checks remain needs_validation.",
+             {"type": "object", "properties": {"evidence_id": {"type": "string"}},
+               "required": ["evidence_id"]}, _evidence_validate, scope_params=(), risk="safe"),
+    ToolSpec("evidence_replay", "Replay a captured request under the same isolated auth identity; compare facts, never auto-confirm exploitability.",
+             {"type": "object", "properties": {"evidence_id": {"type": "string"}},
+               "required": ["evidence_id"]}, _evidence_replay, scope_params=(), risk="active"),
+    ToolSpec("evidence_status", "Read stored scanner evidence, coverage and validation states.",
+             {"type": "object", "properties": {}}, _evidence_status, scope_params=(), risk="safe"),
     # ── Recon ──
     ToolSpec("http_probe", "GET một URL: trả status code, headers chọn lọc, snippet body.",
              {"type": "object", "properties": {"url": {"type": "string", "pattern": "^https?://"}},
@@ -2038,6 +2296,103 @@ TOOL_REGISTRY: list[ToolSpec] = [
     # v1.9.0: crawler GET-only trên Session Engine — link/form/param/script/
     # js-hint discovery, bounded (depth/pages/body/time_budget), redirect ra
     # ngoài scope không theo. record=False — không làm ô nhiễm evidence ring.
+    ToolSpec("dynamic_plan",
+             "Phase 3 deterministic re-planner: reads current inventory, test history, capabilities and correlations; returns prioritized planned/blocked/completed actions without executing them.",
+             {"type": "object", "properties": {
+                 "goal": {"type": "string", "enum": ["coverage", "authorization", "business_logic", "sast_dast"]},
+                 "max_actions": {"type": "integer", "minimum": 1, "maximum": 50}}},
+             _dynamic_plan, risk="safe"),
+    ToolSpec("authorization_reason",
+             "Build evidence-bound authorization hypotheses from auth_compare observations. Optional declared owner/policy strengthens reasoning. Never returns a vulnerability verdict.",
+             {"type": "object", "properties": {
+                 "url": {"type": "string", "pattern": "^https?://"},
+                 "resource_owner": {"type": "string"},
+                 "expected_allowed_contexts": {"type": "array",
+                     "items": {"type": "string"}}}},
+             _authorization_reason, risk="safe"),
+    ToolSpec("business_rule_set",
+             "Declare a business invariant before testing: required_before, max_successes, numeric_bound, or state_transition. Declaration is policy input, not evidence.",
+             {"type": "object", "properties": {
+                 "workflow": {"type": "string"},
+                 "rule": {"type": "object", "properties": {
+                     "type": {"type": "string", "enum": ["required_before", "max_successes", "numeric_bound", "state_transition"]},
+                     "before": {"type": "string"}, "action": {"type": "string"},
+                     "field": {"type": "string"}, "min": {"type": "number"},
+                     "max": {"type": "number"},
+                     "allowed": {"type": "array", "items": {"type": "array", "minItems": 2, "maxItems": 2}}},
+                    "required": ["type"]}}, "required": ["workflow", "rule"]},
+             _business_rule_set, risk="safe"),
+    ToolSpec("business_workflow_test",
+             "Execute a bounded sequence of real requests through one configured auth context and record evidence for declared business rules. Does not invent state changes or verdicts.",
+             {"type": "object", "properties": {
+                 "workflow": {"type": "string"}, "context": {"type": "string"},
+                 "steps": {"type": "array", "minItems": 1, "maxItems": 20,
+                     "items": {"type": "object", "properties": {
+                         "action": {"type": "string"}, "resource": {"type": "string"},
+                         "inputs": {"type": "object"}, "from_state": {"type": "string"},
+                         "to_state": {"type": "string"}, "request": {"type": "object"}},
+                         "required": ["action", "request"]}}},
+              "required": ["workflow", "context", "steps"]},
+             _business_workflow_test, risk="active"),
+    ToolSpec("business_reason",
+             "Evaluate actual workflow observations against previously declared invariants and emit hypotheses plus evidence gaps; never a confirmed verdict.",
+             {"type": "object", "properties": {"workflow": {"type": "string"}},
+              "required": ["workflow"]}, _business_reason, risk="safe"),
+    ToolSpec("sast_dast_correlate",
+             "Correlate structured SAST sinks with discovered API operations by route/parameter/category and return bounded validation leads. SAST alone never confirms exploitability.",
+             {"type": "object", "properties": {
+                 "max_results": {"type": "integer", "minimum": 1, "maximum": 200}}},
+             _sast_dast_correlate, risk="safe"),
+    ToolSpec("phase3_status", "Show bound Phase 3 planning/reasoning/correlation state.",
+             {"type": "object", "properties": {}}, _phase3_status, risk="safe"),
+    ToolSpec("auth_context_set",
+             "Tạo auth context có HTTP session/cookie jar riêng. Giá trị bí mật nên dùng env:TEN_BIEN. login_steps hỗ trợ request tuần tự và extract cookie/header/json/body_regex. Không gửi request cho tới auth_login/auth_compare.",
+             {"type": "object", "properties": {
+                 "name": {"type": "string", "pattern": "^[A-Za-z][A-Za-z0-9_.-]{0,63}$"},
+                 "origin": {"type": "string", "pattern": "^https?://"},
+                 "transport": {"type": "object", "description": "auth string và/hoặc headers/cookies/params; secret có thể là env:NAME"},
+                 "login_steps": {"type": "array", "maxItems": 12,
+                                  "items": {"type": "object"}},
+                 "logout_step": {"type": "object"},
+                 "replace": {"type": "boolean"}},
+              "required": ["name", "origin"]}, _auth_context_set,
+             scope_params=("origin",), risk="safe"),
+    ToolSpec("auth_context_list", "Liệt kê auth context và lifecycle state; không lộ secret.",
+             {"type": "object", "properties": {}}, _auth_context_list, risk="safe"),
+    ToolSpec("auth_login", "Chạy login flow đã cấu hình trong session riêng của context.",
+             {"type": "object", "properties": {"name": {"type": "string"}},
+              "required": ["name"]}, _auth_login, risk="active"),
+    ToolSpec("auth_logout", "Chạy logout step nếu có rồi xóa cookie/session/biến trích xuất của context.",
+             {"type": "object", "properties": {"name": {"type": "string"}},
+              "required": ["name"]}, _auth_logout, risk="active"),
+    ToolSpec("auth_context_remove", "Xóa một auth context và session của nó.",
+             {"type": "object", "properties": {"name": {"type": "string"}},
+              "required": ["name"]}, _auth_context_remove, risk="safe"),
+    ToolSpec("auth_compare",
+             "Gửi cùng một request qua 2-8 auth context cô lập và ghi structured status/redirect/shape/hash/similarity evidence. Chỉ facts, không tự kết luận IDOR/BOLA.",
+             {"type": "object", "properties": {
+                 "contexts": {"type": "array", "minItems": 2, "maxItems": 8,
+                              "items": {"type": "string"}},
+                 "request": {"type": "object", "properties": {
+                     "method": {"type": "string", "enum": ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"]},
+                     "url": {"type": "string", "pattern": "^https?://"},
+                     "headers": {"type": "object"}, "params": {"type": "object"},
+                     "cookies": {"type": "object"}, "form": {"type": "object"},
+                     "json": {}, "body": {"type": "string"},
+                     "follow_redirects": {"type": "boolean"},
+                     "timeout": {"type": "number", "minimum": 0.1, "maximum": 60}},
+                    "required": ["url"]}},
+              "required": ["contexts", "request"]}, _auth_compare, risk="active"),
+    ToolSpec("api_discovery", "GET-only same-origin OpenAPI/Swagger discovery, JSON observation and GraphQL hints. No auth testing or introspection.",
+             {"type": "object", "properties": {
+                 "url": {"type": "string", "pattern": "^https?://"},
+                 "max_requests": {"type": "integer", "minimum": 1, "maximum": 100}},
+              "required": ["url"]}, _api_discovery, risk="safe"),
+    ToolSpec("api_import", "Import provided OpenAPI/Swagger JSON/YAML or Postman collection text without executing requests. URL is the document location and scope origin. External references are not fetched.",
+             {"type": "object", "properties": {
+                 "url": {"type": "string", "pattern": "^https?://"},
+                 "document": {"type": "string"}}, "required": ["url", "document"]},
+             _api_import, risk="safe"),
     ToolSpec("crawler",
              "BFS crawl GET-only một website (dùng CHUNG Session Engine, không "
              "submit form, không chạy exploit): khám phá link nội bộ, external "
@@ -2082,6 +2437,10 @@ TOOL_REGISTRY: list[ToolSpec] = [
               "required": ["url"]}, _param_discovery, risk="noisy"),
 
     # ── Active ──
+    ToolSpec("sql_error_verify", "Repeat fresh captured control/payload pairs for an SQL error candidate.",
+             {"type":"object", "properties":{"url":{"type":"string"}, "parameter":{"type":"string"},
+              "evidence_id":{"type":"string"}}, "required":["url","parameter","evidence_id"]},
+             _sql_error_verify, risk="active"),
     ToolSpec("nuclei_scan", "Quét lỗ hổng bằng nuclei templates (CVE, misconfig, exposures). "
              "Severity: critical,high,medium,low. Tags ví dụ: cve,rce,sqli,lfi.",
              {"type": "object",

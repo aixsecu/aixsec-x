@@ -101,7 +101,7 @@ class FakeChat:
 
 
 def cfg(extra=None):
-    base = {"ollama_url": "http://x", "model": "m", "max_rounds": 9,
+    base = {"scan_backend": "legacy", "ollama_url": "http://x", "model": "m", "max_rounds": 9,
             "tool_timeout": 10, "output_cap": 5000,
             "targets": ["https://example.com", "10.0.0.0/8"],
             "src_dirs": [],
@@ -486,7 +486,7 @@ class TestWapitiGate(unittest.TestCase):
         # gate chặn đúng 1 lần; sau khi wapiti ok JSON được chấp nhận
         self.assertEqual(a._no_wapiti_json, 1)
         self.assertTrue(a._wapiti_done)
-        self.assertEqual(caught["t"], TOOL_TIMEOUTS["wapiti_scan"])  # sàn 600s
+        self.assertEqual(caught["t"], 210)  # scan 120s + cleanup/report 90s
         self.assertEqual(len(a.chat.calls), 4)
         self.assertFalse(a.chat.calls[3]["json_mode"])   # không forced
         gate = [m for m in a.chat.calls[1]["messages"] if m.get("role") == "user"]
@@ -968,9 +968,8 @@ class TestToolTimeoutCap(unittest.TestCase):
         self.assertEqual(r["outcome"], "ok")
         self.assertEqual(caught["t"], 300)  # không nằm trong cap → giữ nguyên
 
-    def test_wapiti_long_run_gets_cap_floor(self):
-        # v1.5.1 (Bug 2): LONG_RUN_TOOLS dùng SÀN max(tool_timeout, cap) —
-        # wapiti_scan tool_timeout=90s vẫn được 600s, không bị giết giữa scan
+    def test_wapiti_budget_follows_requested_scan_time(self):
+        # Wapiti nhận max_scan_time + 90s cleanup thay vì sàn cố định 600s.
         from tools import TOOL_INDEX, TOOL_TIMEOUTS
         caught = {}
 
@@ -984,9 +983,22 @@ class TestToolTimeoutCap(unittest.TestCase):
                           chat=FakeChat(script=[]))
             r = a._dispatch("wapiti_scan", {"url": "https://example.com/"})
         self.assertEqual(r["outcome"], "ok")
-        # cấu hình 90s nhưng sàn wapiti 600s phải thắng (không còn min())
-        self.assertEqual(caught["t"], TOOL_TIMEOUTS["wapiti_scan"])
-        self.assertGreater(TOOL_TIMEOUTS["wapiti_scan"], 90)
+        self.assertEqual(caught["t"], 390)  # default scan 300 + cleanup 90
+        self.assertLess(caught["t"], TOOL_TIMEOUTS["wapiti_scan"])
+
+    def test_wapiti_short_scan_gets_bounded_cleanup_window(self):
+        from tools import TOOL_INDEX
+        caught = {}
+
+        def fake_wapiti(**kw):
+            caught["t"] = kw.get("_timeout")
+            return "scan done"
+
+        with patch.object(TOOL_INDEX["wapiti_scan"], "exec_fn", fake_wapiti):
+            a = WebXAgent(config=cfg({"tool_timeout": 90}), chat=FakeChat())
+            a._dispatch("wapiti_scan", {"url": "https://example.com/",
+                                         "max_scan_time": 120})
+        self.assertEqual(caught["t"], 210)
 
 
 class TestScopePrompt(unittest.TestCase):
@@ -1359,15 +1371,15 @@ class TestOllamaRemote(unittest.TestCase):
             [json.dumps(x, ensure_ascii=False) for x in lines])
         return r
 
-    def test_ollama_chat_stream_reasoning_tokens_tool_calls(self):
-        """Stream bật: gom NDJSON → content gộp + on_reasoning/on_token + parse tool_calls."""
+    def test_ollama_chat_stream_thinking_tokens_tool_calls(self):
+        """Ollama message.thinking được stream qua callback cùng content/tool calls."""
         from llm import ollama_chat
         cfg_s = {"ollama_url": "http://x", "model": "m", "stream": True,
                  "think": True, "temperature": 0.1, "num_ctx": 4096,
                  "tool_timeout": 30}
         lines = [
             {"message": {"role": "assistant",
-                          "reasoning": "Phân tích endpoint /login..."}},
+                          "thinking": "Phân tích endpoint /login..."}},
             {"message": {"role": "assistant", "content": "He"}},
             {"message": {"role": "assistant", "content": "llo"}},
             {"message": {"role": "assistant", "tool_calls": [
@@ -3055,7 +3067,7 @@ class TestWapitiScan(unittest.TestCase):
         self.assertEqual(r["outcome"], "ok")
         self.assertEqual(c["argv"][c["argv"].index("--max-scan-time") + 1], "300")
         self.assertEqual(c["argv"][c["argv"].index("--max-attack-time") + 1], "150")
-        self.assertEqual(c["timeout"], 600)
+        self.assertEqual(c["timeout"], 390)
         # max_scan_time=5000 bị clamp theo budget 600 → 580, run_cmd 600
         r2, c2, sm2, _ = self._dispatch({"url": "https://example.com/",
                                          "max_scan_time": 5000})
@@ -3616,9 +3628,13 @@ class TestEvidenceRedactor(unittest.TestCase):
         # dict
         self.assertEqual(red.redact_params({"q": "1", "api_key": "k"}),
                          {"q": "1", "api_key": self.REDACT})
-        # list[(name, value)] chuẩn hóa về dict, giữ key
+        # list[(name, value)] giữ nguyên shape và duplicate keys
         self.assertEqual(red.redact_params([("q", "1"), ("token", "t")]),
-                         {"q": "1", "token": self.REDACT})
+                         [("q", "1"), ("token", self.REDACT)])
+        self.assertEqual(red.redact_params([("id", "1"), ("id", "2"),
+                                            ("token", "t1"), ("token", "t2")]),
+                         [("id", "1"), ("id", "2"),
+                          ("token", self.REDACT), ("token", self.REDACT)])
         # None → {} không crash
         self.assertEqual(red.redact_params(None), {})
         # extra: tên param bổ sung theo ngữ cảnh request
@@ -3631,6 +3647,10 @@ class TestEvidenceRedactor(unittest.TestCase):
         out = he._default_redactor().redact_form(
             {"user": "admin", "pass": "123"})
         self.assertEqual(out, {"user": "admin", "pass": self.REDACT})
+        out_multi = he._default_redactor().redact_form(
+            [("role", "user"), ("role", "admin"), ("pass", "123")])
+        self.assertEqual(out_multi, [("role", "user"), ("role", "admin"),
+                                     ("pass", self.REDACT)])
 
     def test_add_sensitive_field_instance_isolation(self):
         import http_engine as he
@@ -4467,10 +4487,8 @@ class TestLedgerHttpRequestEvidence(unittest.TestCase):
 
 
 class TestLlmDownSynthesis(unittest.TestCase):
-    """v1.5.8 (Bug A + Bug B): chuỗi lỗi LLM (Ollama timeout) KHÔNG còn bị
-    đếm là plan-only; 2 lỗi liên tiếp → model down → BỎ final chat (tiết kiệm
-    300s chắc chắn timeout) và tổng hợp findings từ tool output THẬT của phiên
-    (wapiti_scan đã chạy ok). Final chat lỗi → fallback tổng hợp tương tự."""
+    """Timeout không bị tính là plan-only; khi Wapiti bổ sung bằng chứng mới,
+    agent thử một final chat rồi mới fallback sang ToolResult có cấu trúc."""
 
     def setUp(self):
         from tools import TOOL_INDEX
@@ -4503,9 +4521,9 @@ class TestLlmDownSynthesis(unittest.TestCase):
                      if m.get("role") == "user"]
         self.assertTrue(any("Lỗi kết nối model" in u for u in user_msgs))
 
-    def test_two_llm_errors_skip_final_chat_and_synthesize(self):
-        # Bug B: 2 lỗi LLM liên tiếp → llm_down → BỎ final chat (không đốt 300s),
-        # auto wapiti vẫn chạy ở tail, findings tổng hợp từ output THẬT.
+    def test_two_llm_errors_retry_final_after_auto_wapiti(self):
+        # Hai lỗi planning liên tiếp nhưng auto-wapiti vừa tạo bằng chứng mới:
+        # thử đúng một final chat để model tổng hợp dữ liệu scan.
         from tools import TOOL_INDEX
         err = {"content": "[!] Ollama timeout — model may still be loading or too large.",
                "tool_calls": []}
@@ -4514,23 +4532,74 @@ class TestLlmDownSynthesis(unittest.TestCase):
             return WAPITI_OUT
 
         with patch.object(TOOL_INDEX["wapiti_scan"], "exec_fn", fake_wapiti):
-            a = self._agent(script=[err, err])
+            a = self._agent(script=[err, err,
+                                    {"content": FINAL_JSON, "tool_calls": []}])
             res = a.run("test")
-        self.assertTrue(res["llm_down"])
-        self.assertEqual(len(a.chat.calls), 2)      # KHÔNG có final chat
-        self.assertFalse(any(c["json_mode"] for c in a.chat.calls))
-        self.assertEqual(a._llm_fail, 2)
+        self.assertNotIn("llm_down", res)
+        self.assertEqual(len(a.chat.calls), 3)
+        self.assertTrue(a.chat.calls[2]["json_mode"])
+        self.assertEqual(a._llm_fail, 0)
         self.assertTrue(a._wapiti_done)             # auto wapiti chạy ok
         self.assertEqual(res["calls"], 1)          # chỉ auto wapiti
-        self.assertEqual(res["risk_level"], "high")  # top severity từ wapiti
-        self.assertEqual(len(res["findings"]), 2)
+        self.assertEqual(res["risk_level"], "HIGH")
         self.assertEqual(len(a.ledger.all()), 2)
-        names = {f["name"] for f in res["findings"]}
-        self.assertEqual(names, {"SQL Injection", "XSS"})
-        urls = {f["url"] for f in res["findings"]}
-        self.assertEqual(urls, {"https://example.com/product.php",
-                                "https://example.com/search.php"})
-        self.assertIn("Ollama timeout", res["llm_note"])
+
+    def test_three_llm_errors_synthesize_structured_wapiti_data(self):
+        # Nếu recovery final vẫn timeout, fallback đọc ToolResult.data thay vì
+        # phụ thuộc format text hiển thị của Wapiti.
+        from tools import TOOL_INDEX
+        err = {"content": "[!] Ollama first-token timeout.", "tool_calls": []}
+        data = {"target": "https://example.com", "scope": "domain",
+                "findings": [{"category": "SQL Injection", "level": "3",
+                              "method": "GET", "path": "/items?id=1",
+                              "parameter": "id", "module": "sql"}]}
+
+        def fake_wapiti(**kw):
+            return ("localized output without detail rows", data)
+
+        with patch.object(TOOL_INDEX["wapiti_scan"], "exec_fn", fake_wapiti):
+            a = self._agent(script=[err, err, err])
+            res = a.run("test")
+        self.assertEqual(len(a.chat.calls), 3)
+        self.assertTrue(res["llm_down"])
+        self.assertEqual(res["risk_level"], "high")
+        self.assertEqual(len(res["findings"]), 1)
+        self.assertEqual(res["findings"][0]["name"], "SQL Injection")
+        self.assertEqual(res["findings"][0]["url"],
+                         "https://example.com/items?id=1")
+        self.assertEqual(len(a.ledger.all()), 1)
+
+    def test_malformed_model_finding_cannot_raise_risk_or_enter_ledger(self):
+        a = self._agent(extra={"targets": []})
+        malformed = {"findings": [{"id": "recon-1", "vuln_class": "recon",
+                                    "description": "reachable endpoint"}],
+                     "risk_level": "MEDIUM", "overall_summary": "reachable"}
+        result = {"final_text": json.dumps(malformed), "risk_level": "UNKNOWN",
+                  "overall_summary": ""}
+        a._apply_final_contract(result)
+        self.assertEqual(result["risk_level"], "UNKNOWN")
+        self.assertEqual(result["findings"], [])
+        self.assertEqual(result["invalid_findings"], 1)
+        self.assertEqual(a.ledger.all(), [])
+        self.assertIn("không đúng schema", result["overall_summary"])
+
+    def test_context_keeps_older_success_when_latest_call_is_duplicate(self):
+        a = self._agent(extra={"targets": []})
+        a.transcript = [
+            {"round": 1, "type": "tools", "calls": [{
+                "name": "http_request", "outcome": "ok",
+                "args": {"url": "https://example.com/", "method": "get"},
+                "output": "GET https://example.com/ → 404",
+                "data": {"status": 404, "url": "https://example.com/"}}]},
+            {"round": 2, "type": "tools", "calls": [{
+                "name": "http_request", "outcome": "duplicate",
+                "args": {"url": "https://example.com/", "method": "get"},
+                "output": "duplicate"}]},
+        ]
+        context = a._recent_tool_context()
+        self.assertIn('\\"status\\": 404', context)
+        self.assertIn('"outcome": "ok"', context)
+        self.assertIn('"outcome": "duplicate"', context)
 
     def test_final_chat_error_falls_back_to_synthesis(self):
         # final round (json_mode) vẫn lỗi → fallback tổng hợp từ tool output
@@ -4930,7 +4999,7 @@ class TestInventoryInjection(unittest.TestCase):
 
 
 class TestTestHistory(unittest.TestCase):
-    """v1.7.0 (#12 attack memory — review ChatGPT điểm 4): TestHistory nhớ
+    """v1.7.0 (#12 attack memory — Phase 1): TestHistory nhớ
     endpoint×param×vuln_class×tool×outcome ĐÃ THỬ — planner hỏi
     already_tested() deterministic, model KHÔNG lặp lại tool trên cùng
     endpoint/param/lớp lỗ hổng."""

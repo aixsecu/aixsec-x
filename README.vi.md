@@ -1,4 +1,60 @@
+Cải tiến request đã bắt: kiểm tra SQL error riêng cho JSON lồng nhau và từng vị trí tham số trùng tên. Ngữ cảnh đăng nhập được kiểm tra lại trước khi dùng; phiên hết hạn dừng tác vụ liên quan. Nuclei hỗ trợ raw HTTP và template POST/JSON gắn với request thực tế. Planner dựa vào thông tin quan sát mới để đánh giá tiến triển. Xem [cấu hình và giới hạn](docs/SEQUENTIAL_PIPELINE.md).
+
+## Pipeline tuần tự ZAP + Nuclei
+
+Pipeline hiện chạy discovery → ZAP active → Nuclei → xác minh candidate → AI Planner → báo cáo. Các bước scanner không chờ model quyết định. Ba biến `WEBX_PIPELINE_MAX_SECONDS`, `WEBX_PIPELINE_MAX_ACTIONS`, `WEBX_PIPELINE_MAX_REQUESTS` đã ngừng áp dụng; vẫn giữ timeout từng công cụ/request/model và giới hạn tốc độ. Một bước lỗi không lấy mất thời gian của bước sau.
+
+Nuclei bật mặc định (`WEBX_NUCLEI_ENABLED=1`) khi cho phép active scan. Cần binary và template đã cài cục bộ; thiếu thành phần sẽ được ghi rõ trong trạng thái bước. Tích hợp hỗ trợ HTTP theo URL, raw HTTP trong phạm vi, POST/JSON từ request đã bắt và ngữ cảnh đăng nhập có đối chứng mới. Flow, browser, code và OAST vẫn được loại trừ rõ. Kết quả vẫn là candidate.
+
+File `progress.json` trong mỗi thư mục `session-*` lưu checkpoint. Để tiếp tục phiên bị gián đoạn với cùng cấu hình:
+
+```bash
+export WEBX_RESUME_SESSION=/duong/dan/tuyet/doi/.aixsec-evidence/session-XXXX
+# Tùy chọn: chủ động thử lại cả những tác vụ timeout/lỗi/bị từ chối trước đó:
+export WEBX_RETRY_INCOMPLETE=1
+```
+
+Giữ nguyên namespace lịch sử và thư mục evidence. Tác vụ hoàn tất được khôi phục bằng chứng mà không quét lại. Tác vụ bị ngắt giữa chừng có thể gửi lại request vì chưa ghi nhận hoàn tất. Bỏ `WEBX_RESUME_SESSION` để bắt đầu phiên mới. Xem [luồng tuần tự, phạm vi template và tiếp tục phiên](docs/SEQUENTIAL_PIPELINE.md).
+
+> **4.2.0 — ZAP + Evidence pipeline:** baseline chạy trước AI; finding/risk lấy từ evidence và validator. Mặc định `WEBX_SCAN_BACKEND=auto` chọn ZAP nếu có, nếu không dùng HTTP observation làm discovery, sau đó chạy Nuclei nếu được bật và có sẵn. Wapiti gate cũ chỉ còn trong `legacy`. Xem [cấu hình, auth, policy và giới hạn](docs/ZAP_PIPELINE.md). Các ví dụ Wapiti-first bên dưới mô tả chế độ legacy.
+
+Các tích hợp scanner nằm trong `adapters/` (`adapters/zap.py` dành cho ZAP). Adapter cho scanner mới sẽ được thêm vào package này; phần lập lịch và xử lý bằng chứng dùng chung vẫn tách riêng.
+
+Với website có form hoặc AJAX, baseline hiện bật AJAX Spider mặc định
+(`WEBX_ZAP_AJAX=1`), dùng `firefox-headless`. Cần trình duyệt và add-on
+WebDriver/Selenium tương thích; đặt `WEBX_ZAP_BROWSER=chrome-headless` để dùng Chrome.
+`WEBX_ZAP_AJAX=0` tắt tương tác trình duyệt. Timeout ZAP mặc định là 600 giây.
+Báo cáo cuối có inventory `discovery` riêng cho form, ô nhập và API, phân biệt
+“phát hiện”, “đã gửi request” và “đã kiểm thử”. Xem
+[cấu hình form/AJAX và giới hạn coverage](docs/ZAP_PIPELINE.md#form-and-ajax-discovery).
+
+Active Scan hiện được lập lịch tự động sau discovery, không phụ thuộc AI:
+mặc định `WEBX_ZAP_AUTO_ACTIVE=1`, `WEBX_ALLOW_ACTIVE_SCAN=1` và
+`WEBX_ZAP_ALLOWED_RULES=all`. `all` chọn các rule ZAP đã cài, không bảo đảm phát hiện
+mọi lỗ hổng. Cơ chế phê duyệt chạy tool và timeout từng công cụ vẫn áp dụng.
+Đặt `WEBX_ALLOW_ACTIVE_SCAN=0` nếu chỉ muốn discovery/passive scan.
+Các request cùng cấu trúc chỉ được lập lịch một lần cho mỗi rule; lịch sử lưu
+qua các lần chạy. Xem [lập lịch và chống quét trùng](docs/ZAP_PIPELINE.md#automatic-multi-rule-scheduling-and-persistent-deduplication).
+
+> **4.1.0 / Phase 4.1:** context retrieval xác định, prompt tách lớp, token
+> budget, timeout LLM theo giai đoạn và runtime metrics. Xem
+> [hướng dẫn Phase 4.1](docs/PHASE_4_1.md). Phase 4 gồm knowledge graph có thể lưu, goal-driven planner, bộ nhớ
+> thích nghi, suy luận workflow, cost/risk budget và autonomous runtime có
+> checkpoint. Xem [kiến trúc Phase 4](docs/PHASE_4.md),
+> [hướng dẫn Phase 3](docs/PHASE_3.md), [Phase 2](docs/PHASE_2.md) và
+> [chi tiết API discovery](docs/PHASE_2_1.md).
+
 # AIXSEC-X — AI Web Exploitation Assistant (local LLM, Kali Linux)
+
+Active scan hiện mặc định `WEBX_ZAP_STRENGTH=Medium` (Low/Medium/High/Insane).
+File riêng tư `active-evidence.jsonl` lưu payload, phản hồi có giới hạn, hash và thời gian
+cho các rule được chọn. Lỗi SQL không có trong mẫu đối chứng có thể tạo **candidate SQLi**
+kể cả khi ZAP không cảnh báo; vẫn cần replay đối chứng để xác nhận.
+Scheduler phân biệt `responses_recorded` với `requests_observed`; cả hai không có nghĩa an toàn.
+Để chủ động kiểm tra lại các nhóm URL đã có lịch sử sau cập nhật, đặt
+`export WEBX_ZAP_HISTORY_NAMESPACE=evidence-v2` một lần và giữ nguyên cho các lần chạy sau.
+Chống quét trùng vẫn có hiệu lực trong namespace đó.
+Xem [giới hạn lưu bằng chứng và dữ liệu riêng tư](docs/ZAP_PIPELINE.md#active-response-evidence).
 
 | Ngôn ngữ | Tệp |
 |---|---|
@@ -152,6 +208,8 @@ thực tế.)
 ```bash
 cd aixsec-x
 source .venv/bin/activate
+export WEBX_SCAN_BACKEND=zap
+export WEBX_ZAP_EXECUTABLE=zaproxy
 export WEBX_TARGETS="https://example.com"        # target web (để trống nếu chỉ SAST)
 export WEBX_SRC_DIRS="/path/to/source"           # thư mục source (để trống nếu không dùng SAST)
 python3 agent.py                                  # interactive
@@ -163,6 +221,10 @@ Chế độ `--non-interactive`/`--oneshot` chỉ đọc env (không hỏi) — 
 
 ### Cấu hình qua env
 
+Các công tắc boolean dùng `1` (bật) và `0` (tắt). Mặc định dưới đây lấy từ `config.py`; giá trị trống nghĩa là chưa đặt cấu hình cụ thể.
+
+#### Model, agent và phạm vi
+
 | Var | Mặc định | Ý nghĩa |
 |---|---|---|
 | `WEBX_TARGETS` | *(trống)* | Target được ủy quyền, phân tách bằng dấu phẩy (URL/domain/CIDR) |
@@ -170,10 +232,13 @@ Chế độ `--non-interactive`/`--oneshot` chỉ đọc env (không hỏi) — 
 | `WEBX_MODEL` | `qwen2.5:7b` | Model Ollama (gợi ý: `huihui_ai/qwen3.5-abliterated:9b`) |
 | `WEBX_THINK` | `0` | `1`=bật thinking mode (không khuyến nghị khi dùng function calling) |
 | `WEBX_AUTO_EXEC` | `ask` | `ask`=hỏi operator với tool noisy/active; `safe`=chỉ tự chạy tool an toàn; `all`=tự chạy hết (rủi ro) |
-| `WEBX_AI_NATIVE` | `0` | **v1.5.6** `1`=chế độ AI-NATIVE: model TỰ phân tích lỗ hổng qua `http_request` (không bắt buộc wapiti/sqlmap; final JSON cần ≥1 response `http_request` thật) |
-| `WEBX_MAX_ROUNDS` | `8` | Số vòng tool-call tối đa mỗi lượt (thấp hơn = nhanh/rẻ hơn; model 9B trên máy 4 vCPU có thể mất 20–30 phút/vòng) |
-| `WEBX_TOOL_TIMEOUT` | `90` | Timeout mỗi tool (giây) |
-| `WEBX_LLM_TIMEOUT` | `300` | Timeout tối đa chờ model trả lời mỗi lượt (giây); model 9B trên CPU có thể mất 1–3 phút |
+| `WEBX_AI_NATIVE` | `0` | Vòng lặp AI-native cũ dùng bằng chứng http_request; không thay thế các bước scanner tự động của pipeline mới. |
+| `WEBX_MAX_ROUNDS` | `8` | Số vòng AI Planner tối đa; không giới hạn các bước scanner tự động. |
+| `WEBX_TOOL_TIMEOUT` | `90` | Timeout tool mặc định tính bằng giây; từng adapter có thể dùng timeout riêng. |
+| `WEBX_LLM_TIMEOUT` | `300` | Timeout dự phòng cũ (giây) khi timeout theo pha không đặt/bằng 0; mặc định theo pha bên dưới được ưu tiên. |
+| `WEBX_LLM_FIRST_TOKEN_TIMEOUT` | `90` | Dừng nếu Ollama chưa bắt đầu phản hồi sau số giây này; giá trị mặc định cho phép thinking model và model vừa cold-load có thời gian bắt đầu stream |
+| `WEBX_LLM_COMPLETION_TIMEOUT` | `180` | Timeout cho giai đoạn model sinh nội dung sau token đầu tiên (giây) |
+| `WEBX_LLM_OVERALL_TIMEOUT` | `210` | Timeout tổng cho một request gửi tới model (giây) |
 | `WEBX_STREAM` | `1` | `1`=stream NDJSON từ Ollama, agent hiển thị live reasoning + nội dung đang sinh + thời gian mỗi lượt; `0`=tắt (chờ response đầy đủ, không có hiển thị live) |
 | `WEBX_OLLAMA_URL` | `http://localhost:11434` | Endpoint Ollama (local / máy khác / tunnel) |
 | `WEBX_OLLAMA_AUTH` | *(trống)* | Header Authorization gửi tới Ollama: ghi đủ `Bearer xyz`/`Basic abc` hoặc chỉ token (tự thêm `Bearer `) — dùng cho tunnel/proxy có xác thực |
@@ -182,21 +247,127 @@ Chế độ `--non-interactive`/`--oneshot` chỉ đọc env (không hỏi) — 
 | `WEBX_PROMPT_STYLE` | `auto` | `auto`=heuristic theo tên model (≤9B→compact, ≥14B→full); `compact`=prompt ngắn cho model nhỏ; `full`=prompt đầy đủ |
 | `WEBX_OUTPUT_CAP` | `5000` | Giới hạn ký tự output tool đưa vào context |
 | `WEBX_NUM_PREDICT` | `0` | **v1.4.2** giới hạn cứng số token model sinh mỗi lượt. `0`=không giới hạn (mặc định). Đặt `512-2048` nếu model viết essay dài làm chậm từng round — rủi ro: final JSON có thể bị cắt cụt nếu đặt quá thấp |
+| `WEBX_INVENTORY_FILE` | *(trống)* | Đường dẫn lưu Attack Surface Inventory JSON sau mỗi vòng và khi thoát; trống không lưu file inventory riêng. |
+
+#### Pipeline, phạm vi và quyền quét
+
+| Var | Mặc định | Ý nghĩa |
+|---|---|---|
+| `WEBX_SCAN_BACKEND` | `auto` | Backend: auto, zap, wapiti, http, none hoặc legacy. auto ưu tiên ZAP, nếu thiếu thì dùng HTTP baseline. |
+| `WEBX_PLANNER_ENABLED` | `1` | Chạy AI Planner sau các bước scanner tự động. |
+| `WEBX_EVIDENCE_DIR` | `.aixsec-evidence` | Thư mục gốc lưu bằng chứng riêng tư, tiến độ phiên và lịch sử quét. |
+| `WEBX_RESUME_SESSION` | *(trống)* | Thư mục phiên đã có trong evidence root; tiếp tục phiên yêu cầu cấu hình tương thích. |
+| `WEBX_RETRY_INCOMPLETE` | `0` | 1 thử lại tác vụ chưa hoàn tất/lỗi/timeout khi resume; tác vụ hoàn tất được khôi phục. |
+| `WEBX_ALLOW_ACTIVE_SCAN` | `1` | Cho phép quét chủ động và xác minh; vẫn áp dụng các kiểm tra chính sách khác. |
+| `WEBX_ALLOW_SQLMAP` | `0` | Bật sqlmap cho candidate SQLi. Bước xác minh theo lịch chỉ phát hiện, không trích xuất dữ liệu. |
+| `WEBX_ALLOW_CONTENT_DISCOVERY` | `1` | Cho phép công cụ dò nội dung như ffuf. |
+| `WEBX_ALLOW_EXTRACTION` | `0` | Cho phép action sqlmap ngoài detect ở luồng có hỗ trợ; không bật trích xuất trong bước xác minh theo lịch. |
+| `WEBX_FFUF_RATE` | `5` | Tốc độ request mỗi giây của ffuf. |
+| `WEBX_FFUF_THREADS` | `2` | Số luồng của ffuf. |
+
+#### OWASP ZAP
+
+| Var | Mặc định | Ý nghĩa |
+|---|---|---|
+| `WEBX_ZAP_EXECUTABLE` | `zap.sh` | Tên/đường dẫn executable ZAP. Kali có thể dùng zaproxy; cơ chế tìm mặc định cũng dò bản cài theo hệ điều hành. |
+| `WEBX_ZAP_WORKERS` | `2` | Số worker ZAP active (1–8). Nhóm GET/HEAD anonymous không có credential chạy song song; request có session và method khác chạy tuần tự. |
+| `WEBX_ZAP_CONCURRENCY_FILE` | *(trống)* | Policy JSON theo origin, auth_context và đường dẫn: `parallel_read` cho request đọc đã xác định độc lập, kể cả có đăng nhập; `serial` ưu tiên giữ thứ tự. Không tạo session mới; xem hướng dẫn worker. |
+| `WEBX_ZAP_COOKIE_PARALLEL` | `auto` | `auto`: tự kiểm tra đối chứng, bắt đầu 1 worker/origin, tăng tối đa 2 khi ổn định và giảm về 1 khi có tín hiệu lỗi. `strict`: tuần tự khi có cookie; `guest`: operator cho phép cookie khách. Policy thủ công vẫn được ưu tiên. |
+| `WEBX_ZAP_ROUTE_GROUPS_FILE` | *(trống)* | File JSON nhóm route do operator khai báo để gộp slug; trống giữ cách nhóm cấu trúc mặc định. Xem hướng dẫn worker bên dưới. |
+| `WEBX_ZAP_TIMEOUT` | `600` | Timeout giây cho mỗi tiến trình ZAP, không phải tổng phiên. |
+| `WEBX_ZAP_STRENGTH` | `Medium` | Cường độ active scan: Low, Medium, High hoặc Insane; mức cao gửi nhiều payload hơn. |
+| `WEBX_ZAP_PHASE_MINUTES` | `2` | Thời lượng từng pha tính bằng phút (tối thiểu 1): spider, AJAX, chờ passive, active scan/rule. |
+| `WEBX_ZAP_MAX_URLS` | `200` | Chỉ là ước tính lập kế hoạch; không giới hạn cứng URL được phát hiện hay quét. |
+| `WEBX_ZAP_DELAY_MS` | `200` | Độ trễ giữa các request active scan, tính bằng mili giây. |
+| `WEBX_ZAP_AJAX` | `1` | Bật AJAX Spider để khám phá qua trình duyệt. |
+| `WEBX_ZAP_BROWSER` | `firefox-headless` | ID trình duyệt Selenium cho AJAX Spider; cần trình duyệt/driver tương ứng. |
+| `WEBX_ZAP_SPIDER_DEPTH` | `10` | Độ sâu crawl tối đa cho Spider/AJAX (tối thiểu 1). |
+| `WEBX_ZAP_SPIDER_CHILDREN` | `50` | Số node con tối đa mỗi node của Spider truyền thống. |
+| `WEBX_ZAP_AJAX_STATES` | `100` | Số trạng thái crawl AJAX tối đa. |
+| `WEBX_ZAP_AJAX_ELEMENTS` | `a,button,input,span,div` | Các phần tử HTML AJAX Spider được tương tác, phân tách bằng dấu phẩy. |
+| `WEBX_ZAP_AUTH_CONTEXT` | `anonymous` | Nhãn ngữ cảnh xác thực dùng khi nhóm request và lưu lịch sử; chỉ đặt nhãn không tạo đăng nhập. |
+| `WEBX_ZAP_AUTH_FILE` | *(trống)* | File JSON profile xác thực cục bộ; xem hướng dẫn ZAP về credential_env và kiểm tra đăng nhập. |
+| `WEBX_ZAP_OPENAPI_FILE` | *(trống)* | File đặc tả OpenAPI cục bộ để import khi discovery. |
+| `WEBX_ZAP_ALLOWED_RULES` | `all` | all bật các active rule có sẵn; hoặc nhập ID rule dạng số, phân tách bằng dấu phẩy. |
+| `WEBX_ZAP_AUTO_ACTIVE` | `1` | Tự xếp lịch ZAP active sau discovery; vẫn cần quyền active scan. |
+| `WEBX_ZAP_HISTORY_NAMESPACE` | `default` | Namespace lịch sử dùng chung cho lịch scanner/xác minh, có khóa riêng từng scanner. Đổi có chủ đích để quét lại. |
+
+#### Nuclei
+
+| Var | Mặc định | Ý nghĩa |
+|---|---|---|
+| `WEBX_NUCLEI_ENABLED` | `1` | Bật bước Nuclei tự động sau ZAP/HTTP baseline. |
+| `WEBX_NUCLEI_EXECUTABLE` | `nuclei` | Tên hoặc đường dẫn executable Nuclei. |
+| `WEBX_NUCLEI_TEMPLATES` | *(trống)* | Đường dẫn template cục bộ truyền cho -t; trống dùng template đã cài, qua bộ lọc adapter. |
+| `WEBX_NUCLEI_TAGS` | *(trống)* | Tag template phân tách bằng dấu phẩy; trống không lọc thêm theo tag. |
+| `WEBX_NUCLEI_SEVERITY` | `info,low,medium,high,critical` | Lọc severity của template, phân tách bằng dấu phẩy. |
+| `WEBX_NUCLEI_TIMEOUT` | `600` | Timeout tiến trình mỗi batch, tính bằng giây. |
+| `WEBX_NUCLEI_RATE` | `5` | Tốc độ request Nuclei tối đa mỗi giây. |
+
+#### Context và autonomy tùy chọn
+
+| Var | Mặc định | Ý nghĩa |
+|---|---|---|
+| `WEBX_CONTEXT_OPTIMIZATION` | `1` | Bật chọn lọc context cho model theo quy tắc. |
+| `WEBX_MAX_PROMPT_TOKENS` | `12000` | Ngân sách token prompt ước tính, gồm schema các tool được chọn. |
+| `WEBX_RESERVED_COMPLETION_TOKENS` | `2048` | Số token dành cho model sinh câu trả lời. |
+| `WEBX_CONTEXT_MAX_GRAPH_NODES` | `40` | Số node graph liên quan tối đa trong context. |
+| `WEBX_CONTEXT_MAX_OBSERVATIONS` | `12` | Số observation tối đa trong context. |
+| `WEBX_CONTEXT_MAX_HYPOTHESES` | `6` | Số giả thuyết tối đa trong context. |
+| `WEBX_CONTEXT_MAX_HISTORY` | `12` | Số mục lịch sử gần nhất tối đa trước khi tóm tắt. |
+| `WEBX_CONTEXT_MAX_EVIDENCE` | `8` | Số mục bằng chứng tối đa trong context. |
+| `WEBX_CONTEXT_MAX_TOOLS` | `14` | Số schema tool được chọn tối đa mỗi request model. |
+| `WEBX_AUTONOMY` | `0` | Bật runtime tự trị riêng, tùy chọn. |
+| `WEBX_AUTONOMY_CHECKPOINT` | *(trống)* | Đường dẫn checkpoint ghi nguyên tử của runtime tự trị. |
+| `WEBX_AUTONOMY_RESUME` | `0` | Tiếp tục từ checkpoint autonomy đã cấu hình. |
+| `WEBX_AUTONOMY_MAX_ACTIONS` | `100` | Giới hạn action cho runtime tự trị tùy chọn. |
+| `WEBX_AUTONOMY_MAX_REQUESTS` | `500` | Giới hạn request ước tính cho runtime tự trị tùy chọn. |
+| `WEBX_AUTONOMY_MAX_SECONDS` | `3600` | Giới hạn thời gian giây cho runtime tự trị tùy chọn. |
+| `WEBX_AUTONOMY_MAX_RISK` | `20` | Giới hạn rủi ro tích lũy cho runtime tự trị tùy chọn. |
+
+#### Proxy và cơ sở dữ liệu
+
+| Var | Mặc định | Ý nghĩa |
+|---|---|---|
+| `WEBX_HTTP_PROXY` | *(trống)* | Proxy HTTP cho HTTP Session Engine; trống không đặt proxy này. |
+| `WEBX_HTTPS_PROXY` | *(trống)* | Proxy HTTPS cho HTTP Session Engine; không phải cấu hình proxy chung cho mọi scanner. |
+| `WEBX_DB_ENABLED` | `0` | Bật lưu dữ liệu vào database. |
+| `WEBX_DB_HOST` | `localhost` | Host database. |
+| `WEBX_DB_USER` | *(trống)* | Tên tài khoản database. |
+| `WEBX_DB_PASS` | *(trống)* | Mật khẩu database. |
+| `WEBX_DB_NAME` | `webx` | Tên database. |
+
+Pipeline quét tuần tự không có ngân sách tổng phiên. Các biến cũ `WEBX_PIPELINE_MAX_SECONDS`, `WEBX_PIPELINE_MAX_REQUESTS` và `WEBX_PIPELINE_MAX_ACTIONS` không còn tác dụng. `WEBX_AUTONOMY_MAX_*` chỉ áp dụng cho runtime tự trị tùy chọn riêng; timeout từng tool và giới hạn tốc độ vẫn có hiệu lực.
+
+Nuclei chỉ chọn template được adapter hỗ trợ; template bị loại được ghi trong báo cáo độ bao phủ. Xem [pipeline tuần tự](docs/SEQUENTIAL_PIPELINE.md) và [xác thực/cấu hình ZAP](docs/ZAP_PIPELINE.md). Tên biến môi trường chứa credential trong profile xác thực do operator tự đặt, không phải các biến `WEBX_*` cố định bổ sung. Đặt `NO_COLOR=1` để tắt màu terminal.
 
 Để env chạy vĩnh viễn, thêm vào `~/.zshrc` (shell mặc định của Kali là zsh;
 dùng `~/.bashrc` nếu bạn ở bash):
 
 ```bash
 # ~/.zshrc
+export WEBX_SCAN_BACKEND=zap
+export WEBX_ZAP_EXECUTABLE=zaproxy
 export WEBX_MODEL="huihui_ai/qwen3.5-abliterated:9b"
 export WEBX_THINK=1
 export WEBX_TARGETS="https://example.com"
 export WEBX_SRC_DIRS="/var/www/html"
 export WEBX_STREAM=1
 export WEBX_LLM_TIMEOUT=300
+export WEBX_LLM_FIRST_TOKEN_TIMEOUT=90
+export WEBX_LLM_COMPLETION_TIMEOUT=180
+export WEBX_LLM_OVERALL_TIMEOUT=210
 
 # sau đó: source ~/.zshrc   (hoặc mở terminal mới)
 ```
+
+### Worker ZAP và nhóm route
+
+Mặc định mới là `auto`: không cần file policy cho các request đủ điều kiện kiểm tra tự động. Hệ thống gửi hai request đối chứng (giữ cookie, không theo redirect), chỉ tăng song song sau lượt thử ổn định. Không xác định được tính ổn định thì vẫn quét tuần tự. Xem giới hạn và nhật ký `auto-concurrency.json` trong hướng dẫn worker. Biến env cũ đã export vẫn được ưu tiên; dùng `unset WEBX_ZAP_COOKIE_PARALLEL` để dùng mặc định mới trong phiên mới.
+
+Đặt `WEBX_ZAP_WORKERS=2` để chạy tối đa hai nhóm request độc lập cùng lúc; đặt `1` để chạy tuần tự. Khoảng cách `WEBX_ZAP_DELAY_MS` được phối hợp giữa các worker theo origin cho request active scanner, tránh mỗi worker tự nhân tốc độ. Journal và evidence được cập nhật tuần tự, có tiến độ `[zap] x/y`.
+
+Dùng `WEBX_ZAP_ROUTE_GROUPS_FILE=/path/to/routes.json` khi đã xác định các slug dùng chung route. File mẫu và giới hạn được mô tả trong [hướng dẫn quét song song](docs/ZAP_WORKERS.md). Chỉ request đại diện được kiểm tra; không coi mọi URL trong nhóm đã được kiểm tra riêng. Mỗi tác vụ vẫn khởi động một tiến trình ZAP riêng; bản này chưa tái sử dụng JVM giữa các nhóm.
 
 ### Màn hình live (streaming)
 
@@ -290,6 +461,13 @@ root@aixsec-x:~# q                                          → thoát
 |---|---|---|---|
 | http_probe / headers_recon / dns_lookup | recon | safe | Python requests |
 | crawler | recon | safe | **v1.9.0:** Crawl BFS nội bộ Python, GET-only, dùng CHUNG Session Engine (cookie jar + proxy + auth header) — không cần wapiti binary. Khám phá: link nội bộ + external, form (action/method/field name), query param, script src, JS endpoint hint (`fetch`/`axios`/`$.ajax`/XHR — ỨNG VIÊN, cần xác minh, nguồn `crawler:js` trong inventory). Bounds: `max_depth` 0–10 (mặc định 3), `max_pages`, `request_timeout`, `time_budget` tự dừng, `trailing_slash`, `max_body_bytes`; redirect ≤5 hop trong scope, ra ngoài scope dừng + ghi `redirect_out`. Form KHÔNG bị submit; script/static/PDF ghi nhận nhưng KHÔNG enqueue. Query chuẩn hoá (sort key, bỏ anchor), canonical `/x?id={value}`, `<base href>` theo đúng urljoin, `same_scope` mặc định true. **Bug fixed (test phát hiện):** `max_depth=0` trước bị `or 3` ép thành crawl depth-3 — giờ tôn trọng 0. Tự đổ inventory qua `_DATA_INGEST["crawler"]` **v1.9.1:** JS hint kèm method ƯỚC LƯỢNG (axios verb / `xhr.open('V')` → verb; `fetch('url')` → GET chỉ khi không có options; `$.ajax`/fetch có options → UNKNOWN — UNKNOWN KHÔNG bị ép thành GET trong inventory); **EvidenceRedactor** che secret trong `evidence_dict()` (headers/cookies/params/form/json/url, `add_sensitive_field`, `pass` đã được thêm vào field mặc định) |
+| api_discovery / api_import | recon | safe | Discovery/import OpenAPI/Swagger/Postman, metadata operation, JSON shape và GraphQL hints; không thực thi operation khai báo |
+| auth_context_set/list/login/logout/remove | auth | safe/active | Session riêng theo origin, static auth, login nhiều bước và lifecycle; secret `${ENV:NAME}` |
+| auth_compare | auth | active | Chạy cùng request qua 2–8 context và ghi facts-only status/redirect/shape/hash/similarity |
+| dynamic_plan / phase3_status | reasoning | safe | Plan ưu tiên từ live state với action planned/blocked/completed và prerequisite |
+| authorization_reason | reasoning | safe | Authorization hypothesis gắn evidence và owner/policy khai báo; không tự kết luận |
+| business_rule_set / business_workflow_test / business_reason | reasoning | safe/active | Khai báo invariant, chạy workflow thật có giới hạn, reasoning từ response evidence |
+| sast_dast_correlate | reasoning | safe | Correlation route/parameter/category tạo validation lead, không tạo finding |
 | sast_scan | sast | safe | Source-code scan: pattern heuristic (PHP/Python/JS/Java) + secret scan; tùy chọn semgrep/gitleaks; scope qua WEBX_SRC_DIRS |
 | waf_detect (wafw00f) / detect_cms (whatweb) | recon | safe | fingerprint |
 | subdomain_enum (subfinder) | recon | safe | |
@@ -584,10 +762,10 @@ Model 7B/9B (vd: `huihui_ai/qwen3.5-abliterated:9b`) tuân theo **ít quy tắc*
   `min(tool_timeout, TOOL_TIMEOUTS[name])` — `WEBX_TOOL_TIMEOUT` toàn cục
   thấp (vd 90 s) co run_cmd của `wapiti_scan` xuống 90 s và scanner bị giết
   giữa chừng (live v1.5.0: "wapiti không chạy gì cả"). Giờ dùng `max(...)`:
-  hằng số riêng của tool đóng vai trò SÀN, timeout toàn cục thấp không giết
-  được quét dài; sàn wapiti_scan = 600 s, và `_wapiti_scan` truyền TRỌN
-  budget cho run_cmd (bỏ `min(budget, scan_time+60)`), wapiti tự kết thúc
-  trước khi bị giết.
+  Dispatcher hiện tính budget ngoài của Wapiti bằng
+  `max_scan_time + 90 giây` cho cleanup/ghi report, mặc định bị chặn ở 600
+  giây; có thể tăng rõ ràng bằng `WEBX_TOOL_TIMEOUT` cho target lớn. Nhờ vậy
+  scan yêu cầu 120–300 giây không còn âm thầm chiếm đủ 600 giây.
   Test suite v1.5.1: **179 OK** (4 mới: TestActiveCheckGate ×3 +
   test_wapiti_long_run_gets_cap_floor; test_plan_only_does_not_terminate
   viết lại theo cổng; TestWapitiScan.test_scan_time_budget_clamps cập nhật
@@ -958,7 +1136,7 @@ python3 agent.py --recon
   xạ lỗi) + 2 test timeout cập nhật theo engine mới. Toàn bộ suite:
   **294 test pass** (trước là 273).
 
-### v1.7.0 — Hoàn tất Phase 1 (theo review ChatGPT): structured results + inventory đa-service + bộ nhớ tấn công + evidence provenance
+### v1.7.0 — Hoàn tất Phase 1: structured results + inventory đa-service + bộ nhớ tấn công + evidence provenance
 
 - **Structured ToolResult (`tools.py`)** — mọi tool Python-native giờ trả về
   `(output_text, data_dict)`: văn bản cho model + dict cấu trúc do chính tool

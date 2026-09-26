@@ -21,6 +21,7 @@ import os
 import re
 import sys
 import time
+from urllib.parse import urljoin
 
 # ── local imports ──
 from config import load_config
@@ -28,7 +29,10 @@ from inventory import Inventory, TestHistory
 from ledger import (Ledger, parse_findings_json, render_markdown, validation_plan,
                    check_findings_evidence)
 from llm import InjectionGuard, ollama_chat
-from prompts import SYSTEM_PROMPT, build_system_prompt
+from context_optimization import (ContextBuilder, ContextLimits, ContextRequest,
+                                  PromptComposer, PromptParts, RuntimeMetrics,
+                                  TokenBudgetManager)
+from prompts import SYSTEM_PROMPT, build_orchestration_prompt, build_system_prompt
 from scope import ScopePolicy, normalize_host
 from tools import (TOOL_REGISTRY, TOOL_INDEX, TOOL_BINS, TOOL_TIMEOUTS,
                    LONG_RUN_TOOLS, available_tools, _WAPITI_FIX, capability_report)
@@ -37,7 +41,7 @@ from tools import (TOOL_REGISTRY, TOOL_INDEX, TOOL_BINS, TOOL_TIMEOUTS,
 # v1.8.0: HTTP Session Engine (http_engine.py) — http_request là adapter trên
 # engine (cookie jar theo host, auth, redirect history, timing, evidence, replay,
 # proxy WEBX_HTTP_PROXY/WEBX_HTTPS_PROXY).
-VERSION = "1.9.1"
+VERSION = "4.2.0"
 
 # v1.7.0 (#12 attack memory): phân loại vuln_class cho TestHistory theo tool
 # (sqli→sqli, scanner→scan, recon→recon, poc→poc; tool không khớp → "").
@@ -48,22 +52,43 @@ for _t in ("wapiti_scan", "nikto_scan", "nuclei_scan", "sast_scan"):
     _TOOL_VULN[_t] = "scan"
 for _t in ("http_probe", "http_request", "headers_recon", "detect_cms",
            "waf_detect", "ffuf_dir", "param_discovery", "subdomain_enum",
-           "dns_lookup", "crawler"):
+           "dns_lookup", "crawler", "api_discovery", "api_import"):
     _TOOL_VULN[_t] = "recon"
 for _t in ("generate_poc", "poc_executor"):
     _TOOL_VULN[_t] = "poc"
+for _t in ("auth_context_set", "auth_context_list", "auth_login",
+           "auth_logout", "auth_context_remove"):
+    _TOOL_VULN[_t] = "auth"
+for _t in ("auth_compare", "authorization_reason"):
+    _TOOL_VULN[_t] = "authorization"
+for _t in ("business_rule_set", "business_workflow_test", "business_reason"):
+    _TOOL_VULN[_t] = "business_logic"
+for _t in ("sast_dast_correlate",):
+    _TOOL_VULN[_t] = "correlation"
+for _t in ("dynamic_plan", "phase3_status"):
+    _TOOL_VULN[_t] = "planning"
 
 # v1.5.8 (Bug A): chuỗi lỗi LLM từ llm.py — nhận diện để KHÔNG đếm là plan-only
 # (trước đây timeout bị coi là "văn bản kế hoạch" → plan_only=2 → forced break →
 # final round cũng timeout → final_text = chuỗi lỗi → ledger rỗng dù wapiti đã
 # chạy thành công). Lần 1: thử lại (model có thể đang load). Lần 2 liên tiếp:
 # coi model down → tổng hợp findings từ tool output thật (Bug B).
-_LLM_FAIL_PREFIXES = ("[!] Ollama timeout", "[!] Cannot reach Ollama",
-                       "[!] Ollama error")
+_LLM_FAIL_PREFIXES = ("[!] Ollama timeout", "[!] Ollama first-token timeout",
+                       "[!] Ollama completion timeout", "[!] Ollama overall timeout",
+                       "[!] Cannot reach Ollama", "[!] Ollama error")
 
 
 def _llm_failure(content: str) -> bool:
     return (content or "").strip().startswith(_LLM_FAIL_PREFIXES)
+
+
+def _retryable_wapiti_error(result: dict) -> bool:
+    """True when Wapiti produced no report because its execution budget expired."""
+    if result.get("name") != "wapiti_scan" or result.get("outcome") != "error":
+        return False
+    text = str(result.get("output") or "").lower()
+    return any(marker in text for marker in
+               ("timed out", "timeout", "time limit", "không hoàn tất"))
 
 # v1.5.2: wapiti-first gate — web scope active mà wapiti_scan CHƯA chạy
 # (chưa có outcome=ok/error) thì final JSON bị từ chối và model bị ép gọi
@@ -185,13 +210,17 @@ class _LiveDisplay:
             if len(self._buf) >= self._wrap:
                 self._flush()
 
-    def done(self):
+    def done(self, response=None):
         if self._done:
             return  # idempotent — không in "finished" lần thứ 2
         self._done = True
         self._flush()
         dt = time.time() - self.t0
-        print(f"{DIM}  └ model finished in {dt:.1f}s{RESET}", flush=True)
+        failed = response is not None and _llm_failure(response.get("content", ""))
+        state = "failed" if failed else "finished"
+        print(f"{DIM}  └ model {state} in {dt:.1f}s{RESET}", flush=True)
+        if failed:
+            print(response.get("content", ""), flush=True)
 
 
 class WebXAgent:
@@ -215,7 +244,7 @@ class WebXAgent:
         # v1.4.2: phát hiện binary thiếu lúc khởi động (nuclei/arjun/... không
         # có trên máy) → model được báo TRƯỚC để không lên kế hoạch quanh tool
         # chết (trước đây tốn round vào outcome=error rồi mới bị gate cứng).
-        self.available, self.missing_tools = available_tools()
+        self.available, self.missing_tools = available_tools(self.config)
         if self.missing_tools:
             self.system_prompt += (
                 "\n\n⚠ TOOLS KHÔNG KHẢ DỤNG PHIÊN NÀY (binary thiếu trên máy): "
@@ -250,6 +279,204 @@ class WebXAgent:
         # (response THẬT) trong transcript. _no_http_json đếm lượt JSON bị chặn.
         self.ai_native = bool(self.config.get("ai_native", False))
         self._no_http_json = 0
+        from evidence import EvidenceStore
+        self.evidence_store = EvidenceStore(self.ledger)
+        self._pipeline_deadline = None
+        self.context_metrics = RuntimeMetrics()
+        self.context_metrics_history: list[dict] = []
+
+    def _context_history(self) -> list[dict]:
+        values = []
+        for turn in self.transcript:
+            for call in turn.get("calls") or []:
+                args = call.get("args") or {}
+                values.append({"tool": call.get("name", ""),
+                    "outcome": call.get("outcome", ""),
+                    "url": args.get("url") or args.get("target") or "",
+                    "parameter": args.get("param") or ""})
+        return values
+
+    def _current_endpoint(self) -> str:
+        for turn in reversed(self.transcript):
+            for call in reversed(turn.get("calls") or []):
+                args = call.get("args") or {}
+                value = args.get("url") or args.get("target")
+                if not value and isinstance(args.get("request"), dict):
+                    value = args["request"].get("url")
+                if value:
+                    return str(value)
+        return str((self.config.get("targets") or [""])[0])
+
+    def _current_context_selectors(self) -> dict:
+        values = {"auth_context": "", "workflow": "", "hypothesis_id": "",
+                  "parameter": ""}
+        for turn in reversed(self.transcript):
+            for call in reversed(turn.get("calls") or []):
+                args = call.get("args") or {}
+                values["auth_context"] = str(args.get("context") or
+                    ((args.get("contexts") or [""])[0] if isinstance(
+                        args.get("contexts"), list) else "") or values["auth_context"])
+                for key in ("workflow", "hypothesis_id"):
+                    values[key] = str(args.get(key) or values[key])
+                values["parameter"] = str(args.get("param") or values["parameter"])
+                if any(values.values()):
+                    return values
+        return values
+
+    def _recent_tool_context(self) -> str:
+        """Bounded evidence from several recent tool calls.
+
+        Phase 4.1 previously exposed only the last round. A duplicate call in
+        that round could therefore hide every successful HTTP response and the
+        Wapiti result from final synthesis. Keep the latest six calls, while
+        prioritising Wapiti and successful calls, and include bounded structured
+        data so HTTP status codes do not have to be inferred from ``outcome``.
+        """
+        calls: list[tuple[bool, dict]] = []
+        for turn in reversed(self.transcript):
+            is_auto = bool(turn.get("auto"))
+            for call in reversed(turn.get("calls") or []):
+                calls.append((is_auto, call))
+        if not calls:
+            return ""
+        selected: list[tuple[bool, dict]] = []
+        # Evidence-bearing calls first; duplicate/blocked calls remain useful
+        # only when room is left.
+        for wanted in (lambda c: c.get("name") == "wapiti_scan",
+                       lambda c: c.get("outcome") == "ok",
+                       lambda c: c.get("outcome") == "error",
+                       lambda c: True):
+            for pair in calls:
+                if pair in selected or not wanted(pair[1]):
+                    continue
+                selected.append(pair)
+                if len(selected) >= 6:
+                    break
+            if len(selected) >= 6:
+                break
+        values = []
+        for is_auto, call in selected:
+            args = call.get("args") or {}
+            row = {"name": call.get("name"), "outcome": call.get("outcome"),
+                   "auto": is_auto,
+                   "arguments": {key: args[key] for key in
+                                 ("url", "target", "param", "method", "scope")
+                                 if key in args},
+                   "output": InjectionGuard.sanitize(
+                       str(call.get("output") or ""), 1400)}
+            data = call.get("data")
+            if isinstance(data, dict):
+                # Structured result is authoritative but still target-derived;
+                # serialize it inside the same untrusted-data boundary.
+                raw = json.dumps(data, ensure_ascii=False, sort_keys=True,
+                                 default=str)[:1800]
+                row["structured_data"] = InjectionGuard.sanitize(raw, 1800)
+            values.append(row)
+        prefix = "[WAPITI TỰ CHẠY]\n" if any(flag for flag, _ in selected) else ""
+        return prefix + json.dumps(values, ensure_ascii=False, sort_keys=True)[:9000]
+
+    def _context_tool_schemas(self) -> list[dict]:
+        if not self.config.get("context_optimization", True):
+            return [item.schema() for item in self.tools]
+        names = {"dynamic_plan", "phase3_status"}
+        if not self.transcript:
+            names.update({"http_probe", "headers_recon", "crawler", "api_discovery"})
+            if self.config.get("src_dirs"):
+                names.add("sast_scan")
+        if self._web_scope_active():
+            names.add("http_request")
+            if self.ai_native:
+                names.update({"authorization_reason", "auth_compare"})
+            elif not self._wapiti_done:
+                names.add("wapiti_scan")
+        try:
+            import security_analysis as _security_analysis
+            plan = _security_analysis.manager().plan("coverage", max_actions=10)
+            names.update(item["tool"] for item in plan.get("actions") or []
+                         if item.get("state") in {"planned", "blocked"})
+        except (ValueError, TypeError):
+            pass
+        maximum = max(4, int(self.config.get("context_max_tools", 14)))
+        ordered = [item for item in self.tools if item.name in names]
+        return [item.schema() for item in ordered[:maximum]]
+
+    def _prepare_llm_messages(self, messages: list[dict], goal: str,
+                              tool_schemas: list[dict] | None = None) -> list[dict]:
+        if not self.config.get("context_optimization", True):
+            return messages
+        import auth_context as _auth_context
+        import security_analysis as _security_analysis
+        from autonomy import KnowledgeGraph
+        graph = KnowledgeGraph.from_phase_state(
+            self.inventory, self.test_history, _auth_context.manager().list())
+        state = _security_analysis.manager()
+        limits = ContextLimits(
+            max_graph_nodes=int(self.config.get("context_max_graph_nodes", 40)),
+            max_observations=int(self.config.get("context_max_observations", 12)),
+            max_hypotheses=int(self.config.get("context_max_hypotheses", 6)),
+            max_history=int(self.config.get("context_max_history", 12)),
+            max_evidence=int(self.config.get("context_max_evidence", 8)))
+        self.context_metrics = RuntimeMetrics()
+        selectors = self._current_context_selectors()
+        context = ContextBuilder(graph, state.planner_memory, limits).build(
+            ContextRequest(goal=goal, endpoint=self._current_endpoint(), **selectors),
+            self._context_history(), self.context_metrics)
+        from context_optimization import estimate_tokens
+        reserved = int(self.config.get("reserved_completion_tokens", 2048))
+        tool_tokens = estimate_tokens(tool_schemas or [])
+        configured_max = int(self.config.get("max_prompt_tokens", 12000))
+        message_max = max(reserved + 256, configured_max - tool_tokens)
+        manager = TokenBudgetManager(message_max, reserved)
+        last_instruction = ""
+        for message in reversed(messages):
+            if message.get("role") == "user":
+                last_instruction = str(message.get("content") or "")
+                break
+        # The original task is protected; transient gate instructions are kept
+        # only when they differ from it and are bounded independently.
+        reasoning = goal
+        if last_instruction and last_instruction != goal:
+            reasoning += "\n\nCurrent instruction:\n" + last_instruction[:1800]
+        policy = ("Authorized scope: " + self.policy.describe() +
+                  ". Existing dispatcher scope checks and operator risk approval are mandatory.")
+        if self._web_scope_active():
+            if self.ai_native and not self._http_evidence_ok():
+                policy += (" Before final JSON, call http_request and obtain at least one "
+                           "successful real HTTP response.")
+            elif not self.ai_native and not self._wapiti_done:
+                policy += (" Before final JSON, call wapiti_scan for the authorized web "
+                           "target; an explicit tool error also satisfies the attempt gate.")
+        prepared = PromptComposer(manager).compose(PromptParts(
+            system=build_orchestration_prompt(self.config),
+            policy=policy,
+            planner=context, tool=self._recent_tool_context(), reasoning=reasoning),
+            self.context_metrics)
+        self.context_metrics.prompt_chars += len(json.dumps(
+            tool_schemas or [], ensure_ascii=False, separators=(",", ":")))
+        self.context_metrics.estimated_tokens += tool_tokens
+        self.context_metrics_history.append(self.context_metrics.to_dict())
+        self.context_metrics_history = self.context_metrics_history[-100:]
+        return prepared
+
+    def context_runtime_metrics(self) -> dict:
+        return self.context_metrics.to_dict()
+
+    def _chat_contextual(self, messages: list[dict], goal: str, **kwargs) -> dict:
+        schemas = [] if kwargs.get("json_mode") else self._context_tool_schemas()
+        kwargs["tools"] = schemas
+        prepared = self._prepare_llm_messages(messages, goal, schemas)
+        started = time.perf_counter()
+        response = self.chat(prepared, config=self.config, **kwargs)
+        elapsed = (time.perf_counter() - started) * 1000
+        llm_metrics = response.get("metrics") or {}
+        self.context_metrics.llm_latency_ms = round(elapsed, 3)
+        self.context_metrics.first_token_latency_ms = float(
+            llm_metrics.get("first_token_latency_ms") or 0)
+        self.context_metrics.completion_latency_ms = float(
+            llm_metrics.get("completion_latency_ms") or elapsed)
+        if self.context_metrics_history:
+            self.context_metrics_history[-1] = self.context_metrics.to_dict()
+        return response
 
     # ─────────────────────────────────────────
     # TOOL DISPATCH (+ scope check + risk approval)
@@ -259,7 +486,10 @@ class WebXAgent:
         if mode == "ask":
             if spec.risk == "safe":
                 return True
-            ans = input(f"\n[APPROVAL] '{spec.name}' risk [{spec.risk}] — run? [y/N] ").strip().lower()
+            try:
+                ans = input(f"\n[APPROVAL] '{spec.name}' risk [{spec.risk}] — run? [y/N] ").strip().lower()
+            except EOFError:
+                return False
             return ans == "y"
         if mode == "safe":
             return spec.risk == "safe"
@@ -270,6 +500,12 @@ class WebXAgent:
         if not spec:
             return {"name": name, "outcome": "error",
                     "output": f"[!] Tool '{name}' not found in registry."}
+        modern = self.config.get("scan_backend", "auto") != "legacy"
+        if modern:
+            from execution_policy import check_action
+            reason = check_action(self.config, name, arguments, self.evidence_store)
+            if reason:
+                return {"name": name, "outcome": "blocked", "output": "[POLICY] " + reason}
         # scope check
         for p in spec.scope_params:
             if p in arguments:
@@ -282,6 +518,42 @@ class WebXAgent:
                     "output": "[!] Operator denied this tool."}
         try:
             kw = dict(arguments)
+            if modern and name in ('sql_error_verify', 'sqlmap_runner'):
+                kw['_config'] = dict(self.config)
+                kw['_verification_entry'] = getattr(self, '_verification_entry', None)
+                kw['_verification_record'] = getattr(self, '_verification_record', None)
+                kw['_config']['_verification_auth_context'] = (kw['_verification_record'] or {}).get('auth_context','anonymous')
+            if modern and name == "nuclei_scan":
+                kw["_config"] = dict(self.config)
+                kw["_templates"] = getattr(self, "_nuclei_templates", [])
+                kw["_entry"] = getattr(self, "_nuclei_entry", None)
+            if name.startswith("zap_"):
+                kw["_config"] = dict(self.config)
+                if kw["_config"].get("zap_allowed_rules") == "all":
+                    kw["_config"]["zap_allowed_rules"] = [r['id'] for r in getattr(getattr(self, 'evidence_store', None), 'active_rules', [])]
+                if name == "zap_active_scan" and getattr(self, "_zap_active_entry", None):
+                    kw["_config"]["_zap_seed_entry"] = self._zap_active_entry
+                if name == "zap_active_scan" and getattr(self, "evidence_store", None):
+                    from adapters.zap import within
+                    from pathlib import Path
+                    for coverage in reversed(self.evidence_store.coverage):
+                        har = coverage.get("har_path", "")
+                        if (har and within(coverage.get("target", ""), arguments.get("url", ""))
+                                and coverage.get("auth_context") == arguments.get("auth_context", "anonymous")
+                                and Path(har).is_file()):
+                            kw["_config"]["_zap_seed_har"] = har
+                            break
+            if name in {"evidence_validate", "evidence_status", "evidence_replay"}:
+                kw["_evidence_store"] = self.evidence_store
+                kw["_scope_policy"] = self.policy
+            if modern:
+                if name == "wapiti_scan":
+                    kw["exploit"] = False
+                if name == "ffuf_dir":
+                    kw["_rate"] = max(1, int(self.config.get("ffuf_rate", 5)))
+                    kw["_threads"] = max(1, int(self.config.get("ffuf_threads", 2)))
+                if name == "http_request":
+                    kw["follow_redirects"] = False
             # v1.4.3: trần timeout theo từng tool — chặn tool chạy vô hạn
             # không tôn trọng _timeout tốt (vd arjun 427s ở live-run), ngay cả
             # khi operator cấu hình tool_timeout cao.
@@ -289,10 +561,27 @@ class WebXAgent:
             # max(tool_timeout, cap) — cap từng tool là MỨC TỐI THIỂU để wapiti
             # không bị giết ở tool_timeout mặc định 90s giữa chừng scan.
             cap = TOOL_TIMEOUTS.get(name, self.config["tool_timeout"])
-            if name in LONG_RUN_TOOLS:
+            if name.startswith("zap_"):
+                kw["_timeout"] = int(self.config.get("zap_timeout", 300))
+            elif modern and name == "nuclei_scan":
+                kw["_timeout"] = max(1, int(self.config.get("nuclei_timeout", 600)))
+            elif name == "wapiti_scan":
+                # max_scan_time bounds Wapiti's scan phase. Allow a small
+                # cleanup/report window instead of always granting the old
+                # fixed 600-second floor. Operators can explicitly raise
+                # WEBX_TOOL_TIMEOUT for unusually large targets.
+                requested = max(30, int(arguments.get("max_scan_time") or 300))
+                bounded = min(cap, requested + 90)
+                kw["_timeout"] = max(self.config["tool_timeout"], bounded)
+            elif name in LONG_RUN_TOOLS:
                 kw["_timeout"] = max(self.config["tool_timeout"], cap)
             else:
                 kw["_timeout"] = min(self.config["tool_timeout"], cap)
+            if modern and self._pipeline_deadline is not None:
+                remaining = int(self._pipeline_deadline - time.monotonic())
+                if remaining < 1:
+                    return {"name": name, "outcome": "blocked", "output": "Session time budget exhausted"}
+                kw["_timeout"] = min(kw["_timeout"], remaining)
             # v1.4.4: chỉ đo thời gian THỰC THI tool — chờ operator duyệt
             # (_risk_ok/input()) nằm ngoài try này nên không bị tính vào duration.
             t0 = time.time()
@@ -308,6 +597,10 @@ class WebXAgent:
             # v1.4.4: output mở đầu '[!]' = lỗi thực thi (timeout, thiếu binary,
             # connect fail, args sai) → outcome=error để gate/fail-count đúng.
             oc = "error" if isinstance(out, str) and out.startswith("[!]") else "ok"
+            if (name.startswith("zap_") or name in ("nuclei_scan", "sql_error_verify", "sqlmap_runner")) and isinstance(data, dict):
+                scan_status = (data.get("coverage") or {}).get("status")
+                if scan_status in {"partial", "timeout", "error"}:
+                    oc = scan_status
             r = {"name": name, "outcome": oc, "output": out, "exec_time": dt}
             if data is not None:
                 r["data"] = data
@@ -331,6 +624,8 @@ class WebXAgent:
             if v:
                 url = str(v)
                 break
+        if not url and isinstance(args.get("request"), dict):
+            url = str(args["request"].get("url") or "")
         if not url:
             return
         self.test_history.add(
@@ -341,15 +636,79 @@ class WebXAgent:
             outcome=r.get("outcome") or "ok",
         )
 
+    def run_autonomous(self, goal: str = "coverage", max_cycles: int | None = None,
+                       checkpoint_path: str | None = None) -> dict:
+        """Run the Phase 4 loop through the normal policy-aware dispatcher.
+
+        This is an additive API: ``run`` and all Phase 1-3 tool APIs retain
+        their existing behavior. The operator controls risk through auto_exec.
+        """
+        import auth_context as _auth_context
+        import security_analysis as _security_analysis
+        from autonomy import (AutonomousRuntime, ExecutionBudget, Goal,
+                              KnowledgeGraph, PlannerMemory, WorkflowModel)
+
+        _security_analysis.manager().bind(
+            self.inventory, self.test_history, self.ledger, self.available)
+        checkpoint = checkpoint_path or self.config.get("autonomy_checkpoint", "")
+
+        def execute(action: dict) -> dict:
+            name, arguments = action["tool"], action.get("arguments") or {}
+            result = self._dispatch(name, arguments)
+            self._record_test(name, arguments, result)
+            event = {**result, "args": arguments}
+            if self.config.get("scan_backend", "auto") != "legacy":
+                from pipeline import record_result
+                return record_result(self, name, arguments, event)
+            self.inventory.ingest([event])
+            _security_analysis.manager().ingest_tool_result(event)
+            return result
+
+        if checkpoint and self.config.get("autonomy_resume") and os.path.exists(checkpoint):
+            runtime = AutonomousRuntime.resume(checkpoint, execute)
+        else:
+            budget = ExecutionBudget(
+                max_actions=int(self.config.get("autonomy_max_actions", 100)),
+                max_requests=int(self.config.get("autonomy_max_requests", 500)),
+                max_seconds=float(self.config.get("autonomy_max_seconds", 3600)),
+                max_risk=float(self.config.get("autonomy_max_risk", 20)),
+            )
+            graph = KnowledgeGraph.from_phase_state(
+                self.inventory, self.test_history, _auth_context.manager().list())
+            for target in self.config.get("targets") or []:
+                if str(target).startswith(("http://", "https://")) and not graph.query(
+                        "endpoint", url=str(target)):
+                    graph.add_node("endpoint", {"url": str(target), "methods": ["GET"],
+                                                "auth_hints": [],
+                                                "sources": ["configured_target"]})
+            workflow = WorkflowModel()
+            workflow.infer_from_runs(self.inventory.analysis.get("workflow_runs") or [])
+            runtime = AutonomousRuntime(graph, PlannerMemory(), workflow, budget,
+                                        capabilities=set(self.available), executor=execute)
+        result = runtime.run(Goal(goal), max_cycles=max_cycles,
+                             checkpoint_path=checkpoint or None)
+        self.inventory.analysis["autonomy_status"] = result
+        self.inventory.analysis["knowledge_graph"] = runtime.graph.to_dict()
+        return result
+
     # ─────────────────────────────────────────
     # MAIN LOOP
     # ─────────────────────────────────────────
     def run(self, user_text: str) -> dict:
+        if self.config.get("scan_backend", "auto") != "legacy":
+            from pipeline import run
+            return run(self, user_text)
         # v1.8.0: mỗi run() bắt đầu với Session Engine SẠCH (cookie jar + request
         # records của lượt trước KHÔNG rò sang lượt này) + áp proxy từ config
         # (WEBX_HTTP_PROXY/WEBX_HTTPS_PROXY) — http_request dùng CHUNG engine này.
         import http_engine as _he
         _he.reset_sessions()
+        import auth_context as _auth_context
+        _auth_context.reset_contexts()
+        import security_analysis as _security_analysis
+        _security_analysis.reset()
+        _security_analysis.manager().bind(
+            self.inventory, self.test_history, self.ledger, self.available)
         _px = {k: v for k, v in (("http", self.config.get("http_proxy")),
                                  ("https", self.config.get("https_proxy"))) if v}
         _he.set_proxies(_px or None)
@@ -373,11 +732,15 @@ class WebXAgent:
         self._no_http_json = 0     # v1.5.6: reset bộ đếm JSON-thiếu-http_request (AI-native)
         for rnd in range(1, max_rounds + 1):
             disp = _LiveDisplay(rnd, max_rounds)
-            resp = self.chat(msgs, tools=[t.schema() for t in self.tools],
-                             on_token=disp.on_token, on_reasoning=disp.on_reasoning)
+            resp = self._chat_contextual(
+                msgs, user_text, tools=[t.schema() for t in self.tools],
+                on_token=disp.on_token, on_reasoning=disp.on_reasoning)
+            # Chốt đồng hồ model ngay khi Ollama trả về. Thời gian thực thi
+            # tool được in riêng bởi dispatcher và không được cộng vào nhãn
+            # "model finished".
+            disp.done(resp)
             calls = resp.get("tool_calls") or []
             if not calls:
-                disp.done()
                 result["final_text"] = resp.get("content", "")
                 # v1.5.8 (Bug A): chuỗi lỗi LLM (timeout/không kết nối) KHÔNG
                 # phải văn bản kế hoạch — trước đây bị đếm plan_only → forced
@@ -398,13 +761,7 @@ class WebXAgent:
                     continue
                 self._llm_fail = 0  # phản hồi thật → reset bộ đếm lỗi LLM
                 if self._looks_like_json(result["final_text"]):
-                    self._commit_findings(result)
-                    try:
-                        d = json.loads(self._strip_fence(result["final_text"]))
-                        result["risk_level"] = d.get("risk_level", "UNKNOWN")
-                        result["overall_summary"] = d.get("overall_summary", "")
-                    except json.JSONDecodeError:
-                        pass
+                    self._apply_final_contract(result)
                     # v1.5.2: wapiti-first gate (Bug 3 — user: "wapiti vẫn chưa
                     # được chạy") — web scope active nhưng wapiti_scan CHƯA
                     # chạy (ok/error) → JSON bị từ chối dù các active check khác
@@ -520,17 +877,20 @@ class WebXAgent:
                 # (kể cả error/blocked; duplicate đã ghi ở lần dispatch đầu).
                 if r.get("outcome") != "duplicate":
                     self._record_test(name, args, r)
-            disp.done()
             self.transcript.append({"round": rnd, "type": "tools", "calls": results})
             # v1.6.0 (#1/#12/#13): gom tool output OK của round vào attack surface
             self.inventory.ingest(results)
+            for _analysis_result in results:
+                _security_analysis.manager().ingest_tool_result(_analysis_result)
             result["calls"] += len(results)
             # v1.5.2: wapiti-first gate — chỉ wapiti_scan tính là "đã chạy" khi
             # outcome ok (thành công) HOẶC error (đã cố, fail rõ ràng). Các
             # outcome khác (duplicate/blocked/denied/scope_rejected) KHÔNG tính.
             for r in results:
                 if (r.get("name") == "wapiti_scan"
-                        and r.get("outcome") in ("ok", "error")):
+                        and (r.get("outcome") == "ok"
+                             or (r.get("outcome") == "error"
+                                 and not _retryable_wapiti_error(r)))):
                     self._wapiti_done = True
 
             if all(r.get("outcome") in ("duplicate", "blocked") for r in results):
@@ -562,11 +922,23 @@ class WebXAgent:
             # lại tool-call trên cùng endpoint/param/lớp lỗ hổng.
             th_note = ("\n" + self.test_history.render()) \
                 if self.test_history.record_count() else ""
+            try:
+                live_plan = _security_analysis.manager().plan("coverage", max_actions=8)
+                plan_rows = [
+                    f"- {a['state']} P{a['priority']} {a['tool']} "
+                    f"reason={a['reason']}"
+                    + (f" blocked_by={','.join(a['blocked_by'])}" if a["blocked_by"] else "")
+                    for a in live_plan["actions"]]
+                plan_note = ("\n[DYNAMIC PLAN — live state, ưu tiên action planned; "
+                             "giải quyết blocked_by trước]:\n" + "\n".join(plan_rows)) \
+                    if plan_rows else ""
+            except (ValueError, TypeError):
+                plan_note = ""
             msgs.append({"role": "user", "content":
                         "[TOOL RESULTS BEGIN]\n" +
                         json.dumps(tool_msgs, ensure_ascii=False)[:12000] +
                         "\n[TOOL RESULTS END]\nTiếp tục. Khi đủ dữ liệu trả JSON cuối cùng."
-                        + surf_note + th_note})
+                        + surf_note + th_note + plan_note})
 
         # v1.5.2 (tail-order 1): AUTO-WAPITI — hết vòng lặp mà web scope active
         # và wapiti_scan chưa từng chạy (model bỏ qua dù prompt/gate bắt buộc)
@@ -621,22 +993,23 @@ class WebXAgent:
                             "nữa — trả final JSON trung thực với dữ liệu đã thu; "
                             "nếu chưa đủ bằng chứng, risk_level=UNKNOWN là kết quả "
                             "trung thực (đừng bịa dữ liệu scan)."})
-        # v1.5.8 (Bug B): model đã down (2 lỗi liên tiếp) → BỎ final chat
-        # (tiết kiệm 300s chắc chắn timeout) và tổng hợp findings từ tool
-        # output THẬT trong history (wapiti đã chạy ok). Nếu final chat vẫn
-        # lỗi → fallback tổng hợp tương tự.
-        if llm_down:
+        # Nếu hai lượt đầu timeout nhưng auto-wapiti vừa bổ sung bằng chứng mới,
+        # cho model đúng một cơ hội tổng hợp cuối. Đây là một tác vụ khác với
+        # hai lượt plan trước và thường thành công sau khi model đã load xong.
+        # Không có dữ liệu mới thì giữ fail-fast và tổng hợp tại chỗ.
+        if llm_down and not dispatched:
             result["llm_down"] = True
-            result["llm_note"] = ("[!] Model không phản hồi (Ollama timeout) — "
+            result["llm_note"] = ("[!] Model không phản hồi (lỗi Ollama) — "
                                   "kết quả được tổng hợp từ tool output thật "
                                   "của phiên (không có phân tích của model).")
             self._synthesize_findings_json(result)
             self._commit_findings(result)
             return result
         disp = _LiveDisplay(0 if forced else max_rounds, max_rounds)
-        resp = self.chat(msgs, tools=[t.schema() for t in self.tools], json_mode=True,
-                         on_token=disp.on_token, on_reasoning=disp.on_reasoning)
-        disp.done()
+        resp = self._chat_contextual(
+            msgs, user_text, tools=[t.schema() for t in self.tools], json_mode=True,
+            on_token=disp.on_token, on_reasoning=disp.on_reasoning)
+        disp.done(resp)
         result["final_text"] = resp.get("content", "")
         if _llm_failure(result["final_text"]):
             result["llm_down"] = True
@@ -646,13 +1019,8 @@ class WebXAgent:
             self._synthesize_findings_json(result)
             self._commit_findings(result)
             return result
-        self._commit_findings(result)
-        try:
-            d = json.loads(result["final_text"]) if result["final_text"].strip().startswith("{") else {}
-            result["risk_level"] = d.get("risk_level", "UNKNOWN")
-            result["overall_summary"] = d.get("overall_summary", "")
-        except json.JSONDecodeError:
-            pass
+        self._llm_fail = 0
+        self._apply_final_contract(result)
         return result
 
     @staticmethod
@@ -667,8 +1035,10 @@ class WebXAgent:
         return t.strip().startswith("{") or "findings" in t[:200]
 
     def _synthesize_findings_json(self, result: dict) -> None:
-        """v1.5.8 (Bug B): model down → tổng hợp findings từ tool output THẬT
-        trong history (wapiti_scan đã chạy ok). Chỉ parse dòng detail wapiti:
+        """Model down → tổng hợp findings từ dữ liệu Wapiti thật trong history.
+
+        Ưu tiên ``ToolResult.data.findings`` vì đây là contract có cấu trúc,
+        sau đó mới parse output chữ để tương thích các adapter/release cũ:
         `[SEVERITY] CATEGORY (param=X) — METHOD /path [module=...]` + dòng
         `    → ` theo sau (bỏ wstg:/curl:). Dừng ở marker `[✓] TỔNG HỢP LỖ
         HỔNG` — phần summary có dòng no-param match regex → duplicate. Không
@@ -681,7 +1051,49 @@ class WebXAgent:
         seen: set = set()
         findings: list[dict] = []
         target = ""
-        for msg in self._history():
+        severity = {"0": "info", "1": "low", "2": "medium", "3": "high",
+                    "4": "critical", "info": "info", "low": "low",
+                    "medium": "medium", "high": "high", "critical": "critical"}
+        history = self._history()
+
+        # New structured result path. It remains usable even when display text
+        # is truncated, localized, or reformatted.
+        for msg in history:
+            if msg.get("name") != "wapiti_scan" or msg.get("outcome") != "ok":
+                continue
+            data = msg.get("data")
+            if not isinstance(data, dict) or not isinstance(data.get("findings"), list):
+                continue
+            base = str(data.get("target") or "")
+            target = target or base
+            for item in data["findings"]:
+                if not isinstance(item, dict):
+                    continue
+                cat = str(item.get("category") or "").strip()
+                if not cat:
+                    continue
+                method = str(item.get("method") or "GET").upper()
+                path = str(item.get("path") or "")
+                param = str(item.get("parameter") or "")
+                module = str(item.get("module") or "")
+                key = (cat, method, path, param)
+                if key in seen:
+                    continue
+                seen.add(key)
+                raw_level = str(item.get("level") or "info").lower()
+                findings.append({
+                    "name": cat,
+                    "severity": severity.get(raw_level, "info"),
+                    "url": urljoin(base.rstrip("/") + "/", path.lstrip("/"))
+                           if base else path,
+                    "port": "", "service": "",
+                    "description": (f"{cat} phát hiện bởi wapiti "
+                                    f"(module={module or '?'})"),
+                    "fix": _WAPITI_FIX.get(cat, _WAPITI_FIX.get("_default", "")),
+                    "cves": [], "source": "wapiti_scan (auto — model down)",
+                    "source_tool": "wapiti_scan", "parameter": param,
+                })
+        for msg in history:
             text = msg.get("output") or ""
             if not text:
                 continue
@@ -730,11 +1142,11 @@ class WebXAgent:
         if findings:
             result["overall_summary"] = (
                 f"Tổng hợp tự động từ tool output thật (wapiti_scan) — model "
-                f"không phản hồi (Ollama timeout) nên không có phân tích của "
+                f"không phản hồi (lỗi Ollama) nên không có phân tích của "
                 f"model. {len(findings)} finding từ wapiti.")
         else:
             result["overall_summary"] = (
-                "Model không phản hồi (Ollama timeout) và không có finding nào "
+                "Model không phản hồi (lỗi Ollama) và không có finding nào "
                 "tổng hợp được từ tool output — risk UNKNOWN là kết quả trung thực.")
         result["findings"] = findings
         result["final_text"] = json.dumps({
@@ -875,15 +1287,23 @@ class WebXAgent:
         key = "wapiti_scan|" + json.dumps(args, sort_keys=True,
                                           default=str, ensure_ascii=False)
         self._call_cache[key] = r
-        if r.get("outcome") in ("ok", "error"):
+        if (r.get("outcome") == "ok"
+                or (r.get("outcome") == "error" and not _retryable_wapiti_error(r))):
             self._wapiti_done = True
         tag = f"{GREEN}[✔]{RESET}" if r.get("outcome") == "ok" \
             else f"{RED}[✗]{RESET}"
         print(f"{tag} wapiti_scan → outcome={r.get('outcome', '?')} ({dt:.1f}s)",
               flush=True)
+        scan_data = r.get("data") or {}
+        if isinstance(scan_data, dict) and isinstance(scan_data.get("findings"), list):
+            print(f"[i] Wapiti: {len(scan_data['findings'])} findings; "
+                  f"crawled={scan_data.get('crawled', '?')}; "
+                  f"report={scan_data.get('report_path', '?')}", flush=True)
         self.transcript.append({"round": 0, "type": "tools", "calls": [r],
                                 "auto": True})
         self.inventory.ingest([r])   # v1.6.0: wapiti auto cũng vào attack surface
+        import security_analysis as _security_analysis
+        _security_analysis.manager().ingest_tool_result(r)
         self._record_test("wapiti_scan", args, r)
         out = InjectionGuard.sanitize(r.get("output", ""),
                                       self.config["output_cap"])
@@ -917,6 +1337,106 @@ class WebXAgent:
         for f in findings:
             self.ledger.add(f)
 
+    def _apply_final_contract(self, result: dict) -> None:
+        """Validate final JSON before accepting its risk or ledger entries.
+
+        Require structured Wapiti support for scanner-attributed findings.
+        Scan summaries are observations, never vulnerability findings. Other
+        adapters retain their existing evidence validation.
+        """
+        raw = self._strip_fence(str(result.get("final_text") or ""))
+        try:
+            data = json.loads(raw)
+        except (json.JSONDecodeError, TypeError):
+            return
+        if not isinstance(data, dict):
+            return
+        items = data.get("findings")
+        if not isinstance(items, list):
+            items = []
+        valid_items = [item for item in items
+                       if isinstance(item, dict) and str(item.get("name") or "").strip()]
+        invalid_count = len(items) - len(valid_items)
+        # Scanner observations are not vulnerabilities. For structured Wapiti
+        # evidence require a matching category, URL and parameter, and use the
+        # scanner's severity rather than allowing the model to inflate it.
+        rejected = []
+        accepted = []
+        wapiti_runs = [r for r in self._history()
+                       if r.get("name") == "wapiti_scan" and r.get("outcome") == "ok"
+                       and isinstance(r.get("data"), dict)
+                       and isinstance(r["data"].get("findings"), list)]
+        only_wapiti = bool(wapiti_runs) and not any(
+            r.get("outcome") == "ok" and r.get("name") != "wapiti_scan"
+            for r in self._history())
+        levels = {"0": "info", "1": "low", "2": "medium", "3": "high",
+                  "4": "critical"}
+        for item in valid_items:
+            name = str(item.get("name") or "").lower()
+            source = " ".join(str(item.get(k) or "") for k in
+                              ("source", "source_tool", "description")).lower()
+            scan_observation = bool(re.search(
+                r"^(?:wapiti[ \-_]*)?(?:domain |web |website )?scan(?: summary| report| results?| completed)?$",
+                name.strip()))
+            matches = []
+            if only_wapiti or "wapiti" in source or "wapiti" in name:
+                for run in wapiti_runs:
+                    base = str(run["data"].get("target") or run.get("args", {}).get("url") or "")
+                    for finding in run["data"]["findings"]:
+                        if not isinstance(finding, dict):
+                            continue
+                        category = str(finding.get("category") or "").strip().lower()
+                        url = urljoin(base.rstrip("/") + "/", str(finding.get("path") or ""))
+                        if (category and category in name
+                                and str(item.get("url") or "").rstrip("/") == url.rstrip("/")
+                                and str(item.get("parameter") or "") == str(finding.get("parameter") or "")):
+                            matches.append(finding)
+                if wapiti_runs and not matches:
+                    rejected.append(item)
+                    continue
+            if scan_observation:
+                rejected.append(item)
+                continue
+            if matches:
+                item = dict(item)
+                rank = {"info": 0, "low": 1, "medium": 2, "high": 3, "critical": 4}
+                item["severity"] = max(
+                    (levels.get(str(f.get("level")), str(f.get("level") or "info").lower())
+                     for f in matches), key=lambda v: rank.get(v, 0))
+            accepted.append(item)
+        valid_items = accepted
+        risk = str(data.get("risk_level") or "UNKNOWN").upper()
+        if risk not in {"CRITICAL", "HIGH", "MEDIUM", "LOW", "UNKNOWN"}:
+            risk = "UNKNOWN"
+        summary = str(data.get("overall_summary") or "")
+        if not valid_items:
+            risk = "UNKNOWN"
+            if invalid_count:
+                note = (f"Đã loại {invalid_count} finding không đúng schema "
+                        "(thiếu trường name); không còn finding hợp lệ nên risk UNKNOWN.")
+                summary = (summary.rstrip() + " " + note).strip()
+        if rejected or wapiti_runs:
+            ranks = {"low": 1, "medium": 2, "high": 3, "critical": 4}
+            severities = [str(f.get("severity") or "").lower() for f in valid_items]
+            risk = max((v for v in severities if v in ranks),
+                       key=ranks.get, default="UNKNOWN").upper()
+        if rejected:
+            summary = (f"Đã loại {len(rejected)} mục mô tả scan hoặc không khớp bằng chứng Wapiti. "
+                       f"Còn {len(valid_items)} finding; đánh giá chưa đầy đủ.")
+            result["unsupported_findings"] = len(rejected)
+        data["findings"] = valid_items
+        data["risk_level"] = risk
+        data["overall_summary"] = summary
+        # Always emit the validated object so terminal output, ledger and API
+        # consumers observe the same result.
+        result["final_text"] = json.dumps(data, ensure_ascii=False, indent=2)
+        result["risk_level"] = risk
+        result["overall_summary"] = summary
+        result["findings"] = valid_items
+        if invalid_count:
+            result["invalid_findings"] = invalid_count
+        self._commit_findings(result)
+
     # ─────────────────────────────────────────
     # SESSION MGMT
     # ─────────────────────────────────────────
@@ -947,6 +1467,22 @@ class WebXAgent:
         th = self.test_history.render(limit=60)
         if th:
             md += f"\n## Test History (đã thử — attack memory)\n```\n{th}\n```\n"
+        if self.inventory.analysis:
+            summary = {
+                "latest_plan": self.inventory.analysis.get("latest_plan", {}),
+                "authorization_hypotheses": self.inventory.analysis.get(
+                    "authorization_hypotheses", []),
+                "business_hypotheses": self.inventory.analysis.get(
+                    "business_hypotheses", []),
+                "sast_dast_correlations": self.inventory.analysis.get(
+                    "sast_dast_correlations", [])[:20],
+            }
+            md += ("\n## Phase 3 Analysis (hypotheses, chưa phải verdict)\n```json\n" +
+                   json.dumps(summary, ensure_ascii=False, indent=2)[:20000] +
+                   "\n```\n")
+        if self.config.get("scan_backend", "auto") != "legacy":
+            coverage = self.evidence_store.summary()["coverage"]
+            md += "\n## Scan coverage (not a safety verdict)\n```json\n" + json.dumps(coverage, ensure_ascii=False, indent=2) + "\n```\n"
         path = f"aixsec-x_report_{int(time.time())}.md"
         with open(path, "w") as f:
             f.write(md)
@@ -973,6 +1509,13 @@ class WebXAgent:
             self.capabilities = capability_report(force=False)
         elif force:
             self.capabilities = capability_report(force=True)
+        if self.config.get("scan_backend", "auto") != "legacy":
+            from adapters.zap import executable
+            ready = executable(self.config) is not None
+            return self.capabilities + [
+                {"tool": name, "binary": self.config.get("zap_executable", "zap.sh"),
+                 "available": ready, "version": "version recorded in scan artifact" if ready else ""}
+                for name in ("zap_baseline", "zap_active_scan")]
         return self.capabilities
 
 
@@ -1178,10 +1721,18 @@ def main():
     if non_interactive or one_shot:
         prompt_text = one_shot if isinstance(one_shot, str) else \
             "Hãy phân tích và khai thác target trong scope. Bắt đầu bằng recon rồi active check. Khi đủ dữ liệu trả JSON findings."
+        if cfg.get("autonomy_enabled"):
+            result = agent.run_autonomous("coverage")
+            print("\n" + json.dumps(result, ensure_ascii=False, indent=2)[:3000])
+            agent.save_inventory()
+            return
         result = agent.run(prompt_text)
+        if result.get("busy"):
+            print("\n" + result['final_text'])
+            return
         if result.get("llm_down"):
             print("\n" + result.get("llm_note", ""))
-        print("\n" + result.get("final_text", "")[:3000])
+        print("\n" + result.get("final_text", ""))
         _print_findings(agent)
         print(f"\n[*] Report: {agent.export_report()}")
         inv_path = agent.save_inventory()   # v1.6.0: WEBX_INVENTORY_FILE
@@ -1191,7 +1742,9 @@ def main():
 
     # ── interactive ──
     print(f"{DIM}[>]{RESET} {DIM}Type{RESET} {GREEN}'q'{RESET} {DIM}quit |{RESET} {GREEN}'!! <cmd>'{RESET} {DIM}shell |{RESET} "
-          f"{GREEN}'/findings'{RESET} {DIM}ledger |{RESET} {GREEN}'/report'{RESET} {DIM}export.{RESET}", flush=True)
+          f"{GREEN}'/findings'{RESET} {DIM}ledger |{RESET} {GREEN}'/report'{RESET} {DIM}export |{RESET} "
+          f"{GREEN}'/autonomy [goal]'{RESET} {DIM}|{RESET} "
+          f"{GREEN}'/context-metrics'{RESET}{DIM}.{RESET}", flush=True)
     while True:
         try:
             line = input(f"\n{BOLD}{GREEN}root@aixsec-x{RESET}{DIM}:~#{RESET} ").strip()
@@ -1217,10 +1770,21 @@ def main():
                 ver = r["version"] or "(chưa cài)"
                 print(f"[{mark}] {r['tool']:<22} {r['binary']:<12} {ver}")
             continue
+        if line == "/context-metrics":
+            print(json.dumps(agent.context_runtime_metrics(), ensure_ascii=False, indent=2))
+            continue
+        if line == "/autonomy" or line.startswith("/autonomy "):
+            goal = line.partition(" ")[2].strip() or "coverage"
+            print(json.dumps(agent.run_autonomous(goal), ensure_ascii=False, indent=2))
+            agent.save_inventory()
+            continue
         result = agent.run(line)
+        if result.get("busy"):
+            print("\n" + result['final_text'])
+            continue
         if result.get("llm_down"):
             print("\n" + result.get("llm_note", ""))
-        print("\n" + (result.get("final_text", "") or "(no response)")[:4000])
+        print("\n" + (result.get("final_text", "") or "(no response)"))
         if result.get("overall_summary"):
             print(f"\n[RISK] {result['risk_level']}\n[SUMMARY] {result['overall_summary']}")
         _print_findings(agent)

@@ -1,0 +1,49 @@
+openapi: 3.0.3
+info:
+  title: Phase 2.1 example
+  version: '1'
+servers:
+  - url: /api
+security:
+  - bearer: []
+components:
+  securitySchemes:
+    bearer:
+      type: http
+      scheme: bearer
+  schemas:
+    User:
+      type: object
+      required: [email]
+      properties:
+        email:
+          type: string
+          format: email
+        nickname:
+          type: string
+          nullable: true
+paths:
+  /users/{id}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+    get:
+      operationId: getUser
+      tags: [users]
+      responses:
+        '200':
+          description: Declared user response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/User'
+  /health:
+    get:
+      security: []
+      responses:
+        '200':
+          description: Health response

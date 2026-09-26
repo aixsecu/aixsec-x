@@ -36,12 +36,18 @@ class Finding:
     sources: list[str] = field(default_factory=list)   # mọi tool xác nhận
     parameter: str = ""                   # tham số liên quan (vd param SQLi/XSS)
 
+    method: str = ""
+    auth_context: str = ""
+    finding_id: str = ""
+
     @property
     def has_evidence_gap(self) -> bool:
         return bool(self.evidence_gaps)
 
     @property
     def key(self) -> tuple:
+        if self.finding_id:
+            return (self.finding_id, self.method, self.parameter, self.auth_context)
         return (self.name.lower(), self.url, self.service.lower())
 
 
