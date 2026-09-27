@@ -143,6 +143,11 @@ class EvidenceStore:
         row = self.records.get(evidence_id)
         if row is None:
             raise ValueError('Unknown evidence_id in this session')
+        if row.get('family_id'):
+            finding = next(f for f in self.candidates.values() if evidence_id in f.evidence)
+            return {'evidence_id': evidence_id, 'finding_id': finding.finding_id,
+                    'status': 'candidate',
+                    'reason': 'Route-family representative evidence requires a separate future validation phase'}
         if row.get('_normalized_schema'):
             validate_schema(row)
         finding = next(f for f in self.candidates.values() if evidence_id in f.evidence)

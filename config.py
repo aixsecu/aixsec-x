@@ -10,6 +10,9 @@ def load_config() -> dict:
     cookie_mode = os.environ.get("WEBX_ZAP_COOKIE_PARALLEL", "auto").strip().lower()
     if cookie_mode not in ("auto", "strict", "guest"):
         raise ValueError("WEBX_ZAP_COOKIE_PARALLEL must be auto, strict or guest")
+    family_scan = os.environ.get("WEBX_FAMILY_SCAN", "on").strip().lower()
+    if family_scan not in ("on", "off"):
+        raise ValueError("WEBX_FAMILY_SCAN must be on or off")
     return {
         # ── Ollama ──
         #   WEBX_OLLAMA_URL: local (http://localhost:11434) HOẶC máy khác
@@ -48,6 +51,16 @@ def load_config() -> dict:
         "zap_concurrency_file": os.environ.get("WEBX_ZAP_CONCURRENCY_FILE", ""),
         "zap_route_groups_file": os.environ.get("WEBX_ZAP_ROUTE_GROUPS_FILE", ""),
         "zap_route_family_mode": os.environ.get("WEBX_ZAP_ROUTE_FAMILY_MODE", "1") == "1",
+        "family_scan": family_scan == "on",
+        "family_divergence_samples": max(1, int(os.environ.get("WEBX_FAMILY_DIVERGENCE_SAMPLES", "2"))),
+        "family_split_max_depth": max(1, int(os.environ.get("WEBX_FAMILY_SPLIT_MAX_DEPTH", "4"))),
+        "family_confidence_threshold": min(1.0, max(0.0, float(os.environ.get("WEBX_FAMILY_CONFIDENCE_THRESHOLD", "0.6")))),
+        "family_ai_assistance": os.environ.get("WEBX_FAMILY_AI_ASSISTANCE", "0") == "1",
+        "family_ai_max_families": max(1, int(os.environ.get("WEBX_FAMILY_AI_MAX_FAMILIES", "20"))),
+        "zap_route_family_representatives_small": max(1, int(os.environ.get("WEBX_ZAP_ROUTE_FAMILY_REPRESENTATIVES_SMALL", "1"))),
+        "zap_route_family_representatives_medium": max(1, int(os.environ.get("WEBX_ZAP_ROUTE_FAMILY_REPRESENTATIVES_MEDIUM", "2"))),
+        "zap_route_family_representatives_large": max(1, int(os.environ.get("WEBX_ZAP_ROUTE_FAMILY_REPRESENTATIVES_LARGE", "3"))),
+        "zap_route_family_representatives_extra_large": max(1, int(os.environ.get("WEBX_ZAP_ROUTE_FAMILY_REPRESENTATIVES_EXTRA_LARGE", "4"))),
         "zap_timeout": int(os.environ.get("WEBX_ZAP_TIMEOUT", "600")),
         "zap_strength": os.environ.get("WEBX_ZAP_STRENGTH", "Medium"),
         "zap_phase_minutes": int(os.environ.get("WEBX_ZAP_PHASE_MINUTES", "2")),

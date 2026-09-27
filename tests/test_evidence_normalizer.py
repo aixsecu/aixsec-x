@@ -62,6 +62,27 @@ class EvidenceNormalizerTests(unittest.TestCase):
         self.assertEqual(result['status'],'confirmed')
         self.assertEqual(record['verification_state'],'confirmed')
 
+    def test_zap_evidence_references_matching_route_family_representative(self):
+        result={'name':'zap_active_scan','outcome':'ok','args':{'url':URL,
+            'family_id':'rf-primary','representative_id':'request-primary','member_count':2,
+            'family_references':[{'family_id':'rf-matched','representative_id':'request-matched',
+                'member_count':17,'url':URL,'method':'GET'}]},
+            'data':{'alerts':[self.alert()],'coverage':{'status':'complete'}}}
+        row=normalize(result,'/private/raw.json')[0]
+        self.assertEqual(row['family_id'],'rf-matched')
+        self.assertEqual(row['representative_id'],'request-matched')
+        self.assertEqual(row['member_count'],17)
+
+    def test_route_family_candidate_is_not_validated(self):
+        store=EvidenceStore(Ledger())
+        store.ingest({'name':'zap_active_scan','outcome':'ok','args':{'url':URL,
+            'family_id':'rf-one','representative_id':'request-one','member_count':1},
+            'data':{'alerts':[self.alert()]}})
+        record=next(iter(store.records.values()))
+        result=store.validate(record['evidence_id'])
+        self.assertEqual(result['status'],'candidate')
+        self.assertEqual(record['verification_state'],'candidate')
+
     def test_planner_view_is_provider_neutral(self):
         store=EvidenceStore(Ledger())
         store.ingest({'name':'nuclei_scan','outcome':'ok','args':{'url':URL},
