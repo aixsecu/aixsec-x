@@ -216,6 +216,15 @@ class ZapEvidenceTests(unittest.TestCase):
 
 
 class ZapPipelineTests(unittest.TestCase):
+    def test_route_family_mode_disabled_preserves_pipeline(self):
+        with tempfile.TemporaryDirectory() as root:
+            agent=WebXAgent(config(root,zap_route_family_mode=False,allow_active_scan=False))
+            with patch.object(TOOL_INDEX['zap_baseline'],'exec_fn',return_value=('scan',scanner_data(root))), \
+                    contextlib.redirect_stdout(io.StringIO()):
+                result=agent.run('scan')
+            self.assertNotIn('route_family_path',result)
+            self.assertEqual(list(Path(root).glob('*/family.json')),[])
+
     def test_baseline_runs_before_model_and_model_cannot_invent_finding(self):
         events = []
         with tempfile.TemporaryDirectory() as root:
