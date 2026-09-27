@@ -4,6 +4,7 @@ from __future__ import annotations
 from html.parser import HTMLParser
 import hashlib
 import json
+import math
 from pathlib import Path
 import re
 from urllib.parse import parse_qsl, unquote, urlsplit
@@ -74,9 +75,12 @@ def _request_parameters(request):
 
 
 class _DOM(HTMLParser):
+    _VOID={'area','base','br','col','embed','hr','img','input','link','meta','param','source','track','wbr'}
     def __init__(self):
         super().__init__(convert_charrefs=True);self.nodes=[];self.forms=[];self.inputs=[];self._form=None
+        self.depth=0;self.max_depth=0;self.attribute_count=0
     def handle_starttag(self,tag,attrs):
+        self.depth+=1;self.max_depth=max(self.max_depth,self.depth);self.attribute_count+=len(attrs)
         values=dict(attrs);identity=values.get('id','')
         identity=_unstable(identity,'id') or identity
         self.nodes.append([tag,sorted(values),identity])
@@ -91,8 +95,14 @@ class _DOM(HTMLParser):
             item=[tag,values.get('type',tag),values.get('name',''),_unstable(values.get('id',''),'id') or values.get('id','')]
             self.inputs.append(item)
             if self._form is not None:self._form['inputs'].append(item)
+        if tag in self._VOID:self.depth=max(0,self.depth-1)
     def handle_endtag(self,tag):
         if tag=='form':self._form=None
+        self.depth=max(0,self.depth-1)
+
+    def handle_startendtag(self,tag,attrs):
+        self.handle_starttag(tag,attrs)
+        if tag not in self._VOID:self.depth=max(0,self.depth-1)
 
 
 def _response_shape(response):
@@ -163,3 +173,106 @@ class RouteFamilyBuilder:
         temporary=path.with_suffix(path.suffix+'.tmp')
         temporary.write_text(json.dumps(result,ensure_ascii=False,indent=2));temporary.chmod(0o600);temporary.replace(path)
         return result
+
+
+def _member_metrics(entry):
+    request=entry.get('request') or {};response=entry.get('response') or {}
+    query,mime,body=_request_parameters(request)
+    content=response.get('content') or {};text=str(content.get('text') or '')
+    response_mime=str(content.get('mimeType') or '').lower();parser=_DOM()
+    if 'html' in response_mime and text:
+        try:parser.feed(text);parser.close()
+        except (ValueError,TypeError):pass
+    parameter_names={location+':'+str(item[0]) for location,items in (('query',query),('body',body)) for item in items}
+    url_depth=len([part for part in urlsplit(request.get('url','')).path.split('/') if part])
+    response_complexity=(len(parser.nodes)+parser.attribute_count+parser.max_depth+
+                         len(response.get('headers') or [])+max(1,text.count('\n')+1 if text else 0))
+    measured_size=len(text.encode('utf-8'))
+    try:reported_size=max(0,int(content.get('size',response.get('bodySize',0)) or 0))
+    except (TypeError,ValueError):reported_size=0
+    metrics={'response_size':max(measured_size,reported_size),'form_count':len(parser.forms),
+             'input_count':len(parser.inputs),'parameter_count':len(query)+len(body),
+             'response_complexity':response_complexity,'unique_parameter_names':len(parameter_names),
+             'dom_complexity':len(parser.nodes)+parser.attribute_count+parser.max_depth,
+             'url_depth':url_depth}
+    coverage={'status:'+str(response.get('status') or 0),'response-type:'+response_mime,
+              'request-type:'+mime,'url-depth:'+str(url_depth)}
+    coverage.update('parameter:'+name for name in parameter_names)
+    coverage.update('dom-tag:'+node[0] for node in parser.nodes)
+    coverage.update('input:'+':'.join(map(str,item[:3])) for item in parser.inputs)
+    coverage.update('form:'+str(form.get('method'))+':'+_hash(form) for form in parser.forms)
+    return metrics,coverage
+
+
+def _score(metrics):
+    # Log scaling keeps response bytes from overwhelming richer structural signals.
+    weights={'response_size':1.0,'form_count':5.0,'input_count':4.0,'parameter_count':4.0,
+             'response_complexity':2.0,'unique_parameter_names':5.0,
+             'dom_complexity':2.0,'url_depth':1.5}
+    components={name:round(weights[name]*math.log2(1+value),6) for name,value in metrics.items()}
+    return round(sum(components.values()),6),components
+
+
+class RepresentativeSelector:
+    """Choose deterministic request-group representatives without changing them."""
+    def __init__(self,small=1,medium=2,large=3,extra_large=4):
+        self.limits=(max(1,int(small)),max(1,int(medium)),max(1,int(large)),max(1,int(extra_large)))
+
+    def _limit(self,size):
+        if size<=5:return self.limits[0]
+        if size<=30:return self.limits[1]
+        if size<=100:return self.limits[2]
+        return self.limits[3]
+
+    def select(self,entries,family_report):
+        selected=[];families=[];covered_total=set();available_total=set()
+        for family in family_report.get('families',[]):
+            scored=[]
+            for member in family['members']:
+                request_id=member['request_id'];raw=(entries[request_id].get('_entry') or {})
+                metrics,coverage=_member_metrics(raw);score,components=_score(metrics)
+                scored.append({'request_id':request_id,'score':score,'score_breakdown':components,
+                               'metrics':metrics,'_coverage':coverage})
+                available_total.update(coverage)
+            chosen=[];covered=set();remaining=list(scored)
+            while remaining and len(chosen)<min(self._limit(len(scored)),len(scored)):
+                # Maximize new structural features first, richness score second, request id last.
+                candidate=min(remaining,key=lambda item:(-len(item['_coverage']-covered),-item['score'],item['request_id']))
+                remaining.remove(candidate);chosen.append(candidate);covered.update(candidate['_coverage'])
+            chosen_ids=[item['request_id'] for item in chosen];selected.extend(chosen_ids);covered_total.update(covered)
+            family['representative_candidates']=chosen_ids
+            member_urls=sorted({str(member.get('url') or '') for member in family['members'] if member.get('url')})
+            for member in family['members']:
+                entries[member['request_id']]['route_family_member_count']=len(scored)
+                entries[member['request_id']]['route_family_member_urls']=member_urls
+            for request_id in chosen_ids:
+                entries[request_id]['representative_id']=request_id
+            families.append({'family_id':family['family_id'],'member_count':len(scored),
+                'limit':self._limit(len(scored)),'representatives':chosen_ids,
+                'scored_members':[{k:v for k,v in item.items() if k!='_coverage'}
+                                  for item in sorted(scored,key=lambda item:item['request_id'])],
+                'coverage_estimate':round(100*len(covered)/len(set().union(*(v['_coverage'] for v in scored))),2)
+                                    if scored and set().union(*(v['_coverage'] for v in scored)) else 100.0})
+        before=len(entries);after=len(selected)
+        return {'version':1,'algorithm':'deterministic-greedy-structural-coverage-v1',
+                'limits':{'1-5':self.limits[0],'6-30':self.limits[1],
+                          '31-100':self.limits[2],'100+':self.limits[3]},
+                'scan_groups_before':before,'scan_groups_after':after,
+                'reduction':before-after,
+                'coverage_estimate':round(100*len(covered_total)/len(available_total),2) if available_total else 100.0,
+                'representative_request_ids':selected,'families':families}
+
+    def write(self,entries,family_report,path,family_path=None):
+        result=self.select(entries,family_report)
+        self.persist(result,path)
+        if family_path is not None:
+            family_path=Path(family_path);temporary=family_path.with_suffix(family_path.suffix+'.tmp')
+            temporary.write_text(json.dumps(family_report,ensure_ascii=False,indent=2));temporary.chmod(0o600)
+            temporary.replace(family_path)
+        return result
+
+    @staticmethod
+    def persist(result,path):
+        path=Path(path);path.parent.mkdir(parents=True,exist_ok=True)
+        temporary=path.with_suffix(path.suffix+'.tmp')
+        temporary.write_text(json.dumps(result,ensure_ascii=False,indent=2));temporary.chmod(0o600);temporary.replace(path)

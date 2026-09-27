@@ -98,5 +98,9 @@ class ScheduleTests(unittest.TestCase):
                     result=agent.run('scan all supported categories')
             self.assertEqual(len(calls),1)
             self.assertEqual(set(calls[0]['rule_ids']),{40012,40018})
+            self.assertTrue(Path(result['family_evidence_path']).is_file())
+            self.assertEqual(json.loads(Path(result['family_evidence_path']).read_text())['finding_count'],0)
+            self.assertTrue((Path(result['evidence_path']).parent/'confidence.json').is_file())
+            self.assertTrue((Path(result['evidence_path']).parent/'family-ai-hypotheses.json').is_file())
             states=result['active_schedule']['families'][0]['rules']
             self.assertTrue(all(s['state']=='requests_observed' for s in states))

@@ -2,6 +2,7 @@ import tempfile
 import threading
 import time
 import unittest
+from urllib.error import HTTPError
 from unittest.mock import MagicMock, patch
 
 from zap_pool import WorkerError, WorkerPool, WorkerState, ZapWorker
@@ -86,6 +87,14 @@ class ZapWorkerTests(unittest.TestCase):
         with patch.object(worker,'_api',side_effect=[{}, {'sites':['https://one.test']},{},{}]) as api: worker.reset()
         self.assertEqual([call.args[2] for call in api.call_args_list],
                          ['deleteAllAlerts','sites','clearActiveSession','deleteSiteNode'])
+
+    def test_reset_fails_closed_when_authentication_state_cannot_be_cleared(self):
+        worker=ZapWorker(1,'zap',1234,MagicMock())
+        worker.process=MagicMock();worker.process.poll.return_value=None;worker.state=WorkerState.HEALTHY
+        unsupported=HTTPError('http://127.0.0.1',404,'unsupported',{},None)
+        with patch.object(worker,'_api',side_effect=[{}, {'sites':['https://one.test']},unsupported]):
+            with self.assertRaisesRegex(WorkerError,'worker reset failed'):
+                worker.reset()
 
     def test_worker_identity_has_private_resources(self):
         one=ZapWorker(1,'zap',1234,MagicMock());two=ZapWorker(2,'zap',1235,MagicMock())

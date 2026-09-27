@@ -102,6 +102,12 @@ def normalize(result, raw_result_reference=""):
         finding_id=_stable("finding",[key_category,url,method,str(row.get("parameter") or ""),auth]) if candidates else ""
         evidence_id=_stable("ev",[tool,row.get("scan_id"),row.get("rule_id"),url,method,
             row.get("parameter"),auth,request_hash,response_hash])
+        references=args.get("family_references") if isinstance(args.get("family_references"),list) else []
+        reference=next((ref for ref in references if isinstance(ref,dict)
+            and EvidenceRedactor().redact_url(str(ref.get("url") or ""))==url
+            and (not ref.get("method") or str(ref.get("method")).upper()==method)),None) or {}
+        try:member_count=max(1,int(reference.get("member_count") or args.get("member_count") or coverage.get("member_count") or 1))
+        except (TypeError,ValueError):member_count=1
         confidence=row.get("confidence",row.get("scanner_confidence","unknown"))
         record={
             "tool":tool,"tool_version":str(row.get("tool_version") or coverage.get("version") or data.get("version") or ""),
@@ -121,6 +127,15 @@ def normalize(result, raw_result_reference=""):
             "auth_state":str(row.get("auth_state") or coverage.get("auth_state") or ""),
             "request_sha256":request_hash,"response_sha256":response_hash,
             "raw_result_reference":raw_result_reference,"_candidate":candidates,
+            "family_id":str(reference.get("family_id") or args.get("family_id") or coverage.get("family_id") or ""),
+            "representative_id":str(reference.get("representative_id") or args.get("representative_id") or coverage.get("representative_id") or ""),
+            "representative_url":EvidenceRedactor().redact_url(str(reference.get("representative_url") or args.get("representative_url") or args.get("url") or "")),
+            "member_urls":sorted({EvidenceRedactor().redact_url(str(value)) for value in
+                (reference.get("member_urls") or args.get("member_urls") or []) if value}),
+            "rule_ids":sorted({str(value) for value in (args.get("rule_ids") or [])}),
+            "divergence_replay_of":str(args.get("divergence_replay_of") or ""),
+            "divergence_member_id":str(args.get("divergence_member_id") or ""),
+            "member_count":member_count,
             "_normalized_schema":1,
             "_verification":{"response_header":row.get("_response_header") or "",
                 "request_header":row.get("_request_header") or "",

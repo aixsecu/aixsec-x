@@ -13,9 +13,11 @@ and are closed at interpreter exit. There is no per-job JVM execution path.
 
 Workers never share a port, workspace, process, session database, or in-memory
 authentication state. Before a job, the worker clears alerts, active HTTP
-sessions, Sites tree, and history. Raw job artifacts remain in their existing
-per-scan evidence directory. Identical scan policies are retained; a changed
-policy is rebuilt by its Automation Framework job.
+sessions, Sites tree, and history. Session clearing is fail-closed: if the
+installed add-on cannot clear authentication state, that JVM is discarded
+instead of being reused. Raw job artifacts remain in their existing per-scan
+evidence directory. Identical scan policies are retained; a changed policy is
+rebuilt by its Automation Framework job.
 
 ## Health and recycling
 
@@ -43,37 +45,41 @@ They are included in the pipeline result and Active Scan performance artifact.
 
 ## Real benchmark
 
-Local controlled workload: ZAP 2.17.0, one worker, two sequential active jobs,
-one SQL injection rule, identical target server.
+Local controlled workload: installed ZAP, one worker, three sequential active
+jobs, one SQL injection rule, and the same local target implementation. The
+baseline creates and closes a fresh isolated worker for every job. The optimized
+run shares one worker. Both modes use the same production adapter, scheduler,
+report parser, and evidence path.
 
 | Metric | Per-job JVM baseline | Persistent worker |
 |---|---:|---:|
-| Total for two jobs | approximately 26.3 s | 15.72 s |
-| JVMs created | 2 | 1 |
-| Reused jobs | 0 | 1 |
-| Reuse ratio | 0% | 50% |
-| Per-job JVM startup | approximately 2.63 s | 0 ms after pool startup |
-| Per-job JVM shutdown | approximately 6.84 s | 0 ms |
-| Persistent job busy mean | n/a | 4.79 s |
-| Worker lifetime at snapshot | n/a | 12.01 s |
-| Worker RSS at snapshot | n/a | 496.9 MiB |
+| Total wall time | 59.840 s | 43.551 s |
+| Throughput | 0.0501 jobs/s | 0.0689 jobs/s |
+| JVMs created | 3 | 1 |
+| Reuse ratio | 0% | 66.67% |
+| Lifecycle share | 79.80% | 75.36% (one cold start included) |
+| Child CPU time | 43.988 s | 25.527 s |
+| Peak worker RSS | 572.2 MiB | 665.5 MiB |
+| Finding signature | identical | identical |
 
-Observed end-to-end improvement is approximately 40%. The two-job result is
-conservative because initial pool startup is included and only one reuse occurs;
-reuse ratio approaches 100% for longer scans. Target latency, passive waits,
-active rule execution, report export, and evidence parsing remain.
+Observed wall-time reduction was 27.22%, throughput improved 37.52%, and child
+CPU time fell 18.46 seconds. The retained worker used 93.3 MiB more peak RSS in
+this run. The initial pool startup is included; reuse ratio approaches 100% for
+longer scans. Target latency, passive waits, active rule execution, per-job
+context/import work, report export, and evidence parsing remain.
 
 Benchmark command:
 
 ```sh
-python3 bench/zap_performance_benchmark.py --jobs 2 --workers 1 \
-  --evidence-dir /private/tmp/aixsec-zap-pool
+python3 bench/zap_performance_benchmark.py --compare --jobs 3 --workers 1 \
+  --output /private/tmp/aixsec-zap-worker-comparison.json
 ```
 
 ## Verification
 
-- Real ZAP test: two jobs completed through one daemon; second job reused its
-  worker and cached policy, with raw evidence produced for both jobs.
+- Real ZAP test: three jobs completed through one daemon; later jobs reused its
+  worker and cached policy, with raw evidence produced for every job.
 - Automated tests cover lifecycle, reuse, recycling, crash replacement,
   isolation, acquisition/release, shutdown, exhaustion, and parallel leases.
-- Full regression suite: 591 passed, 6 skipped.
+- The benchmark compares normalized finding signatures and reports whether they
+  are equal. Automated regression tests remain the authoritative behavior check.

@@ -285,6 +285,10 @@ def _run(agent, user_text):
     zap_scheduler_performance = {}
     active_performance_report = None
     route_family_report = None
+    representative_report = None
+    family_evidence_report = None
+    divergence_report = None
+    family_history_report = None
     agent._pipeline_deadline = None
     if cfg.get('resume_session'):
         resume = Path(cfg['resume_session']).expanduser().resolve()
@@ -325,6 +329,14 @@ def _run(agent, user_text):
 
     def execution(name, args, baseline=False, scheduled=False, cancelled=None, batch=None):
         nonlocal calls, estimated_requests
+        if name == 'zap_active_scan' and batch:
+            args={**args,'family_references':[{'family_id':member.get('route_family_id',''),
+                'representative_id':member.get('representative_id',member['request_id']),
+                'member_count':member.get('route_family_member_count',1),
+                'representative_url':member.get('url',''),
+                'member_urls':member.get('route_family_member_urls',[]),
+                'url':member.get('url',''),'method':member.get('method','')}
+                for member in batch]}
         key = digest([name, args, [row.get('request_id') for row in batch]]) if batch else digest([name, args])
         if key in cache:
             return {'name':name, 'outcome':'duplicate', 'output':'Action already attempted in this run'}
@@ -453,6 +465,12 @@ def _run(agent, user_text):
                 float(scheduler_row.get(key,0)) for key in ('scheduler_wait_ms','scheduler_dispatch_ms','prepare_ms'))
             performance['job_duration']=performance['total_job_ms']/1000
             zap_performance.append(performance)
+            coverage=(result.get('data') or {}).get('coverage') if isinstance(result.get('data'),dict) else None
+            if isinstance(coverage,dict):
+                coverage['family_id']=args.get('family_id','')
+                coverage['representative_id']=args.get('representative_id','')
+                coverage['member_count']=args.get('member_count',1)
+                coverage['family_references']=args.get('family_references',[])
         result['trigger'] = trigger
         # Coverage failure is retained even if no scanner process was launched.
         if baseline and not isinstance((result.get('data') or {}).get('coverage'), dict):
@@ -511,12 +529,34 @@ def _run(agent, user_text):
         agent.evidence_store.coverage.extend({'target': u, 'status': 'not_run', 'reason': 'baseline disabled'} for u in targets)
     close_stage('discovery')
     if cfg.get('zap_route_family_mode', True):
-        from route_family import RouteFamilyBuilder
+        from route_family import RepresentativeSelector,RouteFamilyBuilder
         route_family_path=journal.directory/'family.json'
         route_family_report=RouteFamilyBuilder().write(schedule.entries,route_family_path)
+        representative_path=journal.directory/'representatives.json'
+        representative_report=RepresentativeSelector(
+            cfg.get('zap_route_family_representatives_small',1),
+            cfg.get('zap_route_family_representatives_medium',2),
+            cfg.get('zap_route_family_representatives_large',3),
+            cfg.get('zap_route_family_representatives_extra_large',4)).write(
+                schedule.entries,route_family_report,representative_path,route_family_path)
+        selected=set(representative_report['representative_request_ids'])
+        family_scan=bool(cfg.get('family_scan',True))
+        original_count=len(schedule.entries)
+        scheduled_count=representative_report['scan_groups_after'] if family_scan else original_count
+        representative_report.update(family_scan='on' if family_scan else 'off',
+            scheduler_input_groups=scheduled_count,
+            reduction_ratio=round((1-(scheduled_count/original_count))*100,2) if original_count else 0.0)
+        RepresentativeSelector.persist(representative_report,representative_path)
+        print('[zap:families] Original groups: '+str(original_count),flush=True)
+        print('[zap:families] Families: '+str(route_family_report['family_count']),flush=True)
+        print('[zap:families] Representatives: '+str(scheduled_count),flush=True)
+        print('[zap:families] Reduction ratio: '+str(representative_report['reduction_ratio'])+'%',flush=True)
         journal.data['stages']['discovery']['route_families']={
             'path':str(route_family_path),'families':route_family_report['family_count'],
-            'request_groups':route_family_report['request_groups']}
+            'request_groups':route_family_report['request_groups'],
+            'representatives_path':str(representative_path),
+            'scan_groups_after':representative_report['scan_groups_after'],
+            'coverage_estimate':representative_report['coverage_estimate']}
         journal.save()
     stage_name = 'zap_active'
     journal.stage(stage_name, 'running')
@@ -528,8 +568,10 @@ def _run(agent, user_text):
             schedule.stop_reason = 'No installed/allowed active rules; inspect the ZAP rule catalog job'
         elif not schedule.entries:
             schedule.stop_reason = 'No eligible captured requests to test'
-        # Run independently of the LLM, once per structural family and rule.
-        representatives = sorted(schedule.entries.values(), key=lambda e: (
+        # Run independently of the LLM using the selected captured request groups.
+        representatives = sorted((row for request_id,row in schedule.entries.items()
+                                  if representative_report is None or not cfg.get('family_scan',True)
+                                  or request_id in selected), key=lambda e: (
             not bool(e['structure']['query'] or e['structure']['body']), e['url']))
         workers = max(1, min(8, int(cfg.get('zap_workers', 2))))
         if active_rules and representatives:
@@ -559,6 +601,11 @@ def _run(agent, user_text):
             def start(representative, cancelled):
                 return execution('zap_active_scan', {'url':representative['_entry']['request']['url'],
                     'request_id':representative['request_id'], 'auth_context':representative['auth_context'],
+                    'family_id':representative.get('route_family_id',''),
+                    'representative_id':representative.get('representative_id',representative['request_id']),
+                    'representative_url':representative.get('url',''),
+                    'member_urls':representative.get('route_family_member_urls',[]),
+                    'member_count':representative.get('route_family_member_count',1),
                     'rule_ids':active_rules}, scheduled=True, cancelled=cancelled,
                     batch=representative.get('_batch_members'))
             schedule.stop_reason = drive(dispatch_jobs, start, workers, cookie_mode, concurrency_policy,
@@ -575,6 +622,97 @@ def _run(agent, user_text):
     if auto_concurrency:
         journal.data['stages']['zap_active']['automatic'] = auto_concurrency.summary()
         journal.save()
+    if route_family_report:
+        from family_evidence import FamilyEvidenceStore
+        family_evidence_path=journal.directory/'family-evidence.json'
+        family_evidence_report=FamilyEvidenceStore().write(
+            agent.evidence_store.normalized.values(),family_evidence_path)
+        journal.data['stages']['zap_active']['family_evidence']={
+            'path':str(family_evidence_path),
+            'findings':family_evidence_report['finding_count'],
+            'verification_policy':family_evidence_report['verification_policy']}
+        from divergence import DivergenceDetector
+        from family_confidence import FamilyConfidence
+        from family_history import FamilyHistory
+        detector=DivergenceDetector(cfg.get('family_divergence_samples',2))
+        confidence_calculator=FamilyConfidence(cfg.get('family_confidence_threshold',0.6))
+        family_history=FamilyHistory(len(schedule.entries));rounds=[];all_splits=[];extra_scans=0
+        selector=RepresentativeSelector(cfg.get('zap_route_family_representatives_small',1),
+            cfg.get('zap_route_family_representatives_medium',2),
+            cfg.get('zap_route_family_representatives_large',3),
+            cfg.get('zap_route_family_representatives_extra_large',4))
+        for generation in range(1,cfg.get('family_split_max_depth',4)+1):
+            confidence_report=confidence_calculator.build(route_family_report,family_history.validated)
+            divergence_plans=detector.plan(route_family_report,family_evidence_report,family_history.tested,
+                confidence_report['families_requiring_replay'])
+            if not divergence_plans:break
+            completed_plans=[]
+            for plan in divergence_plans:
+                member=schedule.entries.get(plan['member_id'])
+                if member is None:continue
+                representative=schedule.entries.get(plan['representative_id']) or member
+                replay_result=execute('zap_active_scan',{'url':member['_entry']['request']['url'],
+                    'request_id':member['request_id'],'auth_context':member['auth_context'],
+                    'family_id':plan['family_id'],'representative_id':plan['representative_id'],
+                    'representative_url':representative.get('url',''),'member_urls':plan['member_urls'],
+                    'member_count':plan['member_count'],'divergence_replay_of':plan['representative_id'],
+                    'divergence_member_id':plan['member_id'],
+                    'rule_ids':[int(rule) for rule in plan['rule_ids'] if str(rule).isdigit()]},scheduled=True)
+                if replay_result.get('outcome')=='ok':completed_plans.append(plan)
+            family_history.observe_plans(divergence_plans,[plan['member_id'] for plan in completed_plans])
+            extra_scans+=len(divergence_plans)
+            round_report=detector.analyze(route_family_report,family_evidence_report,
+                agent.evidence_store.normalized.values(),completed_plans,len(schedule.entries),
+                representative_report['scan_groups_after'])
+            round_report['generation']=generation;rounds.append(round_report)
+            if not round_report['splits']:continue
+            all_splits.extend(round_report['splits'])
+            representative_report,_=family_history.rebuild(route_family_report,round_report,
+                schedule.entries,selector,generation)
+            representative_report.update(family_scan='on' if cfg.get('family_scan',True) else 'off',
+                scheduler_input_groups=representative_report['scan_groups_after'],
+                reduction_ratio=round((1-representative_report['scan_groups_after']/len(schedule.entries))*100,2)
+                                if schedule.entries else 0.0)
+            current_families={member['request_id']:family for family in route_family_report['families']
+                              for member in family['members']}
+            for row in agent.evidence_store.normalized.values():
+                member_id=row.get('divergence_member_id');family=current_families.get(member_id)
+                if not family:continue
+                row['family_id']=family['family_id'];row['member_count']=len(family['members'])
+                row['member_urls']=sorted({str(member.get('url') or '') for member in family['members'] if member.get('url')})
+                if member_id in family.get('representative_candidates',[]):
+                    row['representative_id']=member_id;row['representative_url']=schedule.entries[member_id].get('url','')
+            family_evidence_report=FamilyEvidenceStore().write(
+                agent.evidence_store.normalized.values(),family_evidence_path)
+            RepresentativeSelector.persist(representative_report,journal.directory/'representatives.json')
+        decisions=[finding for report in rounds for finding in report.get('findings',[])]
+        confirmed=sum(1 for finding in decisions if finding['status']=='family_confirmed')
+        final_representatives=sum(len(family.get('representative_candidates',[])) for family in route_family_report['families'])
+        divergence_report={'version':2,'algorithm':'recursive-deterministic-family-divergence-v2',
+            'generations':len(rounds),'extra_scans':extra_scans,
+            'avoided_scans':max(0,len(schedule.entries)-final_representatives-extra_scans),
+            'family_confirmation_rate':round(100*confirmed/len(decisions),2) if decisions else 0.0,
+            'confirmed_findings':confirmed,'finding_count':len(decisions),'findings':decisions,
+            'splits':all_splits,'rounds':rounds}
+        detector.write(divergence_report,journal.directory/'divergence.json')
+        detector.write(route_family_report,journal.directory/'family.json')
+        family_history_report=family_history.snapshot(route_family_report,final_representatives)
+        FamilyHistory.write(family_history_report,journal.directory/'family-history.json')
+        confidence_report=confidence_calculator.build(route_family_report,family_history.validated)
+        FamilyConfidence.write(confidence_report,journal.directory/'confidence.json')
+        from family_ai import FamilyAIAssistant
+        family_ai=FamilyAIAssistant(cfg.get('family_ai_assistance',False),
+                                    cfg.get('family_ai_max_families',20))
+        family_ai_report=family_ai.assist(confidence_report,route_family_report,agent.chat,cfg)
+        family_ai_report['benchmark']=family_ai.benchmark(confidence_report['family_count'],
+            family_ai_report['eligible_families'],family_ai_report['ai_invocations'],0)
+        FamilyAIAssistant.write(family_ai_report,journal.directory/'family-ai-hypotheses.json')
+        journal.data['stages']['zap_active']['divergence']={
+            'path':str(journal.directory/'divergence.json'),
+            'extra_scans':divergence_report['extra_scans'],
+            'avoided_scans':divergence_report['avoided_scans'],
+            'family_confirmation_rate':divergence_report['family_confirmation_rate']}
+        journal.save()
     close_stage('zap_active')
     stage_name = 'nuclei'
     if backend == 'none':
@@ -585,7 +723,8 @@ def _run(agent, user_text):
     journal.stage(stage_name, 'running')
     # Apply supported validators without waiting for an LLM to request them.
     for eid in list(agent.evidence_store.records):
-        agent.evidence_store.validate(eid)
+        if not agent.evidence_store.records[eid].get('family_id'):
+            agent.evidence_store.validate(eid)
     _verify_candidates(agent, schedule, execute, journal, history)
     close_stage('verification')
     if agent.evidence_store.records and not any(t['stage'] == 'verification' for t in journal.data['tasks'].values()):
@@ -679,7 +818,8 @@ def _run(agent, user_text):
                 # Compatibility for saved checkpoints and older planner clients.
                 result = execute(name, args)
         for eid in list(agent.evidence_store.records):
-            agent.evidence_store.validate(eid)
+            if not agent.evidence_store.records[eid].get('family_id'):
+                agent.evidence_store.validate(eid)
         sync_graph(agent)
         current_facts=facts(agent)
         progress=bool(current_facts-seen_facts)
@@ -695,6 +835,14 @@ def _run(agent, user_text):
     if route_family_report:
         result['route_families']={k:v for k,v in route_family_report.items() if k!='families'}
         result['route_family_path']=str(journal.directory/'family.json')
+        result['representatives']={k:v for k,v in representative_report.items() if k!='families'}
+        result['representatives_path']=str(journal.directory/'representatives.json')
+        result['family_evidence']={k:v for k,v in family_evidence_report.items() if k!='findings'}
+        result['family_evidence_path']=str(journal.directory/'family-evidence.json')
+        result['divergence']={k:v for k,v in divergence_report.items() if k not in ('findings','splits')}
+        result['divergence_path']=str(journal.directory/'divergence.json')
+        result['family_history']={k:v for k,v in family_history_report.items() if k!='events'}
+        result['family_history_path']=str(journal.directory/'family-history.json')
     total_batch = sum(int(row.get('batch_size', 1)) for row in zap_performance)
     launches = sum(int(row.get('jvm_launches', 1)) for row in zap_performance)
     result['zap_performance'] = {
@@ -817,6 +965,8 @@ def _verify_candidates(agent, schedule, execute, journal, history):
     from urllib.parse import urlsplit, parse_qsl
     attempted = set()
     for eid, row in list(agent.evidence_store.records.items()):
+        if row.get('family_id'):
+            continue
         if 'sql' not in str(row.get('category','')).lower():
             continue
         parameter = row.get('parameter')

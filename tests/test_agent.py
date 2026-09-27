@@ -1759,6 +1759,16 @@ class TestConfigNumPredict(unittest.TestCase):
             from config import load_config
             self.assertEqual(load_config()["num_predict"], 1024)
 
+    def test_family_scan_on_off(self):
+        from config import load_config
+        with patch.dict(os.environ,{"WEBX_FAMILY_SCAN":"on"},clear=False):
+            self.assertTrue(load_config()["family_scan"])
+        with patch.dict(os.environ,{"WEBX_FAMILY_SCAN":"off"},clear=False):
+            self.assertFalse(load_config()["family_scan"])
+        with patch.dict(os.environ,{"WEBX_FAMILY_SCAN":"invalid"},clear=False):
+            with self.assertRaisesRegex(ValueError,"WEBX_FAMILY_SCAN"):
+                load_config()
+
 
 class TestEvidenceGuard(unittest.TestCase):
     """v1.4.1: check_findings_evidence — phát hiện finding do model BỊA

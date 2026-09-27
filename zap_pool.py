@@ -109,8 +109,9 @@ class ZapWorker:
             for site in sites:
                 # deleteSiteNode removes the site's history/tree without replacing
                 # the daemon, proxy, workspace, or add-on state.
-                try: self._api('httpSessions','action','clearActiveSession',{'site':site},timeout=5)
-                except HTTPError: pass  # Older HTTP Sessions add-ons omit this action.
+                # Authentication state is never optional: if this action is not
+                # supported, fail the reset so the pool replaces the JVM.
+                self._api('httpSessions','action','clearActiveSession',{'site':site},timeout=5)
                 self._api('core','action','deleteSiteNode',{'url':site},timeout=10)
         except (HTTPError,URLError,TimeoutError,OSError,ValueError,WorkerError) as exc:
             raise WorkerError(f'worker reset failed: {exc}') from exc
