@@ -47,6 +47,7 @@ def load_config() -> dict:
         "zap_cookie_parallel": cookie_mode,
         "zap_concurrency_file": os.environ.get("WEBX_ZAP_CONCURRENCY_FILE", ""),
         "zap_route_groups_file": os.environ.get("WEBX_ZAP_ROUTE_GROUPS_FILE", ""),
+        "zap_route_family_mode": os.environ.get("WEBX_ZAP_ROUTE_FAMILY_MODE", "1") == "1",
         "zap_timeout": int(os.environ.get("WEBX_ZAP_TIMEOUT", "600")),
         "zap_strength": os.environ.get("WEBX_ZAP_STRENGTH", "Medium"),
         "zap_phase_minutes": int(os.environ.get("WEBX_ZAP_PHASE_MINUTES", "2")),
