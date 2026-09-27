@@ -284,6 +284,7 @@ def _run(agent, user_text):
     zap_performance = []
     zap_scheduler_performance = {}
     active_performance_report = None
+    route_family_report = None
     agent._pipeline_deadline = None
     if cfg.get('resume_session'):
         resume = Path(cfg['resume_session']).expanduser().resolve()
@@ -509,6 +510,14 @@ def _run(agent, user_text):
     if backend == 'none':
         agent.evidence_store.coverage.extend({'target': u, 'status': 'not_run', 'reason': 'baseline disabled'} for u in targets)
     close_stage('discovery')
+    if cfg.get('zap_route_family_mode', True):
+        from route_family import RouteFamilyBuilder
+        route_family_path=journal.directory/'family.json'
+        route_family_report=RouteFamilyBuilder().write(schedule.entries,route_family_path)
+        journal.data['stages']['discovery']['route_families']={
+            'path':str(route_family_path),'families':route_family_report['family_count'],
+            'request_groups':route_family_report['request_groups']}
+        journal.save()
     stage_name = 'zap_active'
     journal.stage(stage_name, 'running')
     schedule.rules = agent.evidence_store.active_rules
@@ -683,6 +692,9 @@ def _run(agent, user_text):
     agent._pipeline_deadline = None
     result = agent.evidence_store.finish(llm_down or failures > 0)
     result['active_schedule'] = schedule.summary(active_rules)
+    if route_family_report:
+        result['route_families']={k:v for k,v in route_family_report.items() if k!='families'}
+        result['route_family_path']=str(journal.directory/'family.json')
     total_batch = sum(int(row.get('batch_size', 1)) for row in zap_performance)
     launches = sum(int(row.get('jvm_launches', 1)) for row in zap_performance)
     result['zap_performance'] = {
