@@ -86,6 +86,25 @@ class TerminalTests(unittest.TestCase):
             self.assertIn('Status: Interrupted', screen.getvalue())
             self.assertIs(sys.stdout, original)
 
+    def test_summary_prints_technology_benchmark(self):
+        with tempfile.TemporaryDirectory() as root:
+            screen = io.StringIO()
+            terminal, agent = self.session(root, screen)
+            with terminal:
+                event('bind', agent)
+                event('completed', {'technology_capability_benchmark': {
+                    'payload_families_before_optimization': 20,
+                    'payload_families_after_optimization': 8,
+                    'skipped_payload_families': 12,
+                    'executed_payload_families': 4,
+                    'average_planning_time_ms': 1.25,
+                    'average_scan_duration_seconds': 10.5,
+                    'overall_scan_reduction_percent': 60.0}})
+            output = screen.getvalue()
+            self.assertIn('Technology Capability Benchmark', output)
+            self.assertIn('Payload families after: 8', output)
+            self.assertTrue(output.endswith('=' * 50 + '\n'))
+
     def test_tty_updates_clear_only_current_line(self):
         class TTY(io.StringIO):
             def isatty(self):

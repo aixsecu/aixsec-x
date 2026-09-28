@@ -13,6 +13,13 @@ def load_config() -> dict:
     family_scan = os.environ.get("WEBX_FAMILY_SCAN", "on").strip().lower()
     if family_scan not in ("on", "off"):
         raise ValueError("WEBX_FAMILY_SCAN must be on or off")
+    technology_capability_engine = os.environ.get(
+        "WEBX_TECHNOLOGY_CAPABILITY_ENGINE", "off").strip().lower()
+    if technology_capability_engine not in ("on", "off"):
+        raise ValueError("WEBX_TECHNOLOGY_CAPABILITY_ENGINE must be on or off")
+    planner_mode = os.environ.get("WEBX_PLANNER_MODE", "balanced").strip().lower()
+    if planner_mode not in ("aggressive", "balanced", "thorough"):
+        raise ValueError("WEBX_PLANNER_MODE must be aggressive, balanced or thorough")
     return {
         # ── Ollama ──
         #   WEBX_OLLAMA_URL: local (http://localhost:11434) HOẶC máy khác
@@ -29,6 +36,8 @@ def load_config() -> dict:
         # Baseline-first evidence pipeline. Legacy remains explicitly opt-in.
         "scan_backend": os.environ.get("WEBX_SCAN_BACKEND", "auto").lower(),
         "planner_enabled": os.environ.get("WEBX_PLANNER_ENABLED", "1") == "1",
+        "technology_capability_engine": technology_capability_engine == "on",
+        "planner_mode": planner_mode,
         "pipeline_max_seconds": 0,  # retired: sequential stages have no session-wide budget
         "pipeline_max_requests": 0,
         "pipeline_max_actions": 0,
