@@ -93,6 +93,7 @@ class ScanSchedule:
         self.skipped_static = 0
         self.report = []
         self.stop_reason = ''
+        self.limit_report = {'configured': 0, 'before': 0, 'after': 0, 'dropped': 0}
 
     @contextmanager
     def connection(self):
@@ -134,6 +135,24 @@ class ScanSchedule:
                     'url': EvidenceRedactor().redact_url(url), 'method': shape['method'],
                     'auth_context': auth, 'equivalent_requests': 0, '_entry': entry}
             self.entries[fid]['equivalent_requests'] += 1
+
+    @staticmethod
+    def _active_priority(entry):
+        """Prefer request shapes with injectable input and dynamic methods."""
+        structure = entry.get('structure') or {}
+        has_input = bool(structure.get('query') or structure.get('body'))
+        method = str(structure.get('method') or 'GET').upper()
+        return (not has_input, method in ('GET', 'HEAD'), entry.get('url', ''))
+
+    def limit(self, maximum):
+        """Hard-cap structures offered to route grouping and active scanning."""
+        maximum = max(1, int(maximum))
+        before = len(self.entries)
+        selected = sorted(self.entries.items(), key=lambda item: self._active_priority(item[1]))[:maximum]
+        self.entries = dict(selected)
+        self.limit_report = {'configured': maximum, 'before': before,
+                             'after': len(self.entries), 'dropped': max(0, before-len(self.entries))}
+        return self.limit_report
 
     def select(self, args):
         if args.get('request_id'):
@@ -186,5 +205,6 @@ class ScanSchedule:
                                'artifact_ref':states.get(r,('not_run',''))[1]} for r in rules]})
         return {'namespace': self.namespace, 'history_path': str(self.path), 'families': rows,
                 'rules': self.rules, 'skipped_static_requests': self.skipped_static,
+                'active_input_limit': self.limit_report,
                 'stop_reason': self.stop_reason,
                 'interpretation': 'A reserved/attempted rule is never automatically repeated; requests_observed/responses_recorded do not mean the rule completed or the endpoint is safe. Use a new operator-selected namespace for intentional retesting.'}

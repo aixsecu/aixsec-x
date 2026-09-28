@@ -181,8 +181,10 @@ Warnings, malformed reports and incomplete authentication cannot report complete
 | `WEBX_PIPELINE_MAX_SECONDS` | retired | Ignored; stages do not share a deadline |
 | `WEBX_PIPELINE_MAX_REQUESTS` | retired | Estimates are reporting metrics only |
 | `WEBX_ZAP_TIMEOUT` | 600 | Process wall-clock budget; stop owned process group on expiry |
+| `WEBX_ZAP_STARTUP_TIMEOUT` | 120 | Persistent-worker API readiness budget; failed starts are terminated and release their port/home |
 | `WEBX_ZAP_PHASE_MINUTES` | 2 | Per-phase ZAP limit |
-| `WEBX_ZAP_MAX_URLS` | 200 | Planning cost estimate only; does not cap OpenAPI imports or spider URLs (compatible with older bundled OpenAPI add-ons) |
+| `WEBX_ZAP_MAX_URLS` | 200 | Hard cap on captured request structures admitted to route grouping and active scheduling; discovery remains bounded separately by spider duration/depth/children |
+| `WEBX_ZAP_PARAMETERIZED_FIRST` | 1 | Prefer only captured query/body request groups for automatic active scans when such groups exist |
 | `WEBX_ZAP_DELAY_MS` | 200 | Delay for active scanner, one thread per host |
 | `WEBX_EVIDENCE_DIR` | .aixsec-evidence | Private run artifacts |
 
