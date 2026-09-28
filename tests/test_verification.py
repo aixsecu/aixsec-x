@@ -3,12 +3,29 @@ from pathlib import Path
 import tempfile
 import unittest
 from unittest.mock import patch
-from verification import variants, paired
+from verification import variants, paired, discovered_get_probe
 
 URL='https://example.test/search?q=abc'
 ENTRY={'request':{'url':URL,'method':'GET','headers':[]}}
 
 class VerificationTests(unittest.TestCase):
+    def test_discovered_get_quote_parity_creates_candidate_without_extraction(self):
+        from types import SimpleNamespace
+        def response(text):
+            return SimpleNamespace(text=text,content=text.encode(),status_code=200), {}
+        endpoint={'url':'https://example.test/ajax/load_search.php','method':'UNKNOWN',
+                  'parameters':['txt_key'],'sources':['javascript_literal']}
+        with tempfile.TemporaryDirectory() as root, patch('http_engine.HttpSession') as session:
+            session.return_value.request.side_effect=[response(v) for v in
+                ('ok','SQL syntax error','ok','SQL syntax error','ok')]
+            data=discovered_get_probe({'evidence_dir':root},endpoint)
+        self.assertEqual(len(data['alerts']),1)
+        self.assertEqual(data['alerts'][0]['parameter'],'txt_key')
+        self.assertEqual(data['coverage']['requests'],5)
+        self.assertEqual(session.return_value.request.call_count,5)
+        for call in session.return_value.request.call_args_list:
+            self.assertFalse(call.kwargs['follow_redirects'])
+
     def test_variants_preserve_post_context_and_avoid_ambiguous_parameters(self):
         entry={'request':{'url':URL,'method':'POST','postData':{'mimeType':'application/x-www-form-urlencoded','text':'name=bob'}}}
         steps=variants(entry,'name')
