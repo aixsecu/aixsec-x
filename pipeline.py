@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import time
 from pathlib import Path
+from urllib.parse import urlsplit
 from scan_state import Journal, RunLock, ScanBusyError, ScannerHistory, digest
 
 from autonomy import KnowledgeGraph
@@ -505,6 +506,7 @@ def _run(agent, user_text):
     if backend not in ('zap', 'wapiti', 'http', 'none'):
         raise ValueError('WEBX_SCAN_BACKEND must be auto/zap/wapiti/http/none/legacy')
     targets = []
+    discovered_get_candidates = []
     for target in cfg.get('targets', []):
         if '://' not in target and '/' not in target:
             target = 'http://' + target
@@ -529,9 +531,36 @@ def _run(agent, user_text):
             if backend == 'zap':
                 coverage = (baseline_result.get('data') or {}).get('coverage') or {}
                 schedule.collect(coverage)
+                for endpoint in ((baseline_result.get('data') or {}).get('discovery') or {}).get('endpoints', []):
+                    sources=set(endpoint.get('sources') or [])
+                    path=urlsplit(str(endpoint.get('url') or '')).path.lower()
+                    read_like=any(word in path for word in ('search','find','filter','list','load'))
+                    if ('javascript_literal' in sources and read_like
+                            and endpoint.get('method') in ('GET','UNKNOWN') and endpoint.get('parameters')):
+                        discovered_get_candidates.append(endpoint)
     if backend == 'none':
         agent.evidence_store.coverage.extend({'target': u, 'status': 'not_run', 'reason': 'baseline disabled'} for u in targets)
     close_stage('discovery')
+    configured_rules=cfg.get('zap_allowed_rules',[])
+    probe_limit=int(cfg.get('zap_discovered_get_probes',5))
+    if (backend=='zap' and cfg.get('allow_active_scan',False)
+            and cfg.get('zap_auto_active',True) and probe_limit
+            and (configured_rules=='all' or 40018 in configured_rules)):
+        from verification import discovered_get_probe
+        seen=set()
+        for endpoint in discovered_get_candidates:
+            key=(endpoint.get('url'),tuple(endpoint.get('parameters') or []))
+            if key in seen: continue
+            seen.add(key)
+            if len(seen)>probe_limit: break
+            try:
+                data=discovered_get_probe(cfg,endpoint,timeout=min(60,int(cfg.get('tool_timeout',90))))
+                result={'name':'discovered_get_probe','outcome':'ok','output':
+                        f"quote-differential candidates={len(data['alerts'])}",'data':data}
+            except Exception as exc:
+                result={'name':'discovered_get_probe','outcome':'error','output':str(exc),'data':{}}
+            record_result(agent,'discovered_get_probe',{'url':endpoint.get('url'),
+                'parameters':endpoint.get('parameters')},result,baseline=True)
     if backend == 'zap':
         limit_report = schedule.limit(cfg.get('zap_max_urls', 200))
         if limit_report['dropped']:

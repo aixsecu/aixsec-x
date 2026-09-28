@@ -76,6 +76,7 @@ def load_config() -> dict:
         "zap_phase_minutes": int(os.environ.get("WEBX_ZAP_PHASE_MINUTES", "2")),
         "zap_max_urls": int(os.environ.get("WEBX_ZAP_MAX_URLS", "200")),
         "zap_parameterized_first": os.environ.get("WEBX_ZAP_PARAMETERIZED_FIRST", "1") == "1",
+        "zap_discovered_get_probes": max(0, min(20, int(os.environ.get("WEBX_ZAP_DISCOVERED_GET_PROBES", "5")))),
         "zap_delay_ms": int(os.environ.get("WEBX_ZAP_DELAY_MS", "200")),
         "zap_ajax": os.environ.get("WEBX_ZAP_AJAX", "1") == "1",
         "zap_browser": os.environ.get("WEBX_ZAP_BROWSER", "firefox-headless"),

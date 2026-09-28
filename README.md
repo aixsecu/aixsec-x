@@ -278,6 +278,7 @@ Boolean switches use `1` (enabled) and `0` (disabled). Defaults below come from 
 | `WEBX_ZAP_PHASE_MINUTES` | `2` | Per-phase duration in minutes (minimum 1): spider, AJAX, passive wait, active scan/rule. |
 | `WEBX_ZAP_MAX_URLS` | `200` | Hard cap on captured request structures admitted to route grouping and active scanning. The ZAP spider itself remains bounded by phase duration/depth/children. |
 | `WEBX_ZAP_PARAMETERIZED_FIRST` | `1` | When captured parameterized/body requests exist, omit unparameterized groups from automatic active scanning. Set `0` to retain legacy broad scheduling. |
+| `WEBX_ZAP_DISCOVERED_GET_PROBES` | `5` | Maximum read-like JavaScript-discovered GET/UNKNOWN endpoints checked with bounded quote-parity when SQLi rule 40018 is enabled. `0` disables it. |
 | `WEBX_ZAP_DELAY_MS` | `200` | Delay between active scan requests, in milliseconds. |
 | `WEBX_ZAP_AJAX` | `1` | Enable AJAX Spider for browser-driven discovery. |
 | `WEBX_ZAP_BROWSER` | `firefox-headless` | Selenium browser ID for AJAX Spider; requires the corresponding browser/driver. |

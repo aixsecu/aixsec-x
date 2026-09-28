@@ -1,6 +1,7 @@
 """Fresh paired SQL error observations from captured requests; no extraction."""
 import hashlib
 import os
+import re
 from pathlib import Path
 import subprocess
 import signal
@@ -9,6 +10,60 @@ from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from zap_active_evidence import SQL_ERROR
 from scan_state import atomic
+
+
+def discovered_get_probe(config, endpoint, timeout=45):
+    """Bounded quote-parity check for read-like JS-discovered GET endpoints.
+
+    This closes the gap where a JavaScript literal names an endpoint and
+    parameter but no browser interaction captured a request for ZAP to seed.
+    It creates a candidate only; it never extracts data.
+    """
+    import time
+    import http_engine as he
+    from adapters.zap import within
+    from urllib.parse import urlencode, urlsplit, urlunsplit, parse_qsl
+    url=str(endpoint.get('url') or '')
+    parameters=[str(v) for v in endpoint.get('parameters') or [] if str(v)]
+    if endpoint.get('method') not in ('GET','UNKNOWN') or not parameters or not within(url,url):
+        raise ValueError('Discovered GET probe requires a same-origin GET-like endpoint with parameters')
+    sensitive=re.compile(r'csrf|xsrf|token|session|password|secret|api.?key',re.I)
+    parameters=[v for v in parameters if not sensitive.search(v)]
+    if not parameters: raise ValueError('Only sensitive discovered parameters were present')
+    root=Path(config.get('evidence_dir','.aixsec-evidence')).resolve()
+    directory=Path(tempfile.mkdtemp(prefix='discovered-get-',dir=root));path=directory/'pairs.json'
+    session=he.HttpSession('discovered-get-probe',proxies=he.get_proxies())
+    deadline=time.monotonic()+max(5,int(timeout));rows=[];alerts=[]
+    def request(parameter,value,kind):
+        p=urlsplit(url);query=parse_qsl(p.query,keep_blank_values=True);query.append((parameter,value))
+        target=urlunsplit((p.scheme,p.netloc,p.path,urlencode(query),''))
+        remaining=deadline-time.monotonic()
+        if remaining<=0: raise TimeoutError('Discovered GET probe timed out')
+        response,_=session.request('GET',target,headers={'User-Agent':'Mozilla/5.0'},
+            follow_redirects=False,timeout=min(15,max(1,remaining)),max_response_bytes=65536)
+        body=response.content
+        row={'kind':kind,'parameter':parameter,'status':response.status_code,'length':len(body),
+             'sha256':hashlib.sha256(body).hexdigest(),'sql_error':bool(SQL_ERROR.search(response.text))}
+        rows.append(row);atomic(path,rows);return row
+    try:
+        for parameter in parameters:
+            control1=request(parameter,'test','control');payload1=request(parameter,"test'",'payload')
+            control2=request(parameter,'test','control');payload2=request(parameter,"test'",'payload')
+            escaped=request(parameter,"test''",'escaped')
+            stable_controls=(control1['status'],control1['sha256'])==(control2['status'],control2['sha256'])
+            stable_payloads=(payload1['status'],payload1['sha256'])==(payload2['status'],payload2['sha256'])
+            payload_diff=(payload1['status'],payload1['sha256'])!=(control1['status'],control1['sha256'])
+            escaped_matches=(escaped['status'],escaped['sha256'])==(control1['status'],control1['sha256'])
+            if stable_controls and stable_payloads and payload_diff and escaped_matches:
+                alerts.append({'category':'SQL Injection','rule_id':'aixsec-quote-differential',
+                    'severity':'high','url':url,'method':'GET','parameter':parameter,
+                    'auth_context':'anonymous','artifact_ref':str(path),
+                    'description':'Stable quote differential reproduced twice and escaped quote matched controls. Candidate only; no data extraction was attempted.',
+                    'response_sha256':payload1['sha256']})
+    finally:
+        session.s.close();atomic(path,rows)
+    return {'alerts':alerts,'coverage':{'tool':'discovered_get_probe','target':url,
+        'status':'complete','requests':len(rows),'report_path':str(path),'auth_context':'anonymous'}}
 
 
 def variants(entry, parameter, selector=None):

@@ -185,6 +185,7 @@ Warnings, malformed reports and incomplete authentication cannot report complete
 | `WEBX_ZAP_PHASE_MINUTES` | 2 | Per-phase ZAP limit |
 | `WEBX_ZAP_MAX_URLS` | 200 | Hard cap on captured request structures admitted to route grouping and active scheduling; discovery remains bounded separately by spider duration/depth/children |
 | `WEBX_ZAP_PARAMETERIZED_FIRST` | 1 | Prefer only captured query/body request groups for automatic active scans when such groups exist |
+| `WEBX_ZAP_DISCOVERED_GET_PROBES` | 5 | Bounded quote-parity probes for read-like JavaScript-discovered GET/UNKNOWN endpoints when SQLi rule 40018 is enabled; no extraction |
 | `WEBX_ZAP_DELAY_MS` | 200 | Delay for active scanner, one thread per host |
 | `WEBX_EVIDENCE_DIR` | .aixsec-evidence | Private run artifacts |
 
