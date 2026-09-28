@@ -161,6 +161,8 @@ def drive(jobs, start, workers=2, cookie_mode='strict', policy=None, auto=None, 
         if block:
             scheduler_idle_ns += time.perf_counter_ns()-wait_started
         if not done and block:
+            from terminal_output import event
+            event('stage', 'zap_active', f'{completed}/{len(jobs)} jobs finished')
             print(f'[zap] {completed}/{len(jobs)} groups finished; {len(pending)} running', flush=True)
         for future in done:
             generator, _, _ = pending.pop(future)
@@ -174,6 +176,8 @@ def drive(jobs, start, workers=2, cookie_mode='strict', policy=None, auto=None, 
                 if isinstance(finished.value, dict) and finished.value.get('outcome') in ('blocked', 'denied'):
                     stop = True
                     stop_reason = str(finished.value.get('output') or finished.value['outcome'])
+            from terminal_output import event
+            event('stage', 'zap_active', f'{completed}/{len(jobs)} jobs finished')
             print(f'[zap] {completed}/{len(jobs)} groups finished', flush=True)
 
     try:

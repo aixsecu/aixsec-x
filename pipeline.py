@@ -529,6 +529,8 @@ def _run(agent, user_text):
         agent.evidence_store.coverage.extend({'target': u, 'status': 'not_run', 'reason': 'baseline disabled'} for u in targets)
     close_stage('discovery')
     if cfg.get('zap_route_family_mode', True):
+        from terminal_output import event
+        event('stage', 'route_family')
         from route_family import RepresentativeSelector,RouteFamilyBuilder
         route_family_path=journal.directory/'family.json'
         route_family_report=RouteFamilyBuilder().write(schedule.entries,route_family_path)

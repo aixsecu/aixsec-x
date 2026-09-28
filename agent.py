@@ -24,6 +24,7 @@ import time
 from urllib.parse import urljoin
 
 # ── local imports ──
+from terminal_output import TerminalOutput, prompt as terminal_prompt
 from config import load_config
 from inventory import Inventory, TestHistory
 from ledger import (Ledger, parse_findings_json, render_markdown, validation_plan,
@@ -493,7 +494,7 @@ class WebXAgent:
             if spec.risk == "safe":
                 return True
             try:
-                ans = input(f"\n[APPROVAL] '{spec.name}' risk [{spec.risk}] — run? [y/N] ").strip().lower()
+                ans = terminal_prompt(f"\n[APPROVAL] '{spec.name}' risk [{spec.risk}] — run? [y/N] ").strip().lower()
             except EOFError:
                 return False
             return ans == "y"
@@ -1678,7 +1679,7 @@ def _print_banner(cfg: dict, scope: str = "", missing=None, mode: str = "interac
     print(_banner(cfg, scope=scope, missing=missing, mode=mode), flush=True)
 
 
-def main():
+def _main():
     cfg = load_config()
 
     # Chẩn đoán kết nối Ollama (không cần target/scope) — dùng nhiều nhất
@@ -1704,6 +1705,8 @@ def main():
         sys.exit(1)
 
     agent = WebXAgent(config=cfg)
+    from terminal_output import event
+    event("bind", agent)
 
     # v1.6.0 (#14): --capabilities — in bảng tool/binary/version rồi thoát
     if "--capabilities" in sys.argv:
@@ -1731,10 +1734,12 @@ def main():
             "Hãy phân tích và khai thác target trong scope. Bắt đầu bằng recon rồi active check. Khi đủ dữ liệu trả JSON findings."
         if cfg.get("autonomy_enabled"):
             result = agent.run_autonomous("coverage")
+            event("completed", result)
             print("\n" + json.dumps(result, ensure_ascii=False, indent=2)[:3000])
-            agent.save_inventory()
+            event("output_file", "Attack surface", agent.save_inventory())
             return
         result = agent.run(prompt_text)
+        event("completed", result)
         if result.get("busy"):
             print("\n" + result['final_text'])
             return
@@ -1742,8 +1747,11 @@ def main():
             print("\n" + result.get("llm_note", ""))
         print("\n" + result.get("final_text", ""))
         _print_findings(agent)
-        print(f"\n[*] Report: {agent.export_report()}")
+        report_path = agent.export_report()
+        event("output_file", "Report", report_path)
+        print(f"\n[*] Report: {report_path}")
         inv_path = agent.save_inventory()   # v1.6.0: WEBX_INVENTORY_FILE
+        event("output_file", "Attack surface", inv_path)
         if inv_path:
             print(f"[*] Attack surface: {inv_path}")
         return
@@ -1755,9 +1763,9 @@ def main():
           f"{GREEN}'/context-metrics'{RESET}{DIM}.{RESET}", flush=True)
     while True:
         try:
-            line = input(f"\n{BOLD}{GREEN}root@aixsec-x{RESET}{DIM}:~#{RESET} ").strip()
+            line = terminal_prompt(f"\n{BOLD}{GREEN}root@aixsec-x{RESET}{DIM}:~#{RESET} ").strip()
         except (EOFError, KeyboardInterrupt):
-            print("\n[!] Exiting.")
+            print("\n[!] Exiting.", file=sys.stderr)
             break
         if not line:
             continue
@@ -1783,21 +1791,43 @@ def main():
             continue
         if line == "/autonomy" or line.startswith("/autonomy "):
             goal = line.partition(" ")[2].strip() or "coverage"
-            print(json.dumps(agent.run_autonomous(goal), ensure_ascii=False, indent=2))
-            agent.save_inventory()
+            with TerminalOutput(verbose=_verbose()) as terminal:
+                terminal.bind(agent)
+                result = agent.run_autonomous(goal)
+                event("completed", result)
+                print(json.dumps(result, ensure_ascii=False, indent=2))
+                event("output_file", "Attack surface", agent.save_inventory())
             continue
-        result = agent.run(line)
-        if result.get("busy"):
-            print("\n" + result['final_text'])
-            continue
-        if result.get("llm_down"):
-            print("\n" + result.get("llm_note", ""))
-        print("\n" + (result.get("final_text", "") or "(no response)"))
-        if result.get("overall_summary"):
-            print(f"\n[RISK] {result['risk_level']}\n[SUMMARY] {result['overall_summary']}")
-        _print_findings(agent)
-        agent.save_inventory()   # v1.6.0: WEBX_INVENTORY_FILE (nếu set)
+        with TerminalOutput(verbose=_verbose()) as terminal:
+            terminal.bind(agent)
+            result = agent.run(line)
+            event("completed", result)
+            if result.get("busy"):
+                print("\n" + result['final_text'])
+                continue
+            if result.get("llm_down"):
+                print("\n" + result.get("llm_note", ""))
+            print("\n" + (result.get("final_text", "") or "(no response)"))
+            if result.get("overall_summary"):
+                print(f"\n[RISK] {result['risk_level']}\n[SUMMARY] {result['overall_summary']}")
+            _print_findings(agent)
+            event("output_file", "Attack surface", agent.save_inventory())
 
+
+
+def _verbose():
+    return "--verbose" in sys.argv or "--debug" in sys.argv or os.environ.get("WEBX_VERBOSE", "").lower() in ("1", "true", "yes")
+
+
+def main():
+    batch = any(flag in sys.argv for flag in ("--non-interactive", "-n", "--oneshot"))
+    utility = any(flag in sys.argv for flag in ("--check-ollama", "--capabilities"))
+    cfg = load_config()
+    if batch and not utility and (cfg.get("targets") or cfg.get("src_dirs")):
+        with TerminalOutput(verbose=_verbose()):
+            _main()
+    else:
+        _main()
 
 if __name__ == "__main__":
     main()

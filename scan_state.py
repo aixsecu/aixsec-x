@@ -61,6 +61,8 @@ class Journal:
     def stage(self, name, status, reason=''):
         self.data['stages'][name] = {**self.data['stages'].get(name, {}), 'status':status, 'reason':reason}
         self.save()
+        from terminal_output import event
+        event("stage", name, status, reason)
         print(f'[stage] {name}: {status}' + (f' — {reason}' if reason else ''), flush=True)
 
     def cached(self, key):
