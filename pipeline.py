@@ -532,6 +532,11 @@ def _run(agent, user_text):
     if backend == 'none':
         agent.evidence_store.coverage.extend({'target': u, 'status': 'not_run', 'reason': 'baseline disabled'} for u in targets)
     close_stage('discovery')
+    if backend == 'zap':
+        limit_report = schedule.limit(cfg.get('zap_max_urls', 200))
+        if limit_report['dropped']:
+            print(f"[zap] active input cap: retained {limit_report['after']}/{limit_report['before']} "
+                  f"request structures (WEBX_ZAP_MAX_URLS={limit_report['configured']})", flush=True)
     if cfg.get('zap_route_family_mode', True):
         from terminal_output import event
         event('stage', 'route_family')
@@ -593,6 +598,15 @@ def _run(agent, user_text):
                                   if representative_report is None or not cfg.get('family_scan',True)
                                   or request_id in selected), key=lambda e: (
             not bool(e['structure']['query'] or e['structure']['body']), e['url']))
+        if cfg.get('zap_parameterized_first', True):
+            parameterized = [row for row in representatives
+                             if row['structure'].get('query') or row['structure'].get('body')]
+            if parameterized:
+                skipped_unparameterized = len(representatives) - len(parameterized)
+                representatives = parameterized
+                if skipped_unparameterized:
+                    print(f'[zap] skipped {skipped_unparameterized} unparameterized active groups; '
+                          'parameterized groups are available', flush=True)
         workers = max(1, min(8, int(cfg.get('zap_workers', 2))))
         if active_rules and representatives:
             from zap_workers import batch_jobs, drive, scheduling_summary

@@ -39,6 +39,21 @@ class FamilyTests(unittest.TestCase):
                          family(request(BASE+'users/aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee')))
 
 class ScheduleTests(unittest.TestCase):
+    def test_active_limit_prioritizes_parameterized_and_body_shapes(self):
+        with tempfile.TemporaryDirectory() as root:
+            har=Path(root)/'traffic.har'
+            har.write_text(json.dumps({'log':{'entries':[
+                entry(request(BASE+'plain')),
+                entry(request(BASE+'search?q=a')),
+                entry(request(BASE+'submit','POST',{'mimeType':'application/json','text':'{"q":"a"}'})),
+            ]}}))
+            schedule=ScanSchedule(root);schedule.collect({'har_path':str(har),'target':BASE})
+            report=schedule.limit(2)
+            self.assertEqual(report,{'configured':2,'before':3,'after':2,'dropped':1})
+            self.assertTrue(all(row['structure']['query'] or row['structure']['body']
+                                for row in schedule.entries.values()))
+            self.assertEqual(schedule.summary([])['active_input_limit'],report)
+
     def test_recorded_responses_remain_deduplicated(self):
         with tempfile.TemporaryDirectory() as root:
             schedule = ScanSchedule(root)

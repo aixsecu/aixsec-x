@@ -269,13 +269,15 @@ Boolean switches use `1` (enabled) and `0` (disabled). Defaults below come from 
 |---|---|---|
 | `WEBX_ZAP_EXECUTABLE` | `zap.sh` | ZAP executable name/path. Kali can use zaproxy; default discovery also searches platform-specific installations. |
 | `WEBX_ZAP_WORKERS` | `2` | Active ZAP workers (1–8). Anonymous GET/HEAD groups without credentials run concurrently; session-bearing requests and other methods run serially. |
+| `WEBX_ZAP_STARTUP_TIMEOUT` | `120` | Seconds allowed for a persistent ZAP worker to become API-ready. Timed-out processes are terminated so their port/home can be reused safely. |
 | `WEBX_ZAP_CONCURRENCY_FILE` | *(empty)* | JSON policy by origin, auth_context and path: `parallel_read` for declared independent reads including authenticated captures; `serial` takes precedence. Does not create new sessions; see worker guide. |
 | `WEBX_ZAP_COOKIE_PARALLEL` | `auto` | `auto`: fresh controls, one worker/origin initially, up to two after a stable trial, back to one on instability. `strict`: serialize cookies; `guest`: operator opt-in for guest cookies. Explicit policy takes precedence. |
 | `WEBX_ZAP_ROUTE_GROUPS_FILE` | *(empty)* | Operator-owned JSON route groups for slug deduplication; empty preserves default structural grouping. See the worker guide below. |
 | `WEBX_ZAP_TIMEOUT` | `600` | Timeout in seconds for each ZAP process, not the whole session. |
 | `WEBX_ZAP_STRENGTH` | `Medium` | Active scan strength: Low, Medium, High or Insane; higher levels send more payloads. |
 | `WEBX_ZAP_PHASE_MINUTES` | `2` | Per-phase duration in minutes (minimum 1): spider, AJAX, passive wait, active scan/rule. |
-| `WEBX_ZAP_MAX_URLS` | `200` | Planning estimate only; not a strict limit on discovered or scanned URLs. |
+| `WEBX_ZAP_MAX_URLS` | `200` | Hard cap on captured request structures admitted to route grouping and active scanning. The ZAP spider itself remains bounded by phase duration/depth/children. |
+| `WEBX_ZAP_PARAMETERIZED_FIRST` | `1` | When captured parameterized/body requests exist, omit unparameterized groups from automatic active scanning. Set `0` to retain legacy broad scheduling. |
 | `WEBX_ZAP_DELAY_MS` | `200` | Delay between active scan requests, in milliseconds. |
 | `WEBX_ZAP_AJAX` | `1` | Enable AJAX Spider for browser-driven discovery. |
 | `WEBX_ZAP_BROWSER` | `firefox-headless` | Selenium browser ID for AJAX Spider; requires the corresponding browser/driver. |

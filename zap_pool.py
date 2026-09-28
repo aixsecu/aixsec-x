@@ -58,14 +58,16 @@ class ZapWorker:
         if not isinstance(value,dict): raise WorkerError('Malformed ZAP API response')
         return value
 
-    def start(self, command, timeout=45):
+    def start(self, command, timeout=120):
         self.workspace.mkdir(parents=True,exist_ok=True,mode=0o700)
         log_path=self.workspace/'worker.log'
         self._log=log_path.open('a')
         began=_milliseconds();self.started_ms=began
         self.process=subprocess.Popen(command+['-daemon','-host','127.0.0.1','-port',str(self.port),
             '-dir',str(self.workspace/'home'),'-config','api.disablekey=true',
-            '-config','api.addrs.addr.name=127.0.0.1','-config','api.addrs.addr.regex=false'],
+            '-config','api.addrs.addr.name=127.0.0.1','-config','api.addrs.addr.regex=false',
+            '-config','autoupdate.checkOnStart=false',
+            '-config','autoupdate.downloadNewRelease=false'],
             stdout=self._log,stderr=subprocess.STDOUT,start_new_session=True,
             env={k:v for k,v in os.environ.items() if not k.startswith('ZAP_AUTH_HEADER')})
         deadline=time.monotonic()+timeout
@@ -76,7 +78,10 @@ class ZapWorker:
                 self.startup_ms=_milliseconds()-began;self.state=WorkerState.HEALTHY;return
             except (HTTPError,URLError,TimeoutError,OSError,ValueError,WorkerError): time.sleep(.1)
         self.state=WorkerState.DEAD
-        raise WorkerError(f'ZAP worker {self.worker_id} did not become ready')
+        # A process can become ready just after the deadline. Always terminate
+        # it so the worker home and port are not left locked for retries.
+        self.close()
+        raise WorkerError(f'ZAP worker {self.worker_id} did not become ready within {timeout}s')
 
     def healthy(self):
         if self.state==WorkerState.DEAD or self.process is None or self.process.poll() is not None: return False
@@ -185,6 +190,7 @@ class WorkerPool:
         self.size=max(1,int(config.get('zap_workers',2)));self.root=Path(config.get('evidence_dir') or '.aixsec-evidence').resolve()/'zap-workers'
         self.max_jobs=max(1,int(config.get('zap_worker_max_jobs',100)))
         self.memory_limit_mb=max(0,int(config.get('zap_worker_memory_mb',0)))
+        self.startup_timeout=max(15,int(config.get('zap_startup_timeout',120)))
         self._available=queue.Queue(self.size);self._workers=[];self._lock=threading.Lock();self._closed=False
         self.metrics={'jvm_created':0,'jobs':0,'reused_jobs':0,'recycled':0,'crashes':0,
                       'acquire_wait_ms':0.0,'worker_busy_ms':0.0}
@@ -192,7 +198,15 @@ class WorkerPool:
     def _new_worker(self,index):
         worker=ZapWorker(index,self.binary,self.port_factory(),self.root/f'worker-{index}',
                          self.max_jobs,self.memory_limit_mb)
-        worker.start(self.command);self.metrics['jvm_created']+=1;return worker
+        try:
+            worker.start(self.command,self.startup_timeout)
+        except BaseException:
+            # Failure happens before registration in _workers, so close here.
+            if worker.process is not None and worker.process.poll() is None:
+                worker.close()
+            self.port_releaser(worker.port)
+            raise
+        self.metrics['jvm_created']+=1;return worker
 
     def start(self):
         with self._lock:

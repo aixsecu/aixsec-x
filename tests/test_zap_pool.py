@@ -79,8 +79,31 @@ class WorkerPoolTests(unittest.TestCase):
         pool,created=self.pool(2);pool.start();pool.close()
         self.assertTrue(all(worker.closed for worker in created));self.assertTrue(pool._closed)
 
+    def test_startup_timeout_is_forwarded_and_failed_port_released(self):
+        root=tempfile.TemporaryDirectory();self.addCleanup(root.cleanup)
+        released=[]
+        pool=WorkerPool({'evidence_dir':root.name,'zap_workers':1,
+                         'zap_startup_timeout':77},'zap',['zap'],lambda:12345,released.append)
+        with patch.object(ZapWorker,'start',side_effect=WorkerError('boom')) as start:
+            with self.assertRaises(WorkerError): pool._new_worker(0)
+        start.assert_called_once_with(['zap'],77)
+        self.assertEqual(released,[12345])
+
 
 class ZapWorkerTests(unittest.TestCase):
+    def test_start_timeout_closes_process_and_disables_updates(self):
+        worker=ZapWorker(1,'zap',1234,MagicMock())
+        process=MagicMock();process.poll.return_value=None
+        with patch('zap_pool.subprocess.Popen',return_value=process) as popen, \
+                patch.object(worker,'_api',side_effect=OSError('not ready')), \
+                patch('zap_pool.time.monotonic',side_effect=[0,16]), \
+                patch.object(worker,'close') as close:
+            with self.assertRaisesRegex(WorkerError,'within 15s'):
+                worker.start(['zap'],timeout=15)
+        close.assert_called_once()
+        command=popen.call_args.args[0]
+        self.assertIn('autoupdate.checkOnStart=false',command)
+        self.assertIn('autoupdate.downloadNewRelease=false',command)
     def test_reset_clears_only_job_state(self):
         worker=ZapWorker(1,'zap',1234,MagicMock())
         worker.process=MagicMock();worker.process.poll.return_value=None;worker.state=WorkerState.HEALTHY
