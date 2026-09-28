@@ -21,6 +21,7 @@ SCHEMA_FIELDS = (
 SUPPORTED_TOOLS = {
     "zap_baseline", "zap_active_scan", "nuclei_scan", "sqlmap_runner",
     "sqlmap_check", "ffuf_dir", "http_request", "http_probe", "sql_error_verify",
+    "discovered_get_probe", "discovered_search_form_probe",
 }
 
 
@@ -40,12 +41,15 @@ def _capability(tool):
         "http_request":Capability.HTTP_OBSERVATION,
         "http_probe":Capability.PASSIVE_HTTP_ANALYSIS,
         "sql_error_verify":Capability.SQL_INJECTION_VERIFICATION,
+        "discovered_get_probe":Capability.SQL_INJECTION_VERIFICATION,
+        "discovered_search_form_probe":Capability.SQL_INJECTION_VERIFICATION,
     }
     return explicit.get(tool) or registry().capability_for_tool(tool) or "unclassified"
 
 
 def _rows(tool, result, args, data):
-    if tool in {"zap_baseline","zap_active_scan","nuclei_scan","sql_error_verify"}:
+    if tool in {"zap_baseline","zap_active_scan","nuclei_scan","sql_error_verify",
+                "discovered_get_probe","discovered_search_form_probe"}:
         return data.get("alerts") or [], True
     if tool in {"sqlmap_runner","sqlmap_check"}:
         rows=[];output=str(result.get("output") or "")

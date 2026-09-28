@@ -87,12 +87,20 @@ class TerminalOutput:
             self.screen.flush()
 
     def finding(self, finding):
-        if finding.status != 'confirmed' or finding.key in self.seen or self.closed_output:
+        visible = finding.status == 'confirmed' or (
+            finding.status in ('candidate','needs_validation')
+            and finding.severity.lower() in ('critical','high'))
+        marker = (finding.key, finding.status)
+        if not visible or marker in self.seen or self.closed_output:
             return
         with self.lock:
-            self.seen.add(finding.key)
+            self.seen.add(marker)
             self.clear()
-            line = f'[{clean(finding.severity.upper())}] {clean(finding.name)}\n'
+            suffix = '' if finding.status == 'confirmed' else ' [CANDIDATE — needs validation]'
+            detail = f' — {clean(finding.method)} {clean(finding.url)}'
+            if finding.parameter:
+                detail += f' (param={clean(finding.parameter)})'
+            line = f'[{clean(finding.severity.upper())}] {clean(finding.name)}{suffix}{detail}\n'
             self.log.write(line)
             self.screen.write(line)
             self.screen.flush()
@@ -132,6 +140,17 @@ class TerminalOutput:
         for severity in ('critical', 'high', 'medium', 'low', 'info'):
             rows.append(f'  {severity.title()}: {sum(f.status == "confirmed" and f.severity.lower() == severity for f in findings)}')
         rows.append(f'  Awaiting validation: {sum(f.status in ("candidate", "needs_validation") for f in findings)}')
+        priority = [f for f in findings if f.status in ('candidate','needs_validation')
+                    and f.severity.lower() in ('critical','high')]
+        rows += ['', 'High-priority candidates']
+        if priority:
+            for finding in priority:
+                location = f'{clean(finding.method)} {clean(finding.url)}'
+                if finding.parameter:
+                    location += f' (param={clean(finding.parameter)})'
+                rows.append(f'  [{clean(finding.severity.upper())}] {clean(finding.name)} — {location}')
+        else:
+            rows.append('  None')
         coverage = result.get('coverage', [])
         rows += ['', 'Coverage']
         if coverage:
