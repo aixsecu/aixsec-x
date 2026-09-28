@@ -66,6 +66,69 @@ def discovered_get_probe(config, endpoint, timeout=45):
         'status':'complete','requests':len(rows),'report_path':str(path),'auth_context':'anonymous'}}
 
 
+def discovered_search_form_probe(config, form, timeout=45):
+    """Bounded quote-parity check for an anonymous GET/POST search form."""
+    import time
+    import http_engine as he
+    from adapters.zap import within
+    url=str(form.get('action') or '')
+    method=str(form.get('method') or '').upper()
+    parameters=[str(v) for v in form.get('parameters') or [] if str(v)]
+    if method not in ('GET','POST') or not parameters or not within(url,url):
+        raise ValueError('Discovered form probe requires a same-origin GET/POST form with parameters')
+    search=re.compile(r'(?:^|[_-])(q|query|search|keyword|key|term)(?:$|[_-])|timkiem|txt.?key',re.I)
+    sensitive=re.compile(r'csrf|xsrf|token|session|password|secret|api.?key',re.I)
+    candidates=[v for v in parameters if search.search(v) and not sensitive.search(v)]
+    if not candidates:
+        raise ValueError('Discovered form is not a search form')
+    root=Path(config.get('evidence_dir','.aixsec-evidence')).resolve()
+    directory=Path(tempfile.mkdtemp(prefix='discovered-form-',dir=root));path=directory/'pairs.json'
+    session=he.HttpSession('discovered-form-probe',proxies=he.get_proxies())
+    deadline=time.monotonic()+max(5,int(timeout));rows=[];alerts=[]
+    def request(parameter,value,kind):
+        remaining=deadline-time.monotonic()
+        if remaining<=0: raise TimeoutError('Discovered form probe timed out')
+        body={name:'' for name in parameters};body[parameter]=value
+        target=url
+        kwargs={'headers':{'User-Agent':'Mozilla/5.0'},'follow_redirects':False,
+                'timeout':min(15,max(1,remaining)),'max_response_bytes':65536}
+        if method == 'GET':
+            from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+            parsed=urlsplit(url)
+            query=parse_qsl(parsed.query,keep_blank_values=True)
+            supplied=set(body)
+            query=[(name,existing) for name,existing in query if name not in supplied]
+            query.extend(body.items())
+            target=urlunsplit((parsed.scheme,parsed.netloc,parsed.path,urlencode(query),''))
+        else:
+            kwargs['form']=body
+        response,_=session.request(method,target,**kwargs)
+        content=response.content
+        row={'kind':kind,'parameter':parameter,'status':response.status_code,'length':len(content),
+             'sha256':hashlib.sha256(content).hexdigest(),'sql_error':bool(SQL_ERROR.search(response.text))}
+        rows.append(row);atomic(path,rows);return row
+    try:
+        for parameter in candidates:
+            control1=request(parameter,'test','control');payload1=request(parameter,"test'",'payload')
+            control2=request(parameter,'test','control');payload2=request(parameter,"test'",'payload')
+            escaped=request(parameter,"test''",'escaped')
+            stable_controls=(control1['status'],control1['sha256'])==(control2['status'],control2['sha256'])
+            stable_payloads=(payload1['status'],payload1['sha256'])==(payload2['status'],payload2['sha256'])
+            payload_diff=(payload1['status'],payload1['sha256'])!=(control1['status'],control1['sha256'])
+            escaped_matches=(escaped['status'],escaped['sha256'])==(control1['status'],control1['sha256'])
+            blocked=payload1['status'] in (401,403) or control1['status'] in (401,403)
+            if stable_controls and stable_payloads and payload_diff and escaped_matches and not blocked:
+                alerts.append({'category':'SQL Injection','rule_id':'aixsec-form-quote-differential',
+                    'severity':'high','url':url,'method':method,'parameter':parameter,
+                    'auth_context':'anonymous','artifact_ref':str(path),
+                    'description':'Stable search-form quote differential reproduced twice and escaped quote matched controls. Candidate only; no data extraction was attempted.',
+                    'response_sha256':payload1['sha256']})
+    finally:
+        session.s.close();atomic(path,rows)
+    return {'alerts':alerts,'coverage':{'tool':'discovered_search_form_probe','target':url,
+        'status':'complete','requests':len(rows),'report_path':str(path),'auth_context':'anonymous'}}
+
+
 def variants(entry, parameter, selector=None):
     from request_inputs import inputs, mutate
     req=entry['request']

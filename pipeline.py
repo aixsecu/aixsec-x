@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import re
 import time
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -507,6 +508,7 @@ def _run(agent, user_text):
         raise ValueError('WEBX_SCAN_BACKEND must be auto/zap/wapiti/http/none/legacy')
     targets = []
     discovered_get_candidates = []
+    discovered_form_candidates = []
     for target in cfg.get('targets', []):
         if '://' not in target and '/' not in target:
             target = 'http://' + target
@@ -538,6 +540,14 @@ def _run(agent, user_text):
                     if ('javascript_literal' in sources and read_like
                             and endpoint.get('method') in ('GET','UNKNOWN') and endpoint.get('parameters')):
                         discovered_get_candidates.append(endpoint)
+                for form in ((baseline_result.get('data') or {}).get('discovery') or {}).get('forms', []):
+                    path=urlsplit(str(form.get('action') or '')).path.lower()
+                    params=[str(v).lower() for v in form.get('parameters') or []]
+                    search_like=(any(word in path for word in ('search','find','timkiem','tim-kiem'))
+                                 or any(re.search(r'(^|[_-])(q|query|search|keyword|key|term)($|[_-])|timkiem|txt.?key',v)
+                                        for v in params))
+                    if str(form.get('method') or '').upper() in ('GET','POST') and search_like:
+                        discovered_form_candidates.append(form)
     if backend == 'none':
         agent.evidence_store.coverage.extend({'target': u, 'status': 'not_run', 'reason': 'baseline disabled'} for u in targets)
     close_stage('discovery')
@@ -561,11 +571,39 @@ def _run(agent, user_text):
                 result={'name':'discovered_get_probe','outcome':'error','output':str(exc),'data':{}}
             record_result(agent,'discovered_get_probe',{'url':endpoint.get('url'),
                 'parameters':endpoint.get('parameters')},result,baseline=True)
+    form_probe_limit=int(cfg.get('zap_discovered_form_probes',5))
+    if (backend=='zap' and cfg.get('allow_active_scan',False)
+            and cfg.get('zap_auto_active',True) and form_probe_limit
+            and (configured_rules=='all' or 40018 in configured_rules)):
+        from verification import discovered_search_form_probe
+        seen=set()
+        for form in discovered_form_candidates:
+            key=(form.get('action'),tuple(form.get('parameters') or []))
+            if key in seen: continue
+            seen.add(key)
+            if len(seen)>form_probe_limit: break
+            try:
+                data=discovered_search_form_probe(cfg,form,timeout=min(60,int(cfg.get('tool_timeout',90))))
+                result={'name':'discovered_search_form_probe','outcome':'ok','output':
+                        f"quote-differential candidates={len(data['alerts'])}",'data':data}
+            except Exception as exc:
+                result={'name':'discovered_search_form_probe','outcome':'error','output':str(exc),'data':{}}
+            record_result(agent,'discovered_search_form_probe',{'url':form.get('action'),
+                'parameters':form.get('parameters')},result,baseline=True)
     if backend == 'zap':
         limit_report = schedule.limit(cfg.get('zap_max_urls', 200))
         if limit_report['dropped']:
             print(f"[zap] active input cap: retained {limit_report['after']}/{limit_report['before']} "
                   f"request structures (WEBX_ZAP_MAX_URLS={limit_report['configured']})", flush=True)
+        if cfg.get('zap_parameterized_first', True):
+            parameterized = {key:row for key,row in schedule.entries.items()
+                             if row['structure'].get('query') or row['structure'].get('body')}
+            if parameterized:
+                skipped_unparameterized = len(schedule.entries)-len(parameterized)
+                schedule.entries = parameterized
+                if skipped_unparameterized:
+                    print(f'[zap] skipped {skipped_unparameterized} unparameterized active groups; '
+                          'parameterized groups are available', flush=True)
     if cfg.get('zap_route_family_mode', True):
         from terminal_output import event
         event('stage', 'route_family')
@@ -627,15 +665,6 @@ def _run(agent, user_text):
                                   if representative_report is None or not cfg.get('family_scan',True)
                                   or request_id in selected), key=lambda e: (
             not bool(e['structure']['query'] or e['structure']['body']), e['url']))
-        if cfg.get('zap_parameterized_first', True):
-            parameterized = [row for row in representatives
-                             if row['structure'].get('query') or row['structure'].get('body')]
-            if parameterized:
-                skipped_unparameterized = len(representatives) - len(parameterized)
-                representatives = parameterized
-                if skipped_unparameterized:
-                    print(f'[zap] skipped {skipped_unparameterized} unparameterized active groups; '
-                          'parameterized groups are available', flush=True)
         workers = max(1, min(8, int(cfg.get('zap_workers', 2))))
         if active_rules and representatives:
             from zap_workers import batch_jobs, drive, scheduling_summary

@@ -23,7 +23,7 @@ class TerminalTests(unittest.TestCase):
                 with terminal:
                     event('bind', agent)
                     f = agent.ledger.add(Finding('SQL Injection', severity='critical'))
-                    self.assertNotIn('[CRITICAL]', screen.getvalue())
+                    self.assertIn('[CRITICAL] SQL Injection [CANDIDATE', screen.getvalue())
                     agent.ledger.transition(f, 'needs_validation')
                     agent.ledger.transition(f, 'confirmed')
                     self.assertIn('[CRITICAL] SQL Injection', screen.getvalue())
@@ -38,7 +38,7 @@ class TerminalTests(unittest.TestCase):
                     event('output_file', 'Report', 'report.json')
                     print('JVM shutdown complete')
                 output = screen.getvalue()
-                self.assertEqual(output.count('[CRITICAL] SQL Injection'), 1)
+                self.assertEqual(output.count('[CRITICAL] SQL Injection'), 3)
                 self.assertEqual('[scheduler]' in output, verbose)
                 self.assertTrue(output.endswith('=' * 50 + '\n'))
                 self.assertIn('  Critical: 1', output)

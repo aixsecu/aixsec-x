@@ -36,6 +36,26 @@ def baseline(root):
 
 
 class SequentialTests(unittest.TestCase):
+    def test_discovered_post_search_form_is_probed_without_har_submission(self):
+        with tempfile.TemporaryDirectory() as root:
+            seed=baseline(root)
+            seed=(seed[0],{**seed[1], 'discovery': {'forms': [{
+                'page': URL, 'action': URL+'WebTinTuc/TimKiem', 'method': 'POST',
+                'parameters': ['keyword'], 'state': 'discovered'}]}})
+            alert={'category':'SQL Injection','rule_id':'aixsec-form-quote-differential',
+                   'severity':'high','url':URL+'WebTinTuc/TimKiem','method':'POST',
+                   'parameter':'keyword','auth_context':'anonymous'}
+            probe={'alerts':[alert],'coverage':{'tool':'discovered_search_form_probe',
+                   'target':alert['url'],'status':'complete','requests':5}}
+            with patch.object(TOOL_INDEX['zap_baseline'],'exec_fn',return_value=seed), \
+                 patch.object(TOOL_INDEX['zap_active_scan'],'exec_fn',return_value=('ok',{'coverage':{'status':'complete'}})), \
+                 patch('verification.discovered_search_form_probe',return_value=probe) as form_probe, \
+                 contextlib.redirect_stdout(io.StringIO()):
+                result=WebXAgent(config(root,nuclei_enabled=False)).run('scan')
+            form_probe.assert_called_once()
+            self.assertTrue(any(f['name']=='SQL Injection' and f['method']=='POST'
+                                and f['parameter']=='keyword' for f in result['findings']))
+
     def test_capability_engine_integration_persists_decisions_and_filters_rules(self):
         with tempfile.TemporaryDirectory() as root:
             cfg = config(root, technology_capability_engine=True,
