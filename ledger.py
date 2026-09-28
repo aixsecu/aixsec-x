@@ -82,14 +82,20 @@ class Ledger:
                 old.parameter = f.parameter
             if self._STATUS_RANK.get(f.status, 1) > self._STATUS_RANK.get(old.status, 1):
                 old.status = f.status
+            from terminal_output import event
+            event("finding", old)
             return old
         self.findings[f.key] = f
+        from terminal_output import event
+        event("finding", f)
         return f
 
     def transition(self, f: Finding, new_status: str) -> bool:
         if new_status not in VALID_TRANSITIONS.get(f.status, set()):
             return False
         f.status = new_status
+        from terminal_output import event
+        event("finding", f)
         return True
 
     def by_status(self, status: str) -> list[Finding]:
