@@ -36,6 +36,32 @@ def baseline(root):
 
 
 class SequentialTests(unittest.TestCase):
+    def test_capability_engine_integration_persists_decisions_and_filters_rules(self):
+        with tempfile.TemporaryDirectory() as root:
+            cfg = config(root, technology_capability_engine=True,
+                         planner_mode='balanced', nuclei_enabled=False,
+                         zap_allowed_rules='all')
+            rules = [{'id': 40018, 'name': 'SQL Injection'},
+                     {'id': 90001, 'name': 'GraphQL introspection'}]
+            seed = baseline(root)
+            seed = (seed[0], {**seed[1], 'active_rules': rules,
+                'discovery': {'endpoints': [{'url': URL+'search?q=one',
+                    'method': 'GET', 'parameters': ['q']}]}})
+            seen = []
+            def active(**kwargs):
+                seen.extend(kwargs['rule_ids'])
+                return 'ok', {'coverage': {'status': 'complete'}, 'alerts': []}
+            with patch.object(TOOL_INDEX['zap_baseline'],'exec_fn',return_value=seed), \
+                 patch.object(TOOL_INDEX['zap_active_scan'],'exec_fn',side_effect=active), \
+                 contextlib.redirect_stdout(io.StringIO()):
+                result = WebXAgent(cfg).run('scan')
+            self.assertEqual(seen, [40018])
+            self.assertEqual(result['technology_capability_benchmark']['executed_payload_families'], 1)
+            directory = Path(result['progress']['path']).parent
+            for name in ('technology-capabilities.json', 'planner-capabilities.json',
+                         'planner-decisions.json'):
+                self.assertTrue((directory/name).is_file())
+
     def test_sequence_continues_after_zap_timeout_and_ignores_total_budgets(self):
         with tempfile.TemporaryDirectory() as root:
             order=[]

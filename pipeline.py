@@ -289,6 +289,10 @@ def _run(agent, user_text):
     family_evidence_report = None
     divergence_report = None
     family_history_report = None
+    technology_capability_reports = None
+    technology_capability_paths = {}
+    technology_scanner_skips = []
+    technology_executed_families = set()
     agent._pipeline_deadline = None
     if cfg.get('resume_session'):
         resume = Path(cfg['resume_session']).expanduser().resolve()
@@ -560,11 +564,25 @@ def _run(agent, user_text):
             'scan_groups_after':representative_report['scan_groups_after'],
             'coverage_estimate':representative_report['coverage_estimate']}
         journal.save()
+    if cfg.get('technology_capability_engine', False):
+        from technology_capability import TechnologyCapabilityEngine, persist
+        capability_engine = TechnologyCapabilityEngine(cfg.get('planner_mode', 'balanced'))
+        technology_capability_reports = list(capability_engine.evaluate(agent.inventory))
+        technology_capability_paths = persist(agent.evidence_store.directory,
+            *technology_capability_reports)
     stage_name = 'zap_active'
     journal.stage(stage_name, 'running')
     schedule.rules = agent.evidence_store.active_rules
     configured = cfg.get('zap_allowed_rules', [])
-    active_rules = sorted({r['id'] for r in schedule.rules} if configured == 'all' else set(configured))
+    eligible_rule_rows = ([r for r in schedule.rules] if configured == 'all' else
+                          [next((r for r in schedule.rules if r['id'] == rule),
+                                {'id': rule, 'name': ''}) for rule in configured])
+    if technology_capability_reports:
+        eligible_rule_rows, skipped, executed = capability_engine.filter_items(
+            eligible_rule_rows, technology_capability_reports[2])
+        technology_scanner_skips.extend({'scanner': 'zap', **row} for row in skipped)
+        technology_executed_families.update(executed)
+    active_rules = sorted({r['id'] for r in eligible_rule_rows})
     if backend == 'zap' and cfg.get('zap_auto_active', True) and cfg.get('allow_active_scan', False):
         if not active_rules:
             schedule.stop_reason = 'No installed/allowed active rules; inspect the ZAP rule catalog job'
@@ -720,7 +738,10 @@ def _run(agent, user_text):
     if backend == 'none':
         journal.stage('nuclei', 'skipped', 'Scan backend disabled')
     else:
-        _run_nuclei(agent, targets, schedule, history, journal, execute)
+        _run_nuclei(agent, targets, schedule, history, journal, execute,
+            capability_engine if technology_capability_reports else None,
+            technology_capability_reports, technology_scanner_skips,
+            technology_executed_families)
     stage_name = 'verification'
     journal.stage(stage_name, 'running')
     # Apply supported validators without waiting for an LLM to request them.
@@ -872,12 +893,35 @@ def _run(agent, user_text):
     journal.data['status'] = 'partial' if any(s['status'] in ('partial','error','timeout') for s in journal.data['stages'].values()) else 'complete'
     journal.save()
     result['progress'] = journal.summary()
+    if technology_capability_reports:
+        from technology_capability import persist
+        benchmark = technology_capability_reports[2]['benchmark']
+        benchmark['executed_payload_families'] = len(technology_executed_families)
+        benchmark['average_scan_duration_seconds'] = round(time.monotonic() - began, 3)
+        technology_capability_reports[2]['scanner_skips'] = technology_scanner_skips
+        technology_capability_reports[2]['executed_payload_family_names'] = sorted(
+            technology_executed_families)
+        technology_capability_paths = persist(agent.evidence_store.directory,
+            *technology_capability_reports)
+        result['technology_capabilities'] = technology_capability_reports[0]
+        result['planner_capabilities'] = technology_capability_reports[1]
+        result['planner_decisions'] = technology_capability_reports[2]
+        result['technology_capability_paths'] = technology_capability_paths
+        result['technology_capabilities_path'] = technology_capability_paths[
+            'technology-capabilities.json']
+        result['planner_capabilities_path'] = technology_capability_paths[
+            'planner-capabilities.json']
+        result['planner_decisions_path'] = technology_capability_paths[
+            'planner-decisions.json']
+        result['technology_capability_benchmark'] = benchmark
     result['final_text'] = json.dumps({k: v for k, v in result.items() if k != 'final_text'}, ensure_ascii=False, indent=2)
     sync_graph(agent)
     return result
 
 
-def _run_nuclei(agent, targets, schedule, history, journal, execute):
+def _run_nuclei(agent, targets, schedule, history, journal, execute,
+                capability_engine=None, capability_reports=None,
+                scanner_skips=None, executed_families=None):
     from adapters import nuclei
     from urllib.parse import urlsplit, urlunsplit
     from zap_schedule import family
@@ -902,6 +946,14 @@ def _run_nuclei(agent, targets, schedule, history, journal, execute):
     else:
         templates, catalog_state = nuclei.catalog(cfg)
         atomic(catalog_path, {'templates':templates, 'state':catalog_state})
+    if capability_engine and capability_reports:
+        templates, skipped, executed = capability_engine.filter_items(
+            templates, capability_reports[2])
+        scanner_skips.extend(
+            {'scanner': 'nuclei', **row} for row in skipped)
+        executed_families.update(executed)
+        catalog_state = {**catalog_state,
+                         'technology_capability_skipped': len(skipped)}
     if not templates:
         journal.stage('nuclei', catalog_state['status'], catalog_state.get('reason', 'No templates'))
         return

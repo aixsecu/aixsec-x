@@ -142,6 +142,16 @@ class TerminalOutput:
             rows += [f'  {clean(k)}: {v}' for k, v in sorted(counts.items())]
         else:
             rows.append('  Not available')
+        benchmark = result.get('technology_capability_benchmark')
+        if benchmark:
+            rows += ['', 'Technology Capability Benchmark',
+                f'  Payload families before: {benchmark["payload_families_before_optimization"]}',
+                f'  Payload families after: {benchmark["payload_families_after_optimization"]}',
+                f'  Skipped payload families: {benchmark["skipped_payload_families"]}',
+                f'  Executed payload families: {benchmark["executed_payload_families"]}',
+                f'  Average planning time: {benchmark["average_planning_time_ms"]:.3f} ms',
+                f'  Average scan duration: {benchmark["average_scan_duration_seconds"]:.3f}s',
+                f'  Overall scan reduction: {benchmark["overall_scan_reduction_percent"]:.2f}%']
         rows += ['', 'Output Files']
         files = dict(self.files)
         files.update({k.removesuffix('_path').replace('_', ' ').title(): v
