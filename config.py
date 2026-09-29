@@ -6,6 +6,62 @@ aixsec-x — config.py
 import os
 
 
+# Profiles tune coverage/performance only. Authorization gates such as
+# allow_active_scan, allow_oast, allow_sqlmap and allow_extraction are never
+# broadened by selecting a profile.
+SCAN_PROFILES = {
+    "fast": {
+        "coverage_gate": True, "seed_get_forms": True,
+        "seed_safe_post_forms": True, "zap_route_family_mode": True,
+        "family_scan": True, "family_divergence_samples": 1,
+        "technology_filter_mode": "priority", "zap_strength": "Medium",
+        "zap_phase_minutes": 1, "zap_max_urls": 100,
+        "zap_ajax_states": 40, "zap_spider_depth": 6,
+        "zap_spider_children": 30, "zap_discovered_get_probes": 3,
+        "zap_discovered_form_probes": 3, "zap_workers": 2,
+        "zap_batch_size": 8, "zap_parameterized_first": True,
+    },
+    "balanced": {
+        "coverage_gate": True, "seed_get_forms": True,
+        "seed_safe_post_forms": True, "zap_route_family_mode": True,
+        "family_scan": True, "family_divergence_samples": 2,
+        "technology_filter_mode": "priority", "zap_strength": "Medium",
+        "zap_phase_minutes": 2, "zap_max_urls": 200,
+        "zap_ajax_states": 100, "zap_spider_depth": 10,
+        "zap_spider_children": 50, "zap_discovered_get_probes": 5,
+        "zap_discovered_form_probes": 5, "zap_workers": 2,
+        "zap_batch_size": 8, "zap_parameterized_first": True,
+    },
+    "full": {
+        "coverage_gate": True, "seed_get_forms": True,
+        "seed_safe_post_forms": True, "zap_route_family_mode": False,
+        "family_scan": False, "family_divergence_samples": 3,
+        "technology_filter_mode": "off", "zap_strength": "High",
+        "zap_phase_minutes": 10, "zap_max_urls": 2000,
+        "zap_ajax_states": 300, "zap_spider_depth": 20,
+        "zap_spider_children": 100, "zap_discovered_get_probes": 20,
+        "zap_discovered_form_probes": 20, "zap_workers": 4,
+        "zap_batch_size": 8, "zap_parameterized_first": False,
+    },
+}
+
+
+def apply_scan_profile(config: dict, profile: str) -> dict:
+    """Return a copy with a named terminal profile applied.
+
+    Explicit CLI profile values win over environment tuning, while safety and
+    authorization settings remain unchanged because profiles omit those keys.
+    """
+    name = (profile or "").strip().lower()
+    if name not in SCAN_PROFILES:
+        raise ValueError("scan profile must be one of: " + ", ".join(SCAN_PROFILES))
+    resolved = dict(config)
+    resolved.update(SCAN_PROFILES[name])
+    resolved["scan_profile"] = name
+    resolved["scan_profile_settings"] = dict(SCAN_PROFILES[name])
+    return resolved
+
+
 def load_config() -> dict:
     cookie_mode = os.environ.get("WEBX_ZAP_COOKIE_PARALLEL", "auto").strip().lower()
     if cookie_mode not in ("auto", "strict", "guest"):
@@ -21,6 +77,8 @@ def load_config() -> dict:
     if planner_mode not in ("aggressive", "balanced", "thorough"):
         raise ValueError("WEBX_PLANNER_MODE must be aggressive, balanced or thorough")
     return {
+        # Existing behavior is unchanged unless --scan-profile is supplied.
+        "scan_profile": "custom",
         # ── Ollama ──
         #   WEBX_OLLAMA_URL: local (http://localhost:11434) HOẶC máy khác
         #   (http://<IP-may-model>:11434, tunnel SSH/Cloudflare…)
@@ -78,6 +136,13 @@ def load_config() -> dict:
         "zap_parameterized_first": os.environ.get("WEBX_ZAP_PARAMETERIZED_FIRST", "1") == "1",
         "zap_discovered_get_probes": max(0, min(20, int(os.environ.get("WEBX_ZAP_DISCOVERED_GET_PROBES", "5")))),
         "zap_discovered_form_probes": max(0, min(20, int(os.environ.get("WEBX_ZAP_DISCOVERED_FORM_PROBES", "5")))),
+        "coverage_gate": os.environ.get("WEBX_COVERAGE_GATE", "1") == "1",
+        "seed_get_forms": os.environ.get("WEBX_SEED_GET_FORMS", "1") == "1",
+        "seed_safe_post_forms": os.environ.get("WEBX_SEED_SAFE_POST_FORMS", "1") == "1",
+        "technology_filter_mode": os.environ.get("WEBX_TECH_FILTER_MODE", "priority").strip().lower(),
+        "advanced_coverage": os.environ.get("WEBX_ADVANCED_COVERAGE", "1") == "1",
+        "allow_oast": os.environ.get("WEBX_ALLOW_OAST", "0") == "1",
+        "oast_callback_url": os.environ.get("WEBX_OAST_CALLBACK_URL", ""),
         "zap_delay_ms": int(os.environ.get("WEBX_ZAP_DELAY_MS", "200")),
         "zap_ajax": os.environ.get("WEBX_ZAP_AJAX", "1") == "1",
         "zap_browser": os.environ.get("WEBX_ZAP_BROWSER", "firefox-headless"),

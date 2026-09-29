@@ -136,6 +136,25 @@ class ScanSchedule:
                     'auth_context': auth, 'equivalent_requests': 0, '_entry': entry}
             self.entries[fid]['equivalent_requests'] += 1
 
+    def collect_seed(self, template, entry):
+        """Admit a generated safe seed before family reduction.
+
+        A seed is import-only and is not evidence of a successful request.
+        """
+        req = entry['request']
+        shape = family(req, template.auth_context)
+        fid = digest(shape)
+        if fid in self.entries:
+            template.state = 'requested'
+            template.reason = 'matching captured request exists'
+            return self.entries[fid]
+        self.entries[fid] = {'request_id': fid, 'structure': shape,
+            'url': EvidenceRedactor().redact_url(req['url']), 'method': shape['method'],
+            'auth_context': template.auth_context, 'equivalent_requests': 1,
+            'seed_source': template.source, 'template_id': template.id,
+            'coverage_state': 'seeded', '_entry': entry}
+        return self.entries[fid]
+
     @staticmethod
     def _active_priority(entry):
         """Prefer request shapes with injectable input and dynamic methods."""

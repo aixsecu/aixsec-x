@@ -6,7 +6,7 @@ import re
 import time
 from pathlib import Path
 from urllib.parse import urlsplit
-from scan_state import Journal, RunLock, ScanBusyError, ScannerHistory, digest
+from scan_state import Journal, RunLock, ScanBusyError, ScannerHistory, atomic, digest
 
 from autonomy import KnowledgeGraph
 from evidence import EvidenceStore, public
@@ -378,7 +378,7 @@ def _run(agent, user_text):
                 return blocked(reason)
             representative = schedule.select(args)
             if representative is None:
-                return blocked('Select one captured request_id from the active schedule; no synthetic request is scanned')
+                return blocked('Select one captured or safely seeded request_id from the active schedule')
             remaining_rules = schedule.remaining(representative['request_id'], args.get('rule_ids', []))
             if not remaining_rules:
                 result = {'name':name, 'outcome':'duplicate', 'output':'This request structure/rule combination was already attempted; see persistent history.'}
@@ -509,6 +509,9 @@ def _run(agent, user_text):
     targets = []
     discovered_get_candidates = []
     discovered_form_candidates = []
+    request_templates = []
+    advanced_discoveries = []
+    advanced_coverages = []
     for target in cfg.get('targets', []):
         if '://' not in target and '/' not in target:
             target = 'http://' + target
@@ -533,7 +536,23 @@ def _run(agent, user_text):
             if backend == 'zap':
                 coverage = (baseline_result.get('data') or {}).get('coverage') or {}
                 schedule.collect(coverage)
-                for endpoint in ((baseline_result.get('data') or {}).get('discovery') or {}).get('endpoints', []):
+                discovery = (baseline_result.get('data') or {}).get('discovery') or {}
+                advanced_discoveries.append(discovery)
+                advanced_coverages.append(coverage)
+                from request_templates import build_templates, hydrate_from_har
+                target_templates = build_templates(target, discovery,
+                    coverage.get('auth_context', 'anonymous'))
+                hydrate_from_har(target_templates, coverage.get('har_path'))
+                request_templates.extend(target_templates)
+                if cfg.get('seed_get_forms', True):
+                    for template in target_templates:
+                        if template.state in ('requested', 'tested'):
+                            continue
+                        seed = template.seed_entry(
+                            allow_safe_post=cfg.get('seed_safe_post_forms', True))
+                        if seed is not None:
+                            schedule.collect_seed(template, seed)
+                for endpoint in discovery.get('endpoints', []):
                     sources=set(endpoint.get('sources') or [])
                     # A route name is not a security property. Probe any
                     # explicit GET input discovered from JavaScript; UNKNOWN
@@ -542,7 +561,7 @@ def _run(agent, user_text):
                     if ('javascript_literal' in sources
                             and endpoint.get('method') == 'GET' and endpoint.get('parameters')):
                         discovered_get_candidates.append(endpoint)
-                for form in ((baseline_result.get('data') or {}).get('discovery') or {}).get('forms', []):
+                for form in discovery.get('forms', []):
                     path=urlsplit(str(form.get('action') or '')).path.lower()
                     params=[str(v).lower() for v in form.get('parameters') or []]
                     search_like=(any(word in path for word in ('search','find','timkiem','tim-kiem'))
@@ -558,6 +577,16 @@ def _run(agent, user_text):
     if backend == 'none':
         agent.evidence_store.coverage.extend({'target': u, 'status': 'not_run', 'reason': 'baseline disabled'} for u in targets)
     close_stage('discovery')
+    from request_templates import coverage_report
+    request_coverage = coverage_report(request_templates)
+    request_coverage_path = journal.directory/'request-coverage.json'
+    atomic(request_coverage_path, request_coverage)
+    if cfg.get('coverage_gate', True) and not request_coverage['summary']['ready']:
+        journal.data['stages']['discovery']['status'] = 'partial'
+        journal.data['stages']['discovery']['reason'] = (
+            f"Coverage gate: {request_coverage['summary']['unaccounted_inputs']} "
+            "discovered inputs are not accounted for")
+        journal.save()
     configured_rules=cfg.get('zap_allowed_rules',[])
     probe_limit=int(cfg.get('zap_discovered_get_probes',5))
     if (backend=='zap' and cfg.get('allow_active_scan',False)
@@ -611,7 +640,9 @@ def _run(agent, user_text):
                 if skipped_unparameterized:
                     print(f'[zap] skipped {skipped_unparameterized} unparameterized active groups; '
                           'parameterized groups are available', flush=True)
-    if cfg.get('zap_route_family_mode', True):
+    family_optimization_ready = (request_coverage['summary']['ready']
+                                 or not cfg.get('coverage_gate', True))
+    if cfg.get('zap_route_family_mode', True) and family_optimization_ready:
         from terminal_output import event
         event('stage', 'route_family')
         from route_family import RepresentativeSelector,RouteFamilyBuilder
@@ -643,6 +674,10 @@ def _run(agent, user_text):
             'scan_groups_after':representative_report['scan_groups_after'],
             'coverage_estimate':representative_report['coverage_estimate']}
         journal.save()
+    elif cfg.get('zap_route_family_mode', True):
+        journal.data['stages']['discovery']['route_families']={
+            'status':'skipped','reason':'coverage gate is not ready; request groups were not reduced'}
+        journal.save()
     if cfg.get('technology_capability_engine', False):
         from technology_capability import TechnologyCapabilityEngine, persist
         capability_engine = TechnologyCapabilityEngine(cfg.get('planner_mode', 'balanced'))
@@ -657,9 +692,19 @@ def _run(agent, user_text):
                           [next((r for r in schedule.rules if r['id'] == rule),
                                 {'id': rule, 'name': ''}) for rule in configured])
     if technology_capability_reports:
-        eligible_rule_rows, skipped, executed = capability_engine.filter_items(
+        preferred, skipped, executed = capability_engine.filter_items(
             eligible_rule_rows, technology_capability_reports[2])
-        technology_scanner_skips.extend({'scanner': 'zap', **row} for row in skipped)
+        filter_mode=cfg.get('technology_filter_mode','priority')
+        if filter_mode not in ('off','priority','strict'):
+            raise ValueError('WEBX_TECH_FILTER_MODE must be off, priority or strict')
+        if filter_mode == 'strict':
+            eligible_rule_rows = preferred
+            technology_scanner_skips.extend({'scanner': 'zap', **row} for row in skipped)
+        elif filter_mode == 'priority':
+            deferred=[row['item'] for row in skipped]
+            eligible_rule_rows = preferred + deferred
+            technology_scanner_skips.extend({'scanner':'zap','deferred':True,**row} for row in skipped)
+            executed.update(filter(None,(capability_engine.family_for_scanner_item(row) for row in deferred)))
         technology_executed_families.update(executed)
     active_rules = sorted({r['id'] for r in eligible_rule_rows})
     if backend == 'zap' and cfg.get('zap_auto_active', True) and cfg.get('allow_active_scan', False):
@@ -675,7 +720,6 @@ def _run(agent, user_text):
         workers = max(1, min(8, int(cfg.get('zap_workers', 2))))
         if active_rules and representatives:
             from zap_workers import batch_jobs, drive, scheduling_summary
-            from scan_state import atomic
             cookie_mode = cfg.get('zap_cookie_parallel', 'auto')
             if cookie_mode == 'auto':
                 from zap_auto import AutoConcurrency
@@ -934,6 +978,32 @@ def _run(agent, user_text):
     agent._pipeline_deadline = None
     result = agent.evidence_store.finish(llm_down or failures > 0)
     result['active_schedule'] = schedule.summary(active_rules)
+    template_states = {row.get('template_id'): row for row in result['active_schedule']['families']
+                       if row.get('template_id')}
+    for template in request_templates:
+        scheduled = template_states.get(template.id)
+        if not scheduled:
+            continue
+        states = [rule.get('state') for rule in scheduled.get('rules', [])]
+        if states and any(state in ('requests_observed', 'responses_recorded') for state in states):
+            template.state = 'active_tested'
+            template.reason = ''
+        elif states and any(state not in ('not_run', 'reserved') for state in states):
+            template.state = 'active_attempted'
+            template.reason = 'active rules ran without attributed request evidence'
+    request_coverage = coverage_report(request_templates)
+    atomic(request_coverage_path, request_coverage)
+    result['request_coverage'] = request_coverage
+    result['request_coverage_path'] = str(request_coverage_path)
+    if cfg.get('advanced_coverage', True):
+        from advanced_coverage import evaluate as evaluate_advanced_coverage
+        advanced_coverage = evaluate_advanced_coverage(request_templates,
+            advanced_discoveries, advanced_coverages, auth_context.manager().list(),
+            agent.inventory.analysis, cfg)
+        advanced_coverage_path=journal.directory/'advanced-coverage.json'
+        atomic(advanced_coverage_path,advanced_coverage)
+        result['advanced_coverage']=advanced_coverage
+        result['advanced_coverage_path']=str(advanced_coverage_path)
     if route_family_report:
         result['route_families']={k:v for k,v in route_family_report.items() if k!='families'}
         result['route_family_path']=str(journal.directory/'family.json')
@@ -985,6 +1055,7 @@ def _run(agent, user_text):
         result['technology_capabilities'] = technology_capability_reports[0]
         result['planner_capabilities'] = technology_capability_reports[1]
         result['planner_decisions'] = technology_capability_reports[2]
+        result['technology_scanner_skips'] = technology_scanner_skips
         result['technology_capability_paths'] = technology_capability_paths
         result['technology_capabilities_path'] = technology_capability_paths[
             'technology-capabilities.json']
