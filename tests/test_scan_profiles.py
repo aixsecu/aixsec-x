@@ -1,6 +1,6 @@
 import pytest
 
-from agent import _banner, _cli_option_value
+from agent import _banner, _cli_option_value, select_scan_profile_interactive
 from config import SCAN_PROFILES, apply_scan_profile, load_config
 
 
@@ -23,6 +23,13 @@ def test_profiles_have_increasing_scan_limits():
     assert fast["zap_ajax_states"] < balanced["zap_ajax_states"] < full["zap_ajax_states"]
     assert full["technology_filter_mode"] == "off"
     assert full["family_scan"] is False
+    assert fast['zap_timeout'] >= 60 * (
+        fast['zap_spider_minutes'] + fast['zap_ajax_minutes'] + fast['zap_passive_minutes'])
+    assert balanced['zap_timeout'] >= 60 * (
+        balanced['zap_spider_minutes'] + balanced['zap_ajax_minutes'] + balanced['zap_passive_minutes'])
+    assert full['zap_timeout'] >= 60 * (
+        full['zap_spider_minutes'] + full['zap_ajax_minutes'] + full['zap_passive_minutes'])
+    assert fast['profile_session_seconds'] < balanced['profile_session_seconds'] < full['profile_session_seconds']
 
 
 def test_profile_does_not_broaden_authorization_gates():
@@ -58,5 +65,20 @@ def test_default_config_keeps_backward_compatible_custom_mode():
 def test_banner_displays_effective_profile():
     text = _banner({"scan_profile": "balanced", "targets": ["https://example.test"]},
                    missing={}, color=False)
-    assert "profile" in text
-    assert "balanced" in text
+    assert "scan-mode" in text
+    assert "BALANCED" in text
+
+
+def test_interactive_menu_maps_numeric_choice(monkeypatch, capsys):
+    monkeypatch.setattr("builtins.input", lambda _: "3")
+    resolved = select_scan_profile_interactive({"allow_oast": False})
+    assert resolved["scan_profile"] == "full"
+    assert resolved["allow_oast"] is False
+    assert "SCAN MODE: FULL" in capsys.readouterr().out
+
+
+def test_interactive_menu_retries_then_defaults_to_balanced(monkeypatch):
+    answers = iter(["invalid", ""])
+    monkeypatch.setattr("builtins.input", lambda _: next(answers))
+    resolved = select_scan_profile_interactive({})
+    assert resolved["scan_profile"] == "balanced"

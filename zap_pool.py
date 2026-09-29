@@ -213,8 +213,9 @@ class WorkerPool:
             if self._workers: return self
             self.root.mkdir(parents=True,exist_ok=True,mode=0o700)
             try:
-                for index in range(self.size):
-                    worker=self._new_worker(index);self._workers.append(worker);self._available.put(worker)
+                # Baseline discovery needs one JVM. Start additional workers
+                # lazily only when concurrent active jobs request them.
+                worker=self._new_worker(0);self._workers.append(worker);self._available.put(worker)
             except BaseException:
                 self.close();raise
         return self
@@ -222,8 +223,16 @@ class WorkerPool:
     def acquire(self,timeout=None):
         if self._closed: raise WorkerError('worker pool is closed')
         self.start();began=_milliseconds()
-        try: worker=self._available.get(timeout=timeout)
-        except queue.Empty as exc: raise TimeoutError('ZAP worker pool exhausted') from exc
+        try:
+            worker=self._available.get_nowait()
+        except queue.Empty:
+            worker=None
+            with self._lock:
+                if len(self._workers)<self.size:
+                    worker=self._new_worker(len(self._workers));self._workers.append(worker)
+            if worker is None:
+                try: worker=self._available.get(timeout=timeout)
+                except queue.Empty as exc: raise TimeoutError('ZAP worker pool exhausted') from exc
         self.metrics['acquire_wait_ms']+=_milliseconds()-began
         return WorkerLease(self,worker)
 

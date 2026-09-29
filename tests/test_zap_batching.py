@@ -19,6 +19,22 @@ def captured(path, auth='anonymous', method='GET', headers=None):
 
 
 class ZapBatchingTests(unittest.TestCase):
+    def test_discovery_plan_uses_distinct_phase_budgets_and_checkpoints(self):
+        with tempfile.TemporaryDirectory() as root:
+            config = {'zap_spider_minutes': 2, 'zap_ajax_minutes': 4,
+                      'zap_passive_minutes': 1}
+            plan = build_plan(config, BASE, root, ajax=True)
+            spider = next(job for job in plan['jobs'] if job['type'] == 'spider')
+            ajax = next(job for job in plan['jobs'] if job['type'] == 'spiderAjax')
+            passive = next(job for job in plan['jobs'] if job['type'] == 'passiveScan-wait')
+            self.assertEqual(spider['parameters']['maxDuration'], 2)
+            self.assertEqual(ajax['parameters']['maxDuration'], 4)
+            self.assertEqual(passive['parameters']['maxDuration'], 1)
+            exports = [job['parameters']['fileName'] for job in plan['jobs']
+                       if job['type'] == 'export']
+            self.assertTrue(any(name.endswith('traffic-spider.har') for name in exports))
+            self.assertTrue(any(name.endswith('traffic-ajax.har') for name in exports))
+
     def test_safe_groups_batch_by_origin_and_auth(self):
         jobs = [captured('a'), captured('b'), captured('c', auth='member')]
         batches = batch_jobs(jobs, 8, 'guest')

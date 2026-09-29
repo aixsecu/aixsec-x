@@ -122,6 +122,33 @@ class TerminalTests(unittest.TestCase):
             self.assertIn('\r\033[2K', screen.getvalue())
             self.assertNotIn('\033[2J', screen.getvalue())
 
+    def test_tty_stage_shows_spinner_timer_progress_and_completion(self):
+        class TTY(io.StringIO):
+            def isatty(self):
+                return True
+        with tempfile.TemporaryDirectory() as root:
+            screen = TTY()
+            terminal, _ = self.session(root, screen)
+            terminal.stage('zap_active', 'running')
+            first = screen.getvalue()
+            self.assertIn('⠋ [Active Scan] running 00:00', first)
+            terminal.stage('zap_active', '2/5 jobs finished')
+            progress = screen.getvalue()
+            self.assertIn('2/5', progress)
+            self.assertIn('█', progress)
+            self.assertIn('░', progress)
+            terminal.stage('zap_active', 'complete')
+            self.assertIn('✓ [Active Scan] complete', screen.getvalue())
+            self.assertIsNone(terminal.stage_name)
+
+    def test_non_tty_stage_output_stays_static_for_clean_logs(self):
+        with tempfile.TemporaryDirectory() as root:
+            screen = io.StringIO()
+            terminal, _ = self.session(root, screen)
+            terminal.stage('nuclei', 'running')
+            self.assertEqual(screen.getvalue(), '[Nuclei]\n')
+            self.assertNotIn('⠋', screen.getvalue())
+
 
 if __name__ == '__main__':
     unittest.main()
