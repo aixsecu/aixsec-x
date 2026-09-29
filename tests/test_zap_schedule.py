@@ -39,6 +39,31 @@ class FamilyTests(unittest.TestCase):
                          family(request(BASE+'users/aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee')))
 
 class ScheduleTests(unittest.TestCase):
+    def test_malformed_har_downgrades_coverage_without_crashing(self):
+        with tempfile.TemporaryDirectory() as root:
+            har = Path(root) / 'traffic.har'
+            har.write_text('{"log":{"entries":[{"broken": true}')
+            coverage = {'har_path': str(har), 'target': BASE,
+                        'auth_context': 'anonymous', 'status': 'complete'}
+            schedule = ScanSchedule(root)
+            self.assertEqual(schedule.collect(coverage), 0)
+            self.assertEqual(coverage['status'], 'partial')
+            self.assertEqual(coverage['har_import']['status'], 'error')
+            self.assertIn('HAR import failed', schedule.stop_reason)
+            self.assertEqual(len(schedule.import_errors), 1)
+            self.assertEqual(schedule.entries, {})
+
+    def test_har_with_invalid_schema_is_reported_as_partial(self):
+        with tempfile.TemporaryDirectory() as root:
+            har = Path(root) / 'traffic.har'
+            har.write_text(json.dumps({'log': {'entries': {}}}))
+            coverage = {'har_path': str(har), 'target': BASE,
+                        'auth_context': 'anonymous', 'status': 'complete'}
+            schedule = ScanSchedule(root)
+            self.assertEqual(schedule.collect(coverage), 0)
+            self.assertIn('log.entries must be an array',
+                          coverage['har_import']['reason'])
+
     def test_active_limit_prioritizes_parameterized_and_body_shapes(self):
         with tempfile.TemporaryDirectory() as root:
             har=Path(root)/'traffic.har'

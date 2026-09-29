@@ -92,6 +92,7 @@ class ScanSchedule:
         self.rules = []
         self.skipped_static = 0
         self.report = []
+        self.import_errors = []
         self.stop_reason = ''
         self.limit_report = {'configured': 0, 'before': 0, 'after': 0, 'dropped': 0}
 
@@ -107,21 +108,60 @@ class ScanSchedule:
     def collect(self, coverage):
         har = coverage.get('har_path')
         if not har or not Path(har).is_file():
-            return
-        data = json.loads(Path(har).read_text())
+            return 0
+        try:
+            data = json.loads(Path(har).read_text(encoding='utf-8'))
+            if not isinstance(data, dict):
+                raise ValueError('HAR root must be an object')
+            log = data.get('log')
+            entries = log.get('entries') if isinstance(log, dict) else None
+            if not isinstance(entries, list):
+                raise ValueError('HAR log.entries must be an array')
+        except (json.JSONDecodeError, UnicodeDecodeError, OSError, TypeError, ValueError) as exc:
+            # ZAP exports are external artifacts and can be truncated or
+            # malformed. Preserve the artifact, downgrade coverage, and let
+            # discovery/form seeds continue instead of crashing the session.
+            reason = f'HAR import failed ({Path(har).name}): {exc}'
+            self.import_errors.append(reason)
+            self.stop_reason = reason
+            coverage['har_import'] = {'status': 'error', 'reason': reason,
+                                      'path': str(Path(har))}
+            gaps = coverage.setdefault('gaps', [])
+            if reason not in gaps:
+                gaps.append(reason)
+            if coverage.get('status') == 'complete':
+                coverage['status'] = 'partial'
+            return 0
         auth = coverage.get('auth_context', 'anonymous')
         # Authenticated scans without verified login must not seed active requests.
         if auth != 'anonymous' and coverage.get('auth_state') != 'verified':
-            return
-        for entry in data.get('log', {}).get('entries', []):
+            return 0
+        collected = 0
+        malformed_entries = 0
+        for entry in entries:
+            if not isinstance(entry, dict):
+                malformed_entries += 1
+                continue
             req = entry.get('request') or {}
+            if not isinstance(req, dict):
+                malformed_entries += 1
+                continue
             url = req.get('url', '')
-            if not same_origin(url, coverage.get('target', '')) or not (entry.get('response') or {}).get('status'):
+            response = entry.get('response') or {}
+            if (not isinstance(url, str) or not isinstance(response, dict)
+                    or not isinstance(req.get('postData') or {}, dict)):
+                malformed_entries += 1
+                continue
+            if not same_origin(url, coverage.get('target', '')) or not response.get('status'):
                 continue
             if STATIC.search(urlsplit(url).path):
                 self.skipped_static += 1
                 continue
-            shape = family(req, auth)
+            try:
+                shape = family(req, auth)
+            except (TypeError, ValueError, AttributeError):
+                malformed_entries += 1
+                continue
             matches = [g for g in self.route_groups if same_origin(url, g['origin'])
                        and any(fnmatch.fnmatchcase(urlsplit(url).path, pattern) for pattern in g['paths'])]
             if len(matches) > 1:
@@ -134,7 +174,20 @@ class ScanSchedule:
                 self.entries[fid] = {'request_id': fid, 'structure': shape,
                     'url': EvidenceRedactor().redact_url(url), 'method': shape['method'],
                     'auth_context': auth, 'equivalent_requests': 0, '_entry': entry}
+                collected += 1
             self.entries[fid]['equivalent_requests'] += 1
+        coverage['har_import'] = {'status': 'complete', 'entries': len(entries),
+                                  'request_families': collected,
+                                  'malformed_entries_skipped': malformed_entries}
+        if malformed_entries:
+            reason = f'HAR import skipped {malformed_entries} malformed entries'
+            coverage['har_import']['status'] = 'partial'
+            gaps = coverage.setdefault('gaps', [])
+            if reason not in gaps:
+                gaps.append(reason)
+            if coverage.get('status') == 'complete':
+                coverage['status'] = 'partial'
+        return collected
 
     def collect_seed(self, template, entry):
         """Admit a generated safe seed before family reduction.
@@ -224,6 +277,7 @@ class ScanSchedule:
                                'artifact_ref':states.get(r,('not_run',''))[1]} for r in rules]})
         return {'namespace': self.namespace, 'history_path': str(self.path), 'families': rows,
                 'rules': self.rules, 'skipped_static_requests': self.skipped_static,
+                'import_errors': list(self.import_errors),
                 'active_input_limit': self.limit_report,
                 'stop_reason': self.stop_reason,
                 'interpretation': 'A reserved/attempted rule is never automatically repeated; requests_observed/responses_recorded do not mean the rule completed or the endpoint is safe. Use a new operator-selected namespace for intentional retesting.'}

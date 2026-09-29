@@ -47,6 +47,13 @@ class TerminalOutput:
         self.files = {}
         self.seen = set()
         self.stage_name = None
+        self.stage_status = None
+        self.stage_reason = ''
+        self.stage_started = None
+        self.stage_progress = None
+        self.spinner_index = 0
+        self._animation_stop = threading.Event()
+        self._animation_thread = None
         self.closed_output = False
         self.tty = self.screen.isatty()
 
@@ -70,20 +77,68 @@ class TerminalOutput:
         if self.tty and self.stage_name:
             self.screen.write('\r\033[2K')
 
+    def _stage_line(self):
+        frames = '⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏'
+        frame = frames[self.spinner_index % len(frames)]
+        elapsed = max(0, int(time.monotonic() - (self.stage_started or time.monotonic())))
+        timer = f'{elapsed // 60:02d}:{elapsed % 60:02d}'
+        progress = ''
+        if self.stage_progress:
+            current, total = self.stage_progress
+            ratio = min(1.0, current / total) if total else 0
+            width = 18
+            filled = int(width * ratio)
+            progress = f" [{'█' * filled}{'░' * (width - filled)}] {current}/{total}"
+        detail = f' — {clean(self.stage_reason)}' if self.stage_reason else ''
+        return f'{frame} [{self.stage_name}] running {timer}{progress}{detail}'
+
+    def _animate(self):
+        while not self._animation_stop.wait(0.12):
+            with self.lock:
+                if self.closed_output:
+                    return
+                if self.tty and self.stage_name and self.stage_status == 'running':
+                    self.clear()
+                    self.spinner_index += 1
+                    self.screen.write(self._stage_line())
+                    self.screen.flush()
+
     def stage(self, name, status='running', reason=''):
         stages = {'discovery':'Discovery', 'route_family':'Route Family',
-                  'zap_active':'Active Scan', 'nuclei':'Active Scan',
-                  'verification':'Validation', 'planner':'Validation', 'report':'Reporting'}
+                  'zap_active':'Active Scan', 'nuclei':'Nuclei',
+                  'verification':'Verification', 'planner':'AI Analysis', 'report':'Reporting'}
         label = stages.get(name)
         if label is None or self.closed_output:
             return
         with self.lock:
+            progress_match = re.search(r'(\d+)\s*/\s*(\d+)', str(status))
+            is_progress = bool(progress_match and 'finished' in str(status).lower())
+            normalized = 'running' if is_progress else str(status).lower()
             if self.tty:
                 self.clear()
-                self.screen.write(f'[{label}] {clean(status)}\r')
+                if label != self.stage_name or self.stage_status != 'running':
+                    self.stage_started = time.monotonic()
+                    self.stage_progress = None
+                    self.spinner_index = 0
+                self.stage_name = label
+                self.stage_status = normalized
+                self.stage_reason = reason
+                if is_progress:
+                    current, total = map(int, progress_match.groups())
+                    self.stage_progress = (current, total)
+                if normalized == 'running':
+                    self.screen.write(self._stage_line())
+                else:
+                    elapsed = max(0, int(time.monotonic() - (self.stage_started or time.monotonic())))
+                    marker = '✓' if normalized in ('complete', 'completed', 'ok', 'success') else '−' if normalized == 'skipped' else '!'
+                    suffix = f' — {clean(reason)}' if reason else ''
+                    self.screen.write(f'\r\033[2K{marker} [{label}] {clean(status)} ({elapsed}s){suffix}\n')
+                    self.stage_name = None
+                    self.stage_status = None
+                    self.stage_progress = None
             elif label != self.stage_name:
                 self.screen.write(f'[{label}]\n')
-            self.stage_name = label
+                self.stage_name = label
             self.screen.flush()
 
     def finding(self, finding):
@@ -193,6 +248,11 @@ class TerminalOutput:
         self.stderr = redirect_stderr(self)
         self.stdout.__enter__()
         self.stderr.__enter__()
+        if self.tty:
+            self._animation_stop.clear()
+            self._animation_thread = threading.Thread(
+                target=self._animate, name='aixsec-terminal-spinner', daemon=True)
+            self._animation_thread.start()
         return self
 
     def __exit__(self, exc_type, exc, tb):
@@ -200,6 +260,9 @@ class TerminalOutput:
         try:
             self.summary('Interrupted' if exc_type is KeyboardInterrupt else 'Failed' if exc_type else None)
         finally:
+            self._animation_stop.set()
+            if self._animation_thread is not None:
+                self._animation_thread.join(timeout=0.5)
             _active = None
             self.stderr.__exit__(exc_type, exc, tb)
             self.stdout.__exit__(exc_type, exc, tb)

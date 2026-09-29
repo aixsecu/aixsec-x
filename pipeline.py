@@ -234,7 +234,12 @@ def run(agent, user_text):
     agent._scan_journal = None
     pool=None;result=None
     try:
-        with RunLock(cfg.get('evidence_dir', '.aixsec-evidence'), cfg.get('zap_history_namespace', 'default')):
+        history_namespace = cfg.get('zap_history_namespace', 'default')
+        profile = cfg.get('scan_profile', 'custom')
+        if profile != 'custom':
+            history_namespace = f'{history_namespace}:profile:{profile}'
+        cfg['_effective_history_namespace'] = history_namespace
+        with RunLock(cfg.get('evidence_dir', '.aixsec-evidence'), history_namespace):
             try:
                 backend=cfg.get('scan_backend','auto')
                 if (backend=='zap' or backend=='auto') and executable(cfg):
@@ -251,6 +256,7 @@ def run(agent, user_text):
                 raise
             finally:
                 cfg.pop('_zap_worker_pool',None)
+                cfg.pop('_effective_history_namespace',None)
                 if pool: pool.close()
     except ScanBusyError as exc:
         return {'status':'busy', 'busy':True, 'calls':0, 'findings':[],
@@ -295,7 +301,8 @@ def _run(agent, user_text):
     technology_capability_paths = {}
     technology_scanner_skips = []
     technology_executed_families = set()
-    agent._pipeline_deadline = None
+    session_seconds = max(0, int(cfg.get('profile_session_seconds', 0)))
+    agent._pipeline_deadline = began + session_seconds if session_seconds else None
     if cfg.get('resume_session'):
         resume = Path(cfg['resume_session']).expanduser().resolve()
         root = Path(cfg.get('evidence_dir', '.aixsec-evidence')).resolve()
@@ -310,9 +317,10 @@ def _run(agent, user_text):
     journal.save()
     auto_concurrency = None
     stage_name = 'discovery'
-    history = ScannerHistory(cfg.get('evidence_dir', '.aixsec-evidence'), cfg.get('zap_history_namespace', 'default'))
+    history_namespace = cfg.get('_effective_history_namespace', cfg.get('zap_history_namespace', 'default'))
+    history = ScannerHistory(cfg.get('evidence_dir', '.aixsec-evidence'), history_namespace)
     from zap_schedule import ScanSchedule
-    schedule = ScanSchedule(cfg.get('evidence_dir', '.aixsec-evidence'), cfg.get('zap_history_namespace', 'default'), cfg.get('zap_route_groups_file', ''))
+    schedule = ScanSchedule(cfg.get('evidence_dir', '.aixsec-evidence'), history_namespace, cfg.get('zap_route_groups_file', ''))
 
     # A checkpoint's interrupted dispatch has no completed result. Explicit resume
     # recovers only its reservations, under the exclusive namespace lock.
@@ -330,8 +338,14 @@ def _run(agent, user_text):
     def close_stage(name):
         states = [t['status'] for t in journal.data['tasks'].values() if t['stage'] == name]
         incomplete = any(v not in ('complete', 'duplicate') for v in states)
+        failure_reason = ''
+        if incomplete:
+            counts = {state: states.count(state) for state in sorted(set(states))
+                      if state not in ('complete', 'duplicate')}
+            failure_reason = 'Incomplete actions: ' + ', '.join(
+                f'{state}={count}' for state, count in counts.items())
         journal.stage(name, 'partial' if incomplete else 'complete' if any(v != 'duplicate' for v in states) else 'skipped',
-                      'Some actions did not complete; inspect task states' if incomplete else 'Previously attempted; see persistent history' if states and all(v == 'duplicate' for v in states) else '' if states else 'No eligible work')
+                      failure_reason if incomplete else 'Previously attempted; see persistent history' if states and all(v == 'duplicate' for v in states) else '' if states else 'No eligible work')
 
     def execution(name, args, baseline=False, scheduled=False, cancelled=None, batch=None):
         nonlocal calls, estimated_requests
@@ -404,7 +418,6 @@ def _run(agent, user_text):
                         else int(cfg.get('zap_max_urls', 200)) * 2)
         estimated_requests += estimate
         calls += 1
-        agent._pipeline_deadline = None
         if representative:
             claims = {member['request_id']: schedule.claim(member['request_id'], args['rule_ids'])
                       for member in batch_members}
@@ -512,6 +525,7 @@ def _run(agent, user_text):
     request_templates = []
     advanced_discoveries = []
     advanced_coverages = []
+    discovery_failed = False
     for target in cfg.get('targets', []):
         if '://' not in target and '/' not in target:
             target = 'http://' + target
@@ -533,6 +547,8 @@ def _run(agent, user_text):
             if backend == 'http':
                 args.update(method='get', follow_redirects=False)
             baseline_result = execute(tool, args, True)
+            if baseline_result.get('outcome') in ('timeout', 'error', 'failed', 'blocked'):
+                discovery_failed = True
             if backend == 'zap':
                 coverage = (baseline_result.get('data') or {}).get('coverage') or {}
                 schedule.collect(coverage)
@@ -579,11 +595,17 @@ def _run(agent, user_text):
     close_stage('discovery')
     from request_templates import coverage_report
     request_coverage = coverage_report(request_templates)
+    if discovery_failed:
+        request_coverage['summary']['ready'] = False
+        request_coverage['summary']['discovery_status'] = 'failed_or_timeout'
+        request_coverage['summary']['reason'] = (
+            'Discovery did not complete; zero unaccounted inputs is not evidence of coverage')
     request_coverage_path = journal.directory/'request-coverage.json'
     atomic(request_coverage_path, request_coverage)
     if cfg.get('coverage_gate', True) and not request_coverage['summary']['ready']:
         journal.data['stages']['discovery']['status'] = 'partial'
         journal.data['stages']['discovery']['reason'] = (
+            request_coverage['summary'].get('reason') or
             f"Coverage gate: {request_coverage['summary']['unaccounted_inputs']} "
             "discovered inputs are not accounted for")
         journal.save()
@@ -711,7 +733,7 @@ def _run(agent, user_text):
         if not active_rules:
             schedule.stop_reason = 'No installed/allowed active rules; inspect the ZAP rule catalog job'
         elif not schedule.entries:
-            schedule.stop_reason = 'No eligible captured requests to test'
+            schedule.stop_reason = schedule.stop_reason or 'No eligible captured requests to test'
         # Run independently of the LLM using the selected captured request groups.
         representatives = sorted((row for request_id,row in schedule.entries.items()
                                   if representative_report is None or not cfg.get('family_scan',True)
@@ -992,6 +1014,11 @@ def _run(agent, user_text):
             template.state = 'active_attempted'
             template.reason = 'active rules ran without attributed request evidence'
     request_coverage = coverage_report(request_templates)
+    if discovery_failed:
+        request_coverage['summary']['ready'] = False
+        request_coverage['summary']['discovery_status'] = 'failed_or_timeout'
+        request_coverage['summary']['reason'] = (
+            'Discovery did not complete; zero unaccounted inputs is not evidence of coverage')
     atomic(request_coverage_path, request_coverage)
     result['request_coverage'] = request_coverage
     result['request_coverage_path'] = str(request_coverage_path)
@@ -1033,8 +1060,10 @@ def _run(agent, user_text):
     schedule_path.chmod(0o600)
     result['active_schedule_path'] = str(schedule_path)
     result['calls'] = calls
-    result['budget'] = {'mode':'sequential', 'actions':calls, 'max_actions':None,
-                        'elapsed_seconds':round(time.monotonic() - began, 2), 'max_seconds':None,
+    result['budget'] = {'mode':'profile_guardrail' if session_seconds else 'sequential',
+                        'actions':calls, 'max_actions':None,
+                        'elapsed_seconds':round(time.monotonic() - began, 2),
+                        'max_seconds':session_seconds or None,
                         'estimated_requests':estimated_requests, 'max_estimated_requests':None}
     result['scanner_history'] = history.summary()
     result['nuclei_artifacts']={name:str(journal.directory/name) for name in ('nuclei-catalog.json','nuclei-bindings.json','nuclei-resume-check.json') if (journal.directory/name).exists()}

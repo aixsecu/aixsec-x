@@ -222,6 +222,10 @@ python3 agent.py --non-interactive                # run automatically
 Choose the coverage/speed trade-off directly on the command line; no profile
 environment variable is required:
 
+When `python3 agent.py` is started interactively, it first displays a menu and
+lets the user select `1` (Fast), `2` (Balanced), or `3` (Full). Pressing Enter
+selects Balanced. The chosen mode is shown in the startup banner.
+
 ```bash
 python3 agent.py --scan-profile fast
 python3 agent.py --scan-profile balanced
@@ -236,11 +240,52 @@ python3 agent.py --list-scan-profiles
 - `full`: disables route-family and technology reduction, uses High ZAP
   strength, and raises crawl/scan limits. It can take substantially longer.
 
+Profiles use separate soft phase budgets and a larger hard guardrail:
+
+| Profile | Spider | AJAX | Passive | Active/group | ZAP hard limit | Session hard limit |
+|---|---:|---:|---:|---:|---:|---:|
+| Fast | 1m | 1m | 1m | 1m | 5m | 15m |
+| Balanced | 2m | 3m | 1m | 3m | 12m | 45m |
+| Full | 5m | 8m | 2m | 8m | 22m | 120m |
+
+ZAP exports recovery checkpoints after the traditional Spider and AJAX Spider.
+If a later phase reaches its hard limit, the last valid HAR/URL checkpoint is
+used instead of reducing discovery to zero. Worker JVMs start lazily, so a
+baseline starts one worker even when Full allows four active workers. Persistent
+scanner history is separated by profile; repeated runs of the same profile
+still avoid already attempted work.
+
 The selected CLI profile overrides performance-related environment settings.
 It never enables authorization-sensitive capabilities such as active scanning,
 OAST, SQLMap, or data extraction when those gates are disabled. Without
 `--scan-profile`, existing configuration is preserved and the banner reports
 the profile as `custom`.
+
+### User settings without WEBX variables
+
+For normal terminal use, create one local user configuration with the guided
+wizard instead of exporting individual variables:
+
+```bash
+python3 agent.py --configure
+python3 agent.py --show-config
+# Optional alternate file:
+python3 agent.py --configure --config /path/to/aixsec.json
+```
+
+The default file is `.aixsec-config.json` in the working directory, is written
+with mode `0600`, and is ignored by Git. It contains only operator decisions:
+authorized targets/source roots, scan profile/backend, active scan, AJAX,
+Nuclei, content discovery, AI Planner, advanced coverage, SQLMap, extraction,
+and OAST permission. The wizard never asks for or stores passwords/tokens.
+
+At startup, the banner shows the effective backend and the important permission
+gates. Interactive runs still show the Fast/Balanced/Full menu, using the saved
+profile as its default. Use `--config` to select another saved file.
+
+The `WEBX_*` variables below remain available as advanced settings and for
+scripts/CI. Values saved by the wizard take precedence over their corresponding
+environment settings; an explicit `--scan-profile` takes precedence over both.
 
 ### Configuration via env
 
@@ -271,6 +316,8 @@ Boolean switches use `1` (enabled) and `0` (disabled). Defaults below come from 
 | `WEBX_PROMPT_STYLE` | `auto` | `auto`=model-name heuristic (≤9B→compact, ≥14B→full); `compact`=short prompt for small models; `full`=full prompt |
 | `WEBX_OUTPUT_CAP` | `5000` | Max characters of tool output fed into the context |
 | `WEBX_NUM_PREDICT` | `0` | **v1.4.2** hard cap on tokens the model may generate per call. `0`=unlimited (default). Set `512-2048` if the model writes long essays that slow each round — risk: the final JSON may be cut off if set too low |
+| `WEBX_VERBOSE` | *(empty)* | Set to `1`, `true`, or `yes` to include verbose scheduler/debug events in terminal output and logs; `--verbose` and `--debug` are equivalent CLI switches. |
+| `WEBX_LOG_DIR` | `.aixsec-evidence/logs` | Directory for private terminal session logs. |
 
 #### Pipeline, scope and scan permissions
 
@@ -278,6 +325,8 @@ Boolean switches use `1` (enabled) and `0` (disabled). Defaults below come from 
 |---|---|---|
 | `WEBX_SCAN_BACKEND` | `auto` | Backend: auto, zap, wapiti, http, none or legacy. auto prefers ZAP, otherwise HTTP baseline. |
 | `WEBX_PLANNER_ENABLED` | `1` | Run AI Planner after deterministic scanner stages. |
+| `WEBX_PLANNER_MODE` | `balanced` | Planner strategy: `aggressive`, `balanced`, or `thorough`. This affects planning, not authorization gates. |
+| `WEBX_TECHNOLOGY_CAPABILITY_ENGINE` | `off` | `on` enables the optional technology capability planner; `off` keeps it disabled. This is separate from ZAP rule ordering below. |
 | `WEBX_EVIDENCE_DIR` | `.aixsec-evidence` | Root directory for private session evidence, progress and scan history. |
 | `WEBX_RESUME_SESSION` | *(empty)* | Existing session directory inside the evidence root; resume requires matching configuration. |
 | `WEBX_RETRY_INCOMPLETE` | `0` | 1 retries recorded incomplete/error/timeout tasks when resuming; completed tasks are restored. |
@@ -294,13 +343,27 @@ Boolean switches use `1` (enabled) and `0` (disabled). Defaults below come from 
 |---|---|---|
 | `WEBX_ZAP_EXECUTABLE` | `zap.sh` | ZAP executable name/path. Kali can use zaproxy; default discovery also searches platform-specific installations. |
 | `WEBX_ZAP_WORKERS` | `2` | Active ZAP workers (1–8). Anonymous GET/HEAD groups without credentials run concurrently; session-bearing requests and other methods run serially. |
+| `WEBX_ZAP_WORKER_MAX_JOBS` | `100` | Maximum jobs handled by one persistent worker before it is recycled. |
+| `WEBX_ZAP_WORKER_MEMORY_MB` | `0` | Worker memory recycle threshold in MiB; `0` disables memory-based recycling. |
+| `WEBX_ZAP_BATCH_SIZE` | `8` | Maximum request groups placed in one scheduling batch (1–32). |
 | `WEBX_ZAP_STARTUP_TIMEOUT` | `120` | Seconds allowed for a persistent ZAP worker to become API-ready. Timed-out processes are terminated so their port/home can be reused safely. |
 | `WEBX_ZAP_CONCURRENCY_FILE` | *(empty)* | JSON policy by origin, auth_context and path: `parallel_read` for declared independent reads including authenticated captures; `serial` takes precedence. Does not create new sessions; see worker guide. |
 | `WEBX_ZAP_COOKIE_PARALLEL` | `auto` | `auto`: fresh controls, one worker/origin initially, up to two after a stable trial, back to one on instability. `strict`: serialize cookies; `guest`: operator opt-in for guest cookies. Explicit policy takes precedence. |
 | `WEBX_ZAP_ROUTE_GROUPS_FILE` | *(empty)* | Operator-owned JSON route groups for slug deduplication; empty preserves default structural grouping. See the worker guide below. |
+| `WEBX_ZAP_ROUTE_FAMILY_MODE` | `1` | Enable structural route-family grouping. Coverage seeds are admitted before this optimization. |
+| `WEBX_FAMILY_SCAN` | `on` | `on` scans family representatives; `off` retains all scheduled groups. The `full` terminal profile sets this off. |
+| `WEBX_FAMILY_DIVERGENCE_SAMPLES` | `2` | Number of additional family members sampled for divergence checks (minimum 1). |
+| `WEBX_FAMILY_SPLIT_MAX_DEPTH` | `4` | Maximum recursive splits when members of a route family diverge. |
+| `WEBX_FAMILY_CONFIDENCE_THRESHOLD` | `0.6` | Confidence threshold, clamped to 0–1, for accepting a route family. |
+| `WEBX_FAMILY_AI_ASSISTANCE` | `0` | Opt in to AI assistance for ambiguous route-family decisions; deterministic grouping remains primary. |
+| `WEBX_FAMILY_AI_MAX_FAMILIES` | `20` | Maximum ambiguous families sent for optional AI assistance. |
+| `WEBX_ZAP_ROUTE_FAMILY_REPRESENTATIVES_SMALL` | `1` | Representatives retained for small route families. |
+| `WEBX_ZAP_ROUTE_FAMILY_REPRESENTATIVES_MEDIUM` | `2` | Representatives retained for medium route families. |
+| `WEBX_ZAP_ROUTE_FAMILY_REPRESENTATIVES_LARGE` | `3` | Representatives retained for large route families. |
+| `WEBX_ZAP_ROUTE_FAMILY_REPRESENTATIVES_EXTRA_LARGE` | `4` | Representatives retained for extra-large route families. |
 | `WEBX_ZAP_TIMEOUT` | `600` | Timeout in seconds for each ZAP process, not the whole session. |
 | `WEBX_ZAP_STRENGTH` | `Medium` | Active scan strength: Low, Medium, High or Insane; higher levels send more payloads. |
-| `WEBX_ZAP_PHASE_MINUTES` | `2` | Per-phase duration in minutes (minimum 1): spider, AJAX, passive wait, active scan/rule. |
+| `WEBX_ZAP_PHASE_MINUTES` | `2` | Legacy/custom fallback duration when a named terminal profile has not supplied separate Spider, AJAX, passive and active budgets. |
 | `WEBX_ZAP_MAX_URLS` | `200` | Hard cap on captured request structures admitted to route grouping and active scanning. The ZAP spider itself remains bounded by phase duration/depth/children. |
 | `WEBX_ZAP_PARAMETERIZED_FIRST` | `1` | When captured parameterized/body requests exist, omit unparameterized groups from automatic active scanning. Set `0` to retain legacy broad scheduling. |
 | `WEBX_ZAP_DISCOVERED_GET_PROBES` | `5` | Maximum read-like JavaScript-discovered GET/UNKNOWN endpoints checked with bounded quote-parity when SQLi rule 40018 is enabled. `0` disables it. |
@@ -474,13 +537,25 @@ broken tools. If you see repeated `error`/`blocked` for `nuclei_scan` or
 
 ```
 root@aixsec-x:~# Analyze https://example.com                   → agent calls tools and concludes
+root@aixsec-x:~# Analyze and scan https://next.example         → archive the current target and switch to a clean session-scoped target automatically
 root@aixsec-x:~# Run nuclei severity high                      → attack the target
 root@aixsec-x:~# /findings                                     → view ledger (candidate/confirmed/ruled_out)
 root@aixsec-x:~# /report                                       → export markdown report
+root@aixsec-x:~# /config                                       → reopen settings wizard and apply changes in this session
 root@aixsec-x:~# /capabilities                                 → list tool/binary/version availability (v1.6.0)
 root@aixsec-x:~# !! nmap -p- 10.0.0.5                          → run a shell command directly (at your own risk)
 root@aixsec-x:~# q                                             → quit
 ```
+
+When a message contains a literal URL/domain/IP and an explicit scan request,
+the intent router can switch targets without `/config`. A deterministic parser
+extracts and normalizes only targets actually present in the message (including
+Markdown and escaped URLs). High-confidence common commands use a fast rule;
+other languages, indirect wording and typos are classified by the configured
+AI model using a fixed JSON schema. The AI can classify intent but cannot add a
+target or grant scope. Ambiguous and multi-target requests require operator
+confirmation; discussion and explicit negation never change scope. The prior
+target's report/inventory is saved before a clean session-scoped switch.
 
 ## Safety mechanisms (what makes it different from METATRON)
 

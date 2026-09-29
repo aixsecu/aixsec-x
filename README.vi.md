@@ -219,6 +219,73 @@ python3 agent.py --non-interactive                # tự động chạy
 
 Chế độ `--non-interactive`/`--oneshot` chỉ đọc env (không hỏi) — dùng cho script/CI.
 
+### Chế độ scan chọn từ terminal
+
+Khi chạy `python3 agent.py` ở chế độ interactive, tool hiển thị menu để chọn
+`1` (Fast), `2` (Balanced) hoặc `3` (Full). Nhấn Enter sẽ chọn Balanced. Chế độ
+đang dùng được hiển thị ở dòng `SCAN-MODE` trên banner đầu phiên.
+
+Bạn cũng có thể chọn trực tiếp bằng tham số dòng lệnh, không cần biến env:
+
+```bash
+python3 agent.py --scan-profile fast
+python3 agent.py --scan-profile balanced
+python3 agent.py --scan-profile full
+python3 agent.py --list-scan-profiles
+```
+
+- `fast`: vẫn giữ coverage gate và seed form GET/POST an toàn, sau đó tối ưu
+  theo route-family và dùng giới hạn crawl/scan ngắn hơn.
+- `balanced`: chế độ khuyên dùng, cân bằng tốc độ và độ phủ; công nghệ chỉ dùng
+  để ưu tiên thứ tự thay vì loại bỏ kiểm tra.
+- `full`: tắt rút gọn route-family và technology filtering, dùng ZAP strength
+  `High`, đồng thời tăng giới hạn crawl/scan nên có thể chạy lâu hơn đáng kể.
+
+Mỗi profile dùng soft budget riêng cho từng phase và một hard guardrail lớn hơn:
+
+| Profile | Spider | AJAX | Passive | Active/nhóm | Hard limit ZAP | Hard limit phiên |
+|---|---:|---:|---:|---:|---:|---:|
+| Fast | 1 phút | 1 phút | 1 phút | 1 phút | 5 phút | 15 phút |
+| Balanced | 2 phút | 3 phút | 1 phút | 3 phút | 12 phút | 45 phút |
+| Full | 5 phút | 8 phút | 2 phút | 8 phút | 22 phút | 120 phút |
+
+ZAP xuất checkpoint khôi phục sau Spider truyền thống và AJAX Spider. Nếu phase
+sau chạm hard limit, tool dùng HAR/URL checkpoint hợp lệ gần nhất thay vì trả
+Discovery về 0. Worker JVM được khởi động lazy, nên baseline chỉ mở một worker
+dù Full cho phép bốn active worker. Persistent scanner history được tách theo
+profile; các lần chạy lặp lại cùng profile vẫn tránh công việc đã thử.
+
+Profile chọn trên CLI ghi đè các thiết lập hiệu năng tương ứng từ env, nhưng
+không tự bật active scan, OAST, SQLMap hoặc extraction nếu các cổng quyền đó
+đang tắt. Nếu không truyền `--scan-profile`, menu interactive sẽ quyết định;
+luồng non-interactive giữ cấu hình hiện có và báo profile `custom`.
+
+### Cài đặt người dùng không cần biến WEBX
+
+Với cách dùng terminal thông thường, hãy tạo một file cấu hình cục bộ bằng
+wizard thay vì export từng biến riêng lẻ:
+
+```bash
+python3 agent.py --configure
+python3 agent.py --show-config
+# Có thể chọn file khác:
+python3 agent.py --configure --config /duong/dan/aixsec.json
+```
+
+File mặc định là `.aixsec-config.json` trong thư mục đang chạy, được ghi với
+permission `0600` và đã được Git bỏ qua. File chỉ chứa các quyết định của
+operator: target/source được cấp quyền, profile/backend, active scan, AJAX,
+Nuclei, content discovery, AI Planner, advanced coverage, quyền SQLMap,
+extraction và OAST. Wizard không hỏi hay lưu mật khẩu/token.
+
+Khi khởi động, banner hiển thị backend hiệu lực và các cổng quyền quan trọng.
+Luồng interactive vẫn hiện menu Fast/Balanced/Full và dùng profile đã lưu làm
+lựa chọn mặc định. Dùng `--config` để chọn một file cấu hình khác.
+
+Các biến `WEBX_*` bên dưới vẫn dùng được cho cấu hình nâng cao và script/CI.
+Giá trị lưu bởi wizard được ưu tiên hơn biến env tương ứng; tham số
+`--scan-profile` được ưu tiên cao nhất.
+
 ### Cấu hình qua env
 
 Các công tắc boolean dùng `1` (bật) và `0` (tắt). Mặc định dưới đây lấy từ `config.py`; giá trị trống nghĩa là chưa đặt cấu hình cụ thể.
@@ -248,6 +315,8 @@ Các công tắc boolean dùng `1` (bật) và `0` (tắt). Mặc định dướ
 | `WEBX_OUTPUT_CAP` | `5000` | Giới hạn ký tự output tool đưa vào context |
 | `WEBX_NUM_PREDICT` | `0` | **v1.4.2** giới hạn cứng số token model sinh mỗi lượt. `0`=không giới hạn (mặc định). Đặt `512-2048` nếu model viết essay dài làm chậm từng round — rủi ro: final JSON có thể bị cắt cụt nếu đặt quá thấp |
 | `WEBX_INVENTORY_FILE` | *(trống)* | Đường dẫn lưu Attack Surface Inventory JSON sau mỗi vòng và khi thoát; trống không lưu file inventory riêng. |
+| `WEBX_VERBOSE` | *(trống)* | Đặt `1`, `true` hoặc `yes` để hiện event scheduler/debug chi tiết trên terminal và log; tương đương tham số CLI `--verbose` hoặc `--debug`. |
+| `WEBX_LOG_DIR` | `.aixsec-evidence/logs` | Thư mục lưu log terminal riêng tư của từng phiên. |
 
 #### Pipeline, phạm vi và quyền quét
 
@@ -255,6 +324,8 @@ Các công tắc boolean dùng `1` (bật) và `0` (tắt). Mặc định dướ
 |---|---|---|
 | `WEBX_SCAN_BACKEND` | `auto` | Backend: auto, zap, wapiti, http, none hoặc legacy. auto ưu tiên ZAP, nếu thiếu thì dùng HTTP baseline. |
 | `WEBX_PLANNER_ENABLED` | `1` | Chạy AI Planner sau các bước scanner tự động. |
+| `WEBX_PLANNER_MODE` | `balanced` | Chiến lược planner: `aggressive`, `balanced` hoặc `thorough`; không thay đổi các cổng cấp quyền. |
+| `WEBX_TECHNOLOGY_CAPABILITY_ENGINE` | `off` | `on` bật capability planner công nghệ tùy chọn; `off` tắt. Thiết lập này tách biệt với thứ tự rule ZAP bên dưới. |
 | `WEBX_EVIDENCE_DIR` | `.aixsec-evidence` | Thư mục gốc lưu bằng chứng riêng tư, tiến độ phiên và lịch sử quét. |
 | `WEBX_RESUME_SESSION` | *(trống)* | Thư mục phiên đã có trong evidence root; tiếp tục phiên yêu cầu cấu hình tương thích. |
 | `WEBX_RETRY_INCOMPLETE` | `0` | 1 thử lại tác vụ chưa hoàn tất/lỗi/timeout khi resume; tác vụ hoàn tất được khôi phục. |
@@ -271,13 +342,38 @@ Các công tắc boolean dùng `1` (bật) và `0` (tắt). Mặc định dướ
 |---|---|---|
 | `WEBX_ZAP_EXECUTABLE` | `zap.sh` | Tên/đường dẫn executable ZAP. Kali có thể dùng zaproxy; cơ chế tìm mặc định cũng dò bản cài theo hệ điều hành. |
 | `WEBX_ZAP_WORKERS` | `2` | Số worker ZAP active (1–8). Nhóm GET/HEAD anonymous không có credential chạy song song; request có session và method khác chạy tuần tự. |
+| `WEBX_ZAP_STARTUP_TIMEOUT` | `120` | Số giây chờ một worker ZAP persistent sẵn sàng qua API; tiến trình timeout được kết thúc an toàn để tái sử dụng port/home. |
+| `WEBX_ZAP_WORKER_MAX_JOBS` | `100` | Số job tối đa một worker persistent xử lý trước khi được khởi động lại. |
+| `WEBX_ZAP_WORKER_MEMORY_MB` | `0` | Ngưỡng bộ nhớ worker tính bằng MiB để tái khởi động; `0` tắt kiểm tra theo bộ nhớ. |
+| `WEBX_ZAP_BATCH_SIZE` | `8` | Số nhóm request tối đa trong một batch lập lịch (1–32). |
 | `WEBX_ZAP_CONCURRENCY_FILE` | *(trống)* | Policy JSON theo origin, auth_context và đường dẫn: `parallel_read` cho request đọc đã xác định độc lập, kể cả có đăng nhập; `serial` ưu tiên giữ thứ tự. Không tạo session mới; xem hướng dẫn worker. |
 | `WEBX_ZAP_COOKIE_PARALLEL` | `auto` | `auto`: tự kiểm tra đối chứng, bắt đầu 1 worker/origin, tăng tối đa 2 khi ổn định và giảm về 1 khi có tín hiệu lỗi. `strict`: tuần tự khi có cookie; `guest`: operator cho phép cookie khách. Policy thủ công vẫn được ưu tiên. |
 | `WEBX_ZAP_ROUTE_GROUPS_FILE` | *(trống)* | File JSON nhóm route do operator khai báo để gộp slug; trống giữ cách nhóm cấu trúc mặc định. Xem hướng dẫn worker bên dưới. |
+| `WEBX_ZAP_ROUTE_FAMILY_MODE` | `1` | Bật nhóm route-family theo cấu trúc. Coverage seed được đưa vào trước bước tối ưu này. |
+| `WEBX_FAMILY_SCAN` | `on` | `on` quét các đại diện của family; `off` giữ toàn bộ nhóm đã lập lịch. Profile `full` đặt biến này thành off trong nội bộ. |
+| `WEBX_FAMILY_DIVERGENCE_SAMPLES` | `2` | Số member bổ sung lấy mẫu để kiểm tra khác biệt trong family (tối thiểu 1). |
+| `WEBX_FAMILY_SPLIT_MAX_DEPTH` | `4` | Độ sâu chia tách đệ quy tối đa khi các member trong route-family khác nhau. |
+| `WEBX_FAMILY_CONFIDENCE_THRESHOLD` | `0.6` | Ngưỡng tin cậy, giới hạn 0–1, để chấp nhận một route-family. |
+| `WEBX_FAMILY_AI_ASSISTANCE` | `0` | Cho phép AI hỗ trợ quyết định route-family chưa rõ; thuật toán xác định vẫn là cơ chế chính. |
+| `WEBX_FAMILY_AI_MAX_FAMILIES` | `20` | Số family chưa rõ tối đa được gửi cho bước AI hỗ trợ tùy chọn. |
+| `WEBX_ZAP_ROUTE_FAMILY_REPRESENTATIVES_SMALL` | `1` | Số đại diện giữ lại cho route-family nhỏ. |
+| `WEBX_ZAP_ROUTE_FAMILY_REPRESENTATIVES_MEDIUM` | `2` | Số đại diện giữ lại cho route-family vừa. |
+| `WEBX_ZAP_ROUTE_FAMILY_REPRESENTATIVES_LARGE` | `3` | Số đại diện giữ lại cho route-family lớn. |
+| `WEBX_ZAP_ROUTE_FAMILY_REPRESENTATIVES_EXTRA_LARGE` | `4` | Số đại diện giữ lại cho route-family rất lớn. |
 | `WEBX_ZAP_TIMEOUT` | `600` | Timeout giây cho mỗi tiến trình ZAP, không phải tổng phiên. |
 | `WEBX_ZAP_STRENGTH` | `Medium` | Cường độ active scan: Low, Medium, High hoặc Insane; mức cao gửi nhiều payload hơn. |
-| `WEBX_ZAP_PHASE_MINUTES` | `2` | Thời lượng từng pha tính bằng phút (tối thiểu 1): spider, AJAX, chờ passive, active scan/rule. |
-| `WEBX_ZAP_MAX_URLS` | `200` | Chỉ là ước tính lập kế hoạch; không giới hạn cứng URL được phát hiện hay quét. |
+| `WEBX_ZAP_PHASE_MINUTES` | `2` | Thời lượng fallback cho cấu hình custom/legacy khi profile terminal chưa cung cấp budget Spider, AJAX, passive và active riêng. |
+| `WEBX_ZAP_MAX_URLS` | `200` | Giới hạn cứng số cấu trúc request đã bắt được đưa vào nhóm route và active scan. Spider ZAP vẫn bị giới hạn riêng bởi thời lượng pha, độ sâu và số node con. |
+| `WEBX_ZAP_PARAMETERIZED_FIRST` | `1` | Khi có request chứa tham số/body, bỏ nhóm không có tham số khỏi active scan tự động. Đặt `0` để giữ lịch quét rộng kiểu cũ. |
+| `WEBX_ZAP_DISCOVERED_GET_PROBES` | `5` | Số endpoint GET/UNKNOWN kiểu đọc phát hiện từ JavaScript được kiểm tra quote-parity có giới hạn khi rule SQLi 40018 bật; `0` để tắt. |
+| `WEBX_ZAP_DISCOVERED_FORM_PROBES` | `5` | Số form tìm kiếm GET/POST anonymous phát hiện trong HTML được kiểm tra từng input bằng quote-parity; `0` để tắt. Form nhạy cảm hoặc không phải tìm kiếm không tự gửi. |
+| `WEBX_COVERAGE_GATE` | `1` | Chỉ coi discovery đủ coverage khi mọi input đã được seed, bắt request, kiểm thử, đánh dấu không hỗ trợ hoặc bỏ qua kèm lý do policy. |
+| `WEBX_SEED_GET_FORMS` | `1` | Tạo request GET vô hại với giá trị `aixsec-test` cho input đã phát hiện trước route-family reduction và đưa vào targeted ZAP scan; không seed trường nhạy cảm. |
+| `WEBX_SEED_SAFE_POST_FORMS` | `1` | Chỉ seed form POST chưa bắt khi field được phân loại là tìm kiếm/lọc và không có token động hay trường phá hủy; write khác được ghi rõ là policy skip. |
+| `WEBX_TECH_FILTER_MODE` | `priority` | `priority` giữ mọi rule ZAP được phép và ưu tiên family phù hợp; `strict` cho phép capability filtering; `off` tắt sắp xếp/lọc theo công nghệ. |
+| `WEBX_ADVANCED_COVERAGE` | `1` | Tạo `advanced-coverage.json` cho multi-role authorization, DOM/browser, GraphQL, SOAP/XML, WebSocket, OAST và business workflow; prerequisite thiếu được ghi thành gap. |
+| `WEBX_ALLOW_OAST` | `0` | Khai báo OAST đã được cấp quyền; không tự tạo hay suy đoán callback service. |
+| `WEBX_OAST_CALLBACK_URL` | *(trống)* | Endpoint callback HTTP(S) do operator kiểm soát, chỉ dùng để đánh dấu prerequisite OAST sẵn sàng; secret/path callback không đưa vào coverage công khai. |
 | `WEBX_ZAP_DELAY_MS` | `200` | Độ trễ giữa các request active scan, tính bằng mili giây. |
 | `WEBX_ZAP_AJAX` | `1` | Bật AJAX Spider để khám phá qua trình duyệt. |
 | `WEBX_ZAP_BROWSER` | `firefox-headless` | ID trình duyệt Selenium cho AJAX Spider; cần trình duyệt/driver tương ứng. |
@@ -435,13 +531,25 @@ mấy tool đang hỏng. Nếu thấy `error`/`blocked` lặp lại ở `nuclei_
 
 ```
 root@aixsec-x:~# Phân tích https://example.com              → agent tự gọi tool + trả kết luận
+root@aixsec-x:~# Phân tích và tìm lỗ hổng https://b.com      → tự lưu target hiện tại và chuyển sang target mới trong phiên sạch
 root@aixsec-x:~# Quét nuclei severity high                  → tấn công mục tiêu
 root@aixsec-x:~# /findings                                  → xem ledger (candidate/confirmed/ruled_out)
 root@aixsec-x:~# /report                                    → xuất report markdown
+root@aixsec-x:~# /config                                    → mở lại wizard và áp dụng cấu hình ngay trong phiên
 root@aixsec-x:~# /capabilities                              → liệt kê tool/binary/version khả dụng (v1.6.0)
 root@aixsec-x:~# !! nmap -p- 10.0.0.5                       → chạy shell trực tiếp (tự chịu trách nhiệm)
 root@aixsec-x:~# q                                          → thoát
 ```
+
+Khi tin nhắn chứa URL/domain/IP cụ thể và yêu cầu scan rõ ràng, intent router
+có thể chuyển target mà không cần `/config`. Parser xác định chỉ trích xuất và
+chuẩn hóa target thực sự xuất hiện trong tin nhắn, gồm cả URL Markdown hoặc bị
+escape. Lệnh phổ biến có độ chắc chắn cao dùng rule nhanh; ngôn ngữ khác, cách
+diễn đạt gián tiếp và lỗi chính tả được model AI đang cấu hình phân loại bằng
+JSON schema cố định. AI chỉ phân loại ý định, không được thêm target hay cấp
+scope. Yêu cầu mơ hồ hoặc nhiều target phải được operator xác nhận; thảo luận
+hoặc phủ định rõ ràng không làm đổi scope. Report/inventory của target trước
+được lưu trước khi chuyển sang phiên sạch mới.
 
 ## Cơ chế an toàn (làm khác METATRON)
 

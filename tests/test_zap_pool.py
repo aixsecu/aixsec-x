@@ -43,10 +43,17 @@ class WorkerPoolTests(unittest.TestCase):
         self.assertIs(first,second);self.assertEqual(len(created),1)
         self.assertEqual(pool.snapshot()['reuse_ratio'],.5)
 
+    def test_pool_starts_one_worker_and_expands_lazily(self):
+        pool,created=self.pool(4);pool.start()
+        self.assertEqual(len(created),1)
+        first=pool.acquire();second=pool.acquire()
+        self.assertEqual(len(created),2)
+        first.__exit__(None,None,None);second.__exit__(None,None,None)
+
     def test_recycles_only_worker_at_job_limit(self):
         pool,created=self.pool(2,zap_worker_max_jobs=1);pool.start()
         with pool.acquire() as worker: worker.jobs+=1
-        self.assertTrue(worker.closed);self.assertEqual(len(created),3)
+        self.assertTrue(worker.closed);self.assertEqual(len(created),2)
         self.assertEqual(pool.metrics['recycled'],1)
         self.assertFalse(created[1].closed)
 

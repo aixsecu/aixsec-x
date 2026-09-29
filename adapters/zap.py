@@ -168,7 +168,11 @@ def build_plan(config, target, workdir, *, active=False, rule_ids=(), auth_conte
             raise ValueError('Batched ZAP seeds must remain within one origin')
         context['includePaths'] = sorted({re.escape(origin(value) + (urlsplit(value).path or '/')) + r'(?:\?.*)?$'
                                           for value in targets})
-    minutes = max(1, int(config.get('zap_phase_minutes', 2)))
+    legacy_minutes = max(1, int(config.get('zap_phase_minutes', 2)))
+    spider_minutes = max(1, int(config.get('zap_spider_minutes', legacy_minutes)))
+    ajax_minutes = max(1, int(config.get('zap_ajax_minutes', legacy_minutes)))
+    passive_minutes = max(1, int(config.get('zap_passive_minutes', legacy_minutes)))
+    active_minutes = max(1, int(config.get('zap_active_minutes', legacy_minutes)))
     common = {'context': 'aixsec', **({'user': user} if user else {})}
     depth = max(1, int(config.get('zap_spider_depth', 10)))
     jobs = [{'type': 'passiveScan-config', 'parameters': {'scanOnlyInScope': True}}]
@@ -226,11 +230,17 @@ def build_plan(config, target, workdir, *, active=False, rule_ids=(), auth_conte
                      'targetUrl': origin(target)}})
     if not (seed_entry or seed_entries):
         jobs.append({'type': 'spider', 'parameters': {**common, 'url': target,
-            'maxDuration': minutes, 'maxDepth': depth,
+            'maxDuration': spider_minutes, 'maxDepth': depth,
             'maxChildren': max(1, int(config.get('zap_spider_children', 50))), 'logoutAvoidance': True}})
+        jobs.extend([
+            {'type': 'export', 'parameters': {'context': 'aixsec', 'type': 'har', 'source': 'all',
+                'fileName': str(Path(workdir) / 'traffic-spider.har')}},
+            {'type': 'export', 'parameters': {'context': 'aixsec', 'type': 'url', 'source': 'all',
+                'fileName': str(Path(workdir) / 'urls-spider.txt')}},
+        ])
     if ajax and not (seed_entry or seed_entries):
         jobs.append({'type': 'spiderAjax', 'parameters': {**common, 'url': target,
-            'maxDuration': minutes, 'maxCrawlDepth': depth, 'numberOfBrowsers': 1,
+            'maxDuration': ajax_minutes, 'maxCrawlDepth': depth, 'numberOfBrowsers': 1,
             'inScopeOnly': True, 'scopeCheck': 'Strict',
             'browserId': config.get('zap_browser', 'firefox-headless'),
             'clickDefaultElems': False,
@@ -238,7 +248,13 @@ def build_plan(config, target, workdir, *, active=False, rule_ids=(), auth_conte
             'randomInputs': True, 'clickElemsOnce': True, 'logoutAvoidance': True,
             'eventWait': 1500, 'reloadWait': 1500,
             'maxCrawlStates': max(1, int(config.get('zap_ajax_states', 100)))}})
-    jobs.append({'type': 'passiveScan-wait', 'parameters': {'maxDuration': minutes}})
+        jobs.extend([
+            {'type': 'export', 'parameters': {'context': 'aixsec', 'type': 'har', 'source': 'all',
+                'fileName': str(Path(workdir) / 'traffic-ajax.har')}},
+            {'type': 'export', 'parameters': {'context': 'aixsec', 'type': 'url', 'source': 'all',
+                'fileName': str(Path(workdir) / 'urls-ajax.txt')}},
+        ])
+    jobs.append({'type': 'passiveScan-wait', 'parameters': {'maxDuration': passive_minutes}})
     if active:
         allowed = {int(x) for x in config.get('zap_allowed_rules', [])}
         selected = {int(x) for x in rule_ids}
@@ -266,11 +282,11 @@ def build_plan(config, target, workdir, *, active=False, rule_ids=(), auth_conte
             'policyDefinition': {'defaultStrength': strength, 'defaultThreshold': 'Off',
                 'rules': [{'id': i, 'strength': strength, 'threshold': 'Medium'} for i in sorted(selected)]}})
         jobs.append({'type': 'activeScan', 'parameters': {**common,
-            'policy': 'aixsec-targeted', 'maxScanDurationInMins': minutes,
-            'maxRuleDurationInMins': minutes, 'threadPerHost': 1,
+            'policy': 'aixsec-targeted', 'maxScanDurationInMins': active_minutes,
+            'maxRuleDurationInMins': active_minutes, 'threadPerHost': 1,
             'injectPluginIdInHeader': True,
             'delayInMs': int(config.get('zap_delay_ms', 200))}})
-        jobs.append({'type': 'passiveScan-wait', 'parameters': {'maxDuration': minutes}})
+        jobs.append({'type': 'passiveScan-wait', 'parameters': {'maxDuration': passive_minutes}})
     jobs.extend([
         {'type': 'export', 'alwaysRun': True, 'parameters': {'context': 'aixsec',
             'type': 'har', 'source': 'all', 'fileName': str(Path(workdir) / 'traffic.har')}},
@@ -553,6 +569,10 @@ def run_scan(config, url, *, active=False, rule_ids=(), auth_context='anonymous'
         except (ValueError, TypeError, KeyError) as exc:
             parse_error = str(exc)
     urls_path = directory / 'urls.txt'
+    if not urls_path.exists() or not urls_path.stat().st_size:
+        urls_path = next((candidate for candidate in
+            (directory / 'urls-ajax.txt', directory / 'urls-spider.txt')
+            if candidate.exists() and candidate.stat().st_size), urls_path)
     urls = []
     if urls_path.exists():
         urls = sorted({canonical_url(v.strip()) for v in urls_path.read_text().splitlines()
@@ -579,7 +599,16 @@ def run_scan(config, url, *, active=False, rule_ids=(), auth_context='anonymous'
         row['auth_state'] = auth_state
     from zap_discovery import Discovery
     discovery = Discovery(url, auth_context, rule_ids if active else ())
-    har_path = directory / 'traffic.har'
+    def valid_har(candidate):
+        try:
+            value = json.loads(candidate.read_text(encoding='utf-8'))
+            return isinstance(value, dict) and isinstance((value.get('log') or {}).get('entries'), list)
+        except (OSError, UnicodeDecodeError, ValueError, TypeError):
+            return False
+    final_har = directory / 'traffic.har'
+    har_path = next((candidate for candidate in
+        (final_har, directory / 'traffic-ajax.har', directory / 'traffic-spider.har')
+        if candidate.exists() and valid_har(candidate)), final_har)
     inventory_error = ''
     if har_path.exists():
         har_path.chmod(0o600)
@@ -708,6 +737,7 @@ def run_scan(config, url, *, active=False, rule_ids=(), auth_context='anonymous'
     coverage['active_evidence'] = diagnostics
     coverage.update(status_meaning='execution_only_not_full_coverage', phases=phases, gaps=gaps,
                     inventory_path=str(inventory_path), har_path=str(har_path),
+                    har_checkpoint_used=har_path.name if har_path != final_har else '',
                     active_requests_path=str(active_path),
                     inventory_summary=inventory['summary'],
                     captured_requests=inventory['request_count'], active_test_requests=inventory['test_request_count'])

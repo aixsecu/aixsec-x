@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 import os
+from pathlib import Path
 import re
 import sys
 import time
@@ -26,7 +27,11 @@ from urllib.parse import urljoin
 # ── local imports ──
 from terminal_output import TerminalOutput, prompt as terminal_prompt
 from config import SCAN_PROFILES, apply_scan_profile, load_config
+from user_config import (DEFAULT_USER_CONFIG, apply_user_config,
+                         configure_interactive, load_user_config,
+                         public_summary, save_user_config, USER_CONFIG_KEYS)
 from inventory import Inventory, TestHistory
+from intent_router import classify as classify_intent, extract_targets, transition_action
 from ledger import (Ledger, parse_findings_json, render_markdown, validation_plan,
                    check_findings_evidence)
 from llm import InjectionGuard, ollama_chat
@@ -572,6 +577,8 @@ class WebXAgent:
             cap = TOOL_TIMEOUTS.get(name, self.config["tool_timeout"])
             if name.startswith("zap_"):
                 kw["_timeout"] = int(self.config.get("zap_timeout", 300))
+            elif name == "sql_error_verify":
+                kw["_timeout"] = max(5, int(self.config.get("verification_timeout", 60)))
             elif modern and name == "nuclei_scan":
                 kw["_timeout"] = max(1, int(self.config.get("nuclei_timeout", 600)))
             elif name == "wapiti_scan":
@@ -1641,6 +1648,9 @@ def _banner(cfg: dict, scope: str = "", missing=None, mode: str = "interactive",
         pad = max(0, (W - len(vis(t))) // 2)
         return " " * pad + t
 
+    def onoff(key: str) -> str:
+        return 'ON' if cfg.get(key, False) else 'OFF'
+
     lines = [""]
     for s in _AIXSEC_ART.strip("\n").splitlines():
         lines.append(center(f"{G}{B}{s.rstrip()}{RS}"))
@@ -1651,8 +1661,12 @@ def _banner(cfg: dict, scope: str = "", missing=None, mode: str = "interactive",
     lines.append(center(f"{D}{'─' * W}{RS}"))
     lines.append("")
     lines.append(f"{C}{B}[>]{RS} {D}{'model':<9}{RS} {B}{info['python']} | {cfg.get('model', '?')}{RS}")
+    lines.append(f"{C}{B}[>]{RS} {D}{'scan-mode':<9}{RS} {A}{B}{str(cfg.get('scan_profile', 'custom')).upper()}{RS}")
+    lines.append(f"{C}{B}[>]{RS} {D}{'scanner':<9}{RS} {B}{cfg.get('scan_backend', 'auto')}{RS}"
+                 f"{D}  active={onoff('allow_active_scan')} ajax={onoff('zap_ajax')} nuclei={onoff('nuclei_enabled')}{RS}")
+    lines.append(f"{C}{B}[>]{RS} {D}{'opt-ins':<9}{RS} {Y}sqlmap={onoff('allow_sqlmap')}"
+                 f" oast={onoff('allow_oast')} extraction={onoff('allow_extraction')}{RS}")
     lines.append(f"{C}{B}[>]{RS} {D}{'scope':<9}{RS} {G}{scope}{RS}")
-    lines.append(f"{C}{B}[>]{RS} {D}{'profile':<9}{RS} {A}{cfg.get('scan_profile', 'custom')}{RS}")
     lines.append(f"{C}{B}[>]{RS} {D}{'auto-exec':<9}{RS} {Y}{cfg.get('auto_exec', 'ask')}{RS}{D}   mode: {A}{mode}{RS}")
     lines.append(f"{C}{B}[>]{RS} {D}{'host':<9}{RS} {B}{info['host']}{RS}{D}  kernel {info['kernel']}{RS}")
     lines.append(f"{C}{B}[>]{RS} {D}{'session':<9}{RS} {info['ts']}{D}  pid {info['pid']}{RS}")
@@ -1708,8 +1722,88 @@ def _print_scan_profiles():
         print(f"  {name:<8} {descriptions[name]}")
 
 
-def _main():
+def select_scan_profile_interactive(cfg: dict) -> dict:
+    """Show the startup profile menu and return the resolved configuration."""
+    choices = {"1": "fast", "2": "balanced", "3": "full"}
+    print("\n╭──────────────── CHỌN CHẾ ĐỘ SCAN ────────────────╮")
+    print("│  1. FAST      Nhanh, coverage cơ bản             │")
+    print("│  2. BALANCED  Cân bằng tốc độ/độ phủ (khuyên dùng)│")
+    print("│  3. FULL      Quét rộng và sâu, thời gian lâu hơn │")
+    print("╰───────────────────────────────────────────────────╯")
+    default_profile = cfg.get('scan_profile') if cfg.get('scan_profile') in SCAN_PROFILES else 'balanced'
+    default_choice = next((number for number, name in choices.items()
+                           if name == default_profile), '2')
+    while True:
+        try:
+            selected = input(f"Chọn chế độ [1/2/3] (mặc định {default_choice}): ").strip() or default_choice
+        except EOFError:
+            selected = default_choice
+            print(f"\n[>] Không có input; sử dụng {default_profile.upper()}.")
+        profile = choices.get(selected)
+        if profile:
+            resolved = apply_scan_profile(cfg, profile)
+            print(f"[>] SCAN MODE: {profile.upper()}\n")
+            return resolved
+        print("[!] Lựa chọn không hợp lệ. Vui lòng nhập 1, 2 hoặc 3.")
+
+
+def _load_cli_config():
     cfg = load_config()
+    selected_path = _cli_option_value('--config')
+    path = Path(selected_path) if selected_path else DEFAULT_USER_CONFIG
+    if selected_path and not path.exists() and '--configure' not in sys.argv:
+        raise ValueError(f'Config file does not exist: {path}')
+    if path.exists():
+        cfg = apply_user_config(cfg, load_user_config(path))
+    return cfg, path
+
+
+def _print_user_settings(cfg):
+    summary = public_summary(cfg)
+    print('Current operator settings:')
+    for key, value in summary.items():
+        shown = str(value).upper() if isinstance(value, bool) else value
+        print(f'  {key:<12} {shown}')
+
+
+def reconfigure_interactive(current_config, path=DEFAULT_USER_CONFIG):
+    """Run the wizard while idle and build a fresh, fully validated config."""
+    defaults = {key: current_config[key] for key in USER_CONFIG_KEYS
+                if key in current_config}
+    settings = configure_interactive(defaults)
+    refreshed = apply_user_config(load_config(), settings)
+    if not refreshed.get('targets') and not refreshed.get('src_dirs'):
+        raise ValueError('Cần ít nhất một target hoặc thư mục source; cấu hình cũ được giữ nguyên')
+    saved = save_user_config(settings, path)
+    return refreshed, saved
+
+
+def switch_scan_target(agent, targets):
+    """Archive visible outputs and create a clean session-scoped target agent."""
+    report = agent.export_report()
+    inventory = agent.save_inventory()
+    config = dict(agent.config)
+    config['targets'] = list(targets)
+    config['resume_session'] = ''
+    replacement = WebXAgent(config=config)
+    return replacement, report, inventory
+
+
+def _main():
+    try:
+        cfg, user_config_path = _load_cli_config()
+    except (ValueError, OSError, json.JSONDecodeError) as exc:
+        print(f'[!] Invalid user configuration: {exc}', file=sys.stderr)
+        raise SystemExit(2) from exc
+
+    if '--configure' in sys.argv:
+        existing = load_user_config(user_config_path) if user_config_path.exists() else {}
+        saved = save_user_config(configure_interactive(existing), user_config_path)
+        print(f'\n[✓] Đã lưu cấu hình: {saved}')
+        return
+    if '--show-config' in sys.argv:
+        _print_user_settings(cfg)
+        return
 
     if "--list-scan-profiles" in sys.argv:
         _print_scan_profiles()
@@ -1735,7 +1829,9 @@ def _main():
     one_shot = "--oneshot" in sys.argv
 
     # Interactive: nhập target/src ngay trên màn hình (từng mục, để trống = bỏ qua)
-    if not non_interactive and not one_shot:
+    if not non_interactive and not one_shot and "--capabilities" not in sys.argv:
+        if not scan_profile:
+            cfg = select_scan_profile_interactive(cfg)
         cfg = resolve_scope_interactive(cfg)
 
     if not cfg["targets"] and not cfg.get("src_dirs"):
@@ -1800,6 +1896,7 @@ def _main():
     # ── interactive ──
     print(f"{DIM}[>]{RESET} {DIM}Type{RESET} {GREEN}'q'{RESET} {DIM}quit |{RESET} {GREEN}'!! <cmd>'{RESET} {DIM}shell |{RESET} "
           f"{GREEN}'/findings'{RESET} {DIM}ledger |{RESET} {GREEN}'/report'{RESET} {DIM}export |{RESET} "
+          f"{GREEN}'/config'{RESET} {DIM}settings |{RESET} "
           f"{GREEN}'/autonomy [goal]'{RESET} {DIM}|{RESET} "
           f"{GREEN}'/context-metrics'{RESET}{DIM}.{RESET}", flush=True)
     while True:
@@ -1821,6 +1918,16 @@ def _main():
         if line == "/report":
             print(f"[*] Saved: {agent.export_report()}")
             continue
+        if line == "/config":
+            try:
+                cfg, saved = reconfigure_interactive(agent.config, user_config_path)
+                agent = WebXAgent(config=cfg)
+                print(f"\n[✓] Đã áp dụng cấu hình mới trong phiên hiện tại: {saved}")
+                _print_banner(cfg, scope=agent.policy.describe(),
+                              missing=agent.missing_tools, mode='interactive')
+            except (ValueError, OSError, json.JSONDecodeError) as exc:
+                print(f"[!] Không thể cập nhật cấu hình: {exc}")
+            continue
         if line == "/capabilities":
             for r in agent.capability_rows():
                 mark = "✔" if r["available"] else "✗"
@@ -1839,6 +1946,30 @@ def _main():
                 print(json.dumps(result, ensure_ascii=False, indent=2))
                 event("output_file", "Attack surface", agent.save_inventory())
             continue
+        literal_targets = extract_targets(line)
+        decision = classify_intent(line, agent.chat, agent.config) if literal_targets else None
+        action = transition_action(decision, agent.policy) if decision else 'none'
+        if decision and decision.source == 'ai':
+            print(f"[intent] {decision.intent} confidence={decision.confidence:.2f}"
+                  + (f" — {decision.reason}" if decision.reason else ''))
+        if action == 'confirm':
+            listed = ', '.join(decision.targets)
+            answer = input(f"Chuyển sang phiên scan mới cho {listed}? [y/N]: ").strip().lower()
+            action = 'switch' if answer in ('y', 'yes', '1') else 'stay'
+        if action == 'switch':
+            try:
+                agent, previous_report, previous_inventory = switch_scan_target(
+                    agent, decision.targets)
+                cfg = agent.config
+                print(f"[*] Đã lưu phiên target trước: {previous_report}")
+                if previous_inventory:
+                    print(f"[*] Attack surface trước: {previous_inventory}")
+                print(f"[✓] Scope phiên hiện tại đã chuyển sang: {', '.join(decision.targets)}")
+                _print_banner(cfg, scope=agent.policy.describe(),
+                              missing=agent.missing_tools, mode='interactive')
+            except (ValueError, OSError) as exc:
+                print(f"[!] Không thể chuyển target: {exc}")
+                continue
         with TerminalOutput(verbose=_verbose()) as terminal:
             terminal.bind(agent)
             result = agent.run(line)
@@ -1863,8 +1994,12 @@ def _verbose():
 def main():
     batch = any(flag in sys.argv for flag in ("--non-interactive", "-n", "--oneshot"))
     utility = any(flag in sys.argv for flag in ("--check-ollama", "--capabilities",
-                                                 "--list-scan-profiles"))
-    cfg = load_config()
+                                                 "--list-scan-profiles", "--configure",
+                                                 "--show-config"))
+    try:
+        cfg, _ = _load_cli_config()
+    except (ValueError, OSError, json.JSONDecodeError):
+        cfg = load_config()
     if batch and not utility and (cfg.get("targets") or cfg.get("src_dirs")):
         with TerminalOutput(verbose=_verbose()):
             _main()

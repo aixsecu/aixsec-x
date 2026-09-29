@@ -20,6 +20,12 @@ SCAN_PROFILES = {
         "zap_spider_children": 30, "zap_discovered_get_probes": 3,
         "zap_discovered_form_probes": 3, "zap_workers": 2,
         "zap_batch_size": 8, "zap_parameterized_first": True,
+        "zap_spider_minutes": 1, "zap_ajax_minutes": 1,
+        "zap_passive_minutes": 1, "zap_active_minutes": 1,
+        "zap_timeout": 300, "profile_session_seconds": 900,
+        "verification_timeout": 30, "profile_ai_timeout": 60,
+        "llm_first_token_timeout": 30, "llm_completion_timeout": 60,
+        "llm_overall_timeout": 60,
     },
     "balanced": {
         "coverage_gate": True, "seed_get_forms": True,
@@ -31,6 +37,12 @@ SCAN_PROFILES = {
         "zap_spider_children": 50, "zap_discovered_get_probes": 5,
         "zap_discovered_form_probes": 5, "zap_workers": 2,
         "zap_batch_size": 8, "zap_parameterized_first": True,
+        "zap_spider_minutes": 2, "zap_ajax_minutes": 3,
+        "zap_passive_minutes": 1, "zap_active_minutes": 3,
+        "zap_timeout": 720, "profile_session_seconds": 2700,
+        "verification_timeout": 60, "profile_ai_timeout": 180,
+        "llm_first_token_timeout": 90, "llm_completion_timeout": 180,
+        "llm_overall_timeout": 210,
     },
     "full": {
         "coverage_gate": True, "seed_get_forms": True,
@@ -42,6 +54,12 @@ SCAN_PROFILES = {
         "zap_spider_children": 100, "zap_discovered_get_probes": 20,
         "zap_discovered_form_probes": 20, "zap_workers": 4,
         "zap_batch_size": 8, "zap_parameterized_first": False,
+        "zap_spider_minutes": 5, "zap_ajax_minutes": 8,
+        "zap_passive_minutes": 2, "zap_active_minutes": 8,
+        "zap_timeout": 1320, "profile_session_seconds": 7200,
+        "verification_timeout": 180, "profile_ai_timeout": 300,
+        "llm_first_token_timeout": 120, "llm_completion_timeout": 300,
+        "llm_overall_timeout": 300,
     },
 }
 
