@@ -83,14 +83,13 @@ def js_references(text):
     are not guessed when options cannot be resolved.
     """
     for m in re.finditer(r'''(?:\$|jQuery)\.(get|post)\(\s*['"]([^'"\n]+)['"]''', text):
-        yield m[2], m[1].upper(), []
+        yield m[2], m[1].upper(), [], None
     # Search widgets are often not real forms: an input calls a function that
     # builds a navigation URL.  Keep this conservative by requiring a literal
     # prefix ending in a named query slot followed by the same JS variable.
-    # Some legacy CMS templates write ``page.html&keyword=`` even though the
-    # value is semantically a first query parameter; normalize that separator
-    # so the active probe targets the parameter rather than appending a second
-    # malformed query string.
+    # Preserve the literal request shape as a value template. Legacy CMS
+    # routes such as ``page.html&keyword=`` are not equivalent to a standard
+    # ``?keyword=`` query and can exercise different server-side code.
     navigation = re.compile(
         r'''(?:window\.)?location(?:\.href)?\s*=\s*['"](?P<prefix>[^'"\n]+[?&](?P<name>[\w.-]+)=)['"]\s*\+\s*(?P<variable>[A-Za-z_$][\w$]*)''')
     for m in navigation.finditer(text):
@@ -98,18 +97,19 @@ def js_references(text):
         if m.group('variable') != name:
             continue
         ref=m.group('prefix')
+        template=ref+'{value}'
         before,separator,tail=ref.rpartition('&')
         if separator and '?' not in before:
             ref=before+'?'+tail
-        yield ref, 'GET', [name]
+        yield ref, 'GET', [name], (name,template)
     for m in re.finditer(r'''\.load\(\s*['"]([^'"\n]+)['"]''', text):
         tail = re.split(r'[\r\n;]', text[m.end():m.end()+500], maxsplit=1)[0]
         params = re.findall(r'''['"]&([\w.-]+)=''', tail)
-        yield m[1], 'UNKNOWN', params  # a data argument can turn .load into POST
+        yield m[1], 'UNKNOWN', params, None  # a data argument can turn .load into POST
     for m in re.finditer(r'''fetch\(\s*['"]([^'"\n]+)['"]''', text):
-        yield m[1], 'UNKNOWN', []
+        yield m[1], 'UNKNOWN', [], None
     for m in re.finditer(r'''\.open\(\s*['"](GET|POST|PUT|PATCH|DELETE)['"]\s*,\s*['"]([^'"\n]+)['"]''', text, re.I):
-        yield m[2], m[1].upper(), []
+        yield m[2], m[1].upper(), [], None
     for m in re.finditer(r'''(?:\$|jQuery)\.ajax\(\s*\{(.{0,4000}?)\}\s*\)''', text, re.S):
         block = m[1]
         url = re.search(r'''\burl\s*:\s*['"]([^'"\n]+)['"]''', block)
@@ -117,7 +117,7 @@ def js_references(text):
         data = re.search(r'\bdata\s*:\s*\{([^{}]*)\}', block)
         params = re.findall(r'''(?:^|,)\s*['"]?([\w.-]+)['"]?\s*:''', data[1]) if data else []
         if url:
-            yield url[1], method[1].upper() if method else 'UNKNOWN', params
+            yield url[1], method[1].upper() if method else 'UNKNOWN', params, None
 
 
 class Discovery:
@@ -130,7 +130,8 @@ class Discovery:
         self.request_count = 0
         self.test_request_count = 0
 
-    def add(self, url, method, params, source, *, sent=False, rule=None):
+    def add(self, url, method, params, source, *, sent=False, rule=None,
+            request_template=None):
         if not same_origin(url, self.target):
             return
         p = urlsplit(url)
@@ -146,6 +147,10 @@ class Discovery:
             'request_count': 0, 'tested_rule_ids': [], 'state': 'discovered'})
         if source not in row['sources']:
             row['sources'].append(source)
+        if request_template:
+            parameter, template=request_template
+            row['request_template'] = EvidenceRedactor().redact_url(template)
+            row['template_parameter'] = parameter
         if sent:
             row['requested'] = True
             row['request_count'] += 1
@@ -179,10 +184,15 @@ class Discovery:
                     'method': form['method'], 'parameters': sorted(set(form['parameters']))})
             self.inputs.extend({'page': redacted, **i} for i in page.inputs)
         if 'html' in mime or 'javascript' in mime:
-            for ref, method, params in js_references(text):
+            for ref, method, params, request_template in js_references(text):
                 if 'javascript' in mime and not document_url and not ref.startswith(('/', 'http://', 'https://')):
                     continue  # Relative script URLs resolve against a document, not /js/.
-                self.add(urljoin(base, ref), method, params, 'javascript_literal')
+                resolved_template=None
+                if request_template:
+                    parameter,template=request_template
+                    resolved_template=(parameter,urljoin(base,template))
+                self.add(urljoin(base, ref), method, params, 'javascript_literal',
+                         request_template=resolved_template)
 
     def har(self, path):
         raw = json.loads(Path(path).read_text())
