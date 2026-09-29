@@ -535,10 +535,12 @@ def _run(agent, user_text):
                 schedule.collect(coverage)
                 for endpoint in ((baseline_result.get('data') or {}).get('discovery') or {}).get('endpoints', []):
                     sources=set(endpoint.get('sources') or [])
-                    path=urlsplit(str(endpoint.get('url') or '')).path.lower()
-                    read_like=any(word in path for word in ('search','find','filter','list','load'))
-                    if ('javascript_literal' in sources and read_like
-                            and endpoint.get('method') in ('GET','UNKNOWN') and endpoint.get('parameters')):
+                    # A route name is not a security property. Probe any
+                    # explicit GET input discovered from JavaScript; UNKNOWN
+                    # is inventory-only because guessing GET can target the
+                    # wrong operation.
+                    if ('javascript_literal' in sources
+                            and endpoint.get('method') == 'GET' and endpoint.get('parameters')):
                         discovered_get_candidates.append(endpoint)
                 for form in ((baseline_result.get('data') or {}).get('discovery') or {}).get('forms', []):
                     path=urlsplit(str(form.get('action') or '')).path.lower()
@@ -546,7 +548,12 @@ def _run(agent, user_text):
                     search_like=(any(word in path for word in ('search','find','timkiem','tim-kiem'))
                                  or any(re.search(r'(^|[_-])(q|query|search|keyword|key|term)($|[_-])|timkiem|txt.?key',v)
                                         for v in params))
-                    if str(form.get('method') or '').upper() in ('GET','POST') and search_like:
+                    method=str(form.get('method') or '').upper()
+                    # GET forms are read-like by protocol and can be checked
+                    # independent of route language/name. Unsubmitted POST
+                    # forms remain restricted to search-like forms to avoid
+                    # side effects such as orders, messages or registrations.
+                    if form.get('parameters') and (method == 'GET' or (method == 'POST' and search_like)):
                         discovered_form_candidates.append(form)
     if backend == 'none':
         agent.evidence_store.coverage.extend({'target': u, 'status': 'not_run', 'reason': 'baseline disabled'} for u in targets)

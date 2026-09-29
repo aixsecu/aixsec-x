@@ -36,6 +36,22 @@ def baseline(root):
 
 
 class SequentialTests(unittest.TestCase):
+    def test_javascript_get_endpoint_does_not_require_route_name_heuristic(self):
+        with tempfile.TemporaryDirectory() as root:
+            seed=baseline(root)
+            seed=(seed[0],{**seed[1], 'discovery': {'endpoints': [{
+                'url':URL+'x7','method':'GET','parameters':['product_code'],
+                'sources':['javascript_literal'],'state':'discovered'}]}})
+            probe={'alerts':[],'coverage':{'tool':'discovered_get_probe',
+                   'target':URL+'x7','status':'complete','requests':5}}
+            with patch.object(TOOL_INDEX['zap_baseline'],'exec_fn',return_value=seed), \
+                 patch.object(TOOL_INDEX['zap_active_scan'],'exec_fn',return_value=('ok',{'coverage':{'status':'complete'}})), \
+                 patch('verification.discovered_get_probe',return_value=probe) as get_probe, \
+                 contextlib.redirect_stdout(io.StringIO()):
+                WebXAgent(config(root,nuclei_enabled=False)).run('scan')
+            get_probe.assert_called_once()
+            self.assertEqual(get_probe.call_args.args[1]['parameters'],['product_code'])
+
     def test_discovered_post_search_form_is_probed_without_har_submission(self):
         with tempfile.TemporaryDirectory() as root:
             seed=baseline(root)

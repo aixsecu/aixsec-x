@@ -84,6 +84,24 @@ def js_references(text):
     """
     for m in re.finditer(r'''(?:\$|jQuery)\.(get|post)\(\s*['"]([^'"\n]+)['"]''', text):
         yield m[2], m[1].upper(), []
+    # Search widgets are often not real forms: an input calls a function that
+    # builds a navigation URL.  Keep this conservative by requiring a literal
+    # prefix ending in a named query slot followed by the same JS variable.
+    # Some legacy CMS templates write ``page.html&keyword=`` even though the
+    # value is semantically a first query parameter; normalize that separator
+    # so the active probe targets the parameter rather than appending a second
+    # malformed query string.
+    navigation = re.compile(
+        r'''(?:window\.)?location(?:\.href)?\s*=\s*['"](?P<prefix>[^'"\n]+[?&](?P<name>[\w.-]+)=)['"]\s*\+\s*(?P<variable>[A-Za-z_$][\w$]*)''')
+    for m in navigation.finditer(text):
+        name=m.group('name')
+        if m.group('variable') != name:
+            continue
+        ref=m.group('prefix')
+        before,separator,tail=ref.rpartition('&')
+        if separator and '?' not in before:
+            ref=before+'?'+tail
+        yield ref, 'GET', [name]
     for m in re.finditer(r'''\.load\(\s*['"]([^'"\n]+)['"]''', text):
         tail = re.split(r'[\r\n;]', text[m.end():m.end()+500], maxsplit=1)[0]
         params = re.findall(r'''['"]&([\w.-]+)=''', tail)

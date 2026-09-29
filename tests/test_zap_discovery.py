@@ -85,6 +85,19 @@ class DiscoveryTests(unittest.TestCase):
         self.assertEqual(rows[0]['method'], 'POST')
         self.assertEqual(rows[0]['parameters'], ['id','soluong'])
 
+    def test_javascript_navigation_search_input_becomes_get_endpoint(self):
+        d = Discovery(URL)
+        d.page(URL, '''<input name="keyword" id="keyword" onkeyup="doEnter(event)">
+            <script>function onSearch(){var keyword=document.getElementById("keyword").value;
+            location.href="tim-kiem.html&keyword="+keyword;}</script>''', 'text/html')
+        result=d.result()
+        endpoint=next(row for row in result['endpoints'] if row['url'].endswith('/tim-kiem.html'))
+        self.assertEqual(endpoint['method'],'GET')
+        self.assertEqual(endpoint['parameters'],['keyword'])
+        self.assertIn('javascript_literal',endpoint['sources'])
+        self.assertEqual(result['inputs'][0]['name'],'keyword')
+        self.assertFalse(result['inputs'][0]['in_form'])
+
     def test_inventory_reaches_final_report_and_existing_inventory(self):
         d = Discovery(URL)
         d.add(URL+'search?q=', 'GET', ['q'], 'javascript_literal')
