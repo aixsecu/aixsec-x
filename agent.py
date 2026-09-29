@@ -1715,7 +1715,8 @@ def _print_scan_profiles():
     descriptions = {
         "fast": "basic coverage, aggressive family reduction, shorter limits",
         "balanced": "recommended coverage/speed balance",
-        "full": "no route/technology reduction, high strength, wider limits",
+        "full": "adaptive full coverage within a time budget",
+        "exhaustive": "all request groups and rules; potentially many hours",
     }
     print("Available scan profiles:")
     for name in SCAN_PROFILES:
@@ -1724,18 +1725,19 @@ def _print_scan_profiles():
 
 def select_scan_profile_interactive(cfg: dict) -> dict:
     """Show the startup profile menu and return the resolved configuration."""
-    choices = {"1": "fast", "2": "balanced", "3": "full"}
+    choices = {"1": "fast", "2": "balanced", "3": "full", "4": "exhaustive"}
     print("\n╭──────────────── CHỌN CHẾ ĐỘ SCAN ────────────────╮")
     print("│  1. FAST      Nhanh, coverage cơ bản             │")
     print("│  2. BALANCED  Cân bằng tốc độ/độ phủ (khuyên dùng)│")
     print("│  3. FULL      Quét rộng và sâu, thời gian lâu hơn │")
+    print("│  4. EXHAUSTIVE Không rút gọn, có thể chạy nhiều giờ│")
     print("╰───────────────────────────────────────────────────╯")
     default_profile = cfg.get('scan_profile') if cfg.get('scan_profile') in SCAN_PROFILES else 'balanced'
     default_choice = next((number for number, name in choices.items()
                            if name == default_profile), '2')
     while True:
         try:
-            selected = input(f"Chọn chế độ [1/2/3] (mặc định {default_choice}): ").strip() or default_choice
+            selected = input(f"Chọn chế độ [1/2/3/4] (mặc định {default_choice}): ").strip() or default_choice
         except EOFError:
             selected = default_choice
             print(f"\n[>] Không có input; sử dụng {default_profile.upper()}.")

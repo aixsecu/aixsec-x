@@ -18,7 +18,8 @@ def batch_jobs(jobs, max_size=1, cookie_mode='strict', policy=None):
         rule = policy.match(entry) if policy else None
         safe = not reasons and (cookie_mode != 'auto' or (rule and rule['mode'] == 'parallel_read'))
         key = (origin(entry['_entry']['request']['url']), entry.get('auth_context', 'anonymous'),
-               rule['id'] if rule else '', tuple(reasons))
+               rule['id'] if rule else '', tuple(reasons),
+               tuple(entry.get('_applicable_rules') or ()))
         target = next((batch for batch in reversed(batches)
                        if batch['_batch_key'] == key and batch['_batch_safe'] and safe
                        and len(batch['_batch_members']) < max_size), None)
@@ -118,12 +119,21 @@ def scheduling_summary(jobs, workers=2, cookie_mode='strict', policy=None):
             'serial_reasons':dict(counts), 'policy_matches':dict(policy_counts), 'groups':rows}
 
 
-def drive(jobs, start, workers=2, cookie_mode='strict', policy=None, auto=None, metrics=None):
+def drive(jobs, start, workers=2, cookie_mode='strict', policy=None, auto=None, metrics=None,
+          deadline=None, reserve_seconds=0, expected_job_seconds=90):
     """start returns a generator: yield a callable, receive its result on caller thread."""
     from adapters.zap import origin
     # Classify before dispatch so malformed/ambiguous policy cannot partly run.
+    ordered = sorted(jobs, key=lambda entry: (-int(entry.get('risk_score', 0)),
+                                              entry.get('url', entry.get('request_id', ''))))
+    deferred = []
+    if deadline is not None:
+        available = max(0.0, deadline - time.monotonic() - max(0, reserve_seconds))
+        capacity = max(0, int(available / max(1.0, float(expected_job_seconds))) * max(1, workers))
+        if capacity < len(ordered):
+            deferred.extend(ordered[capacity:]); ordered = ordered[:capacity]
     queue = [(entry, origin(entry['_entry']['request']['url']),
-              scheduling_reasons(entry, cookie_mode, policy)) for entry in jobs]
+              scheduling_reasons(entry, cookie_mode, policy)) for entry in ordered]
     cancelled = threading.Event()
     pool = ThreadPoolExecutor(max_workers=workers, thread_name_prefix='zap')
     pending = {}
@@ -134,8 +144,11 @@ def drive(jobs, start, workers=2, cookie_mode='strict', policy=None, auto=None, 
     metrics_started = time.perf_counter_ns()
     scheduler_idle_ns = 0
     completed = 0
+    requests_executed = 0
+    job_durations = []
     stop = False
-    stop_reason = ''
+    stop_reason = ('Active jobs deferred because the estimated workload exceeds the remaining session budget'
+                   if deferred else '')
 
     def mark_wait(entry, kind):
         now = time.perf_counter_ns();state = waiting.get(id(entry))
@@ -153,7 +166,7 @@ def drive(jobs, start, workers=2, cookie_mode='strict', policy=None, auto=None, 
             perf[state[0]]=perf.get(state[0],0)+(now-state[1])/1_000_000
 
     def collect(block=True):
-        nonlocal completed, stop, stop_reason, scheduler_idle_ns
+        nonlocal completed, requests_executed, stop, stop_reason, scheduler_idle_ns
         if not pending:
             return
         wait_started=time.perf_counter_ns()
@@ -162,12 +175,20 @@ def drive(jobs, start, workers=2, cookie_mode='strict', policy=None, auto=None, 
             scheduler_idle_ns += time.perf_counter_ns()-wait_started
         if not done and block:
             from terminal_output import event
-            event('stage', 'zap_active', f'{completed}/{len(jobs)} jobs finished')
+            average = sum(job_durations)/len(job_durations) if job_durations else float(expected_job_seconds)
+            eta = int(((len(queue)+len(pending))*average)/max(1,workers))
+            event('stage', 'zap_active', f'{completed}/{len(jobs)} jobs finished',
+                  f'ETA {eta//60:02d}:{eta%60:02d} | requests {requests_executed} | '
+                  f'{len(pending)}/{workers} workers | deferred {len(deferred)}')
             print(f'[zap] {completed}/{len(jobs)} groups finished; {len(pending)} running', flush=True)
         for future in done:
             generator, _, _ = pending.pop(future)
             completed_at[future] = getattr(future, '_aixsec_finished_ns', time.perf_counter_ns())
+            job_durations.append(max(0.001, (completed_at[future]-submitted[future])/1_000_000_000))
             result = future.result()
+            coverage=(result.get('data') or {}).get('coverage') if isinstance(result,dict) else {}
+            if isinstance(coverage,dict):
+                requests_executed += int(coverage.get('active_test_requests',0) or 0)
             try:
                 generator.send(result)
                 raise RuntimeError('ZAP task yielded more than once')
@@ -177,7 +198,12 @@ def drive(jobs, start, workers=2, cookie_mode='strict', policy=None, auto=None, 
                     stop = True
                     stop_reason = str(finished.value.get('output') or finished.value['outcome'])
             from terminal_output import event
-            event('stage', 'zap_active', f'{completed}/{len(jobs)} jobs finished')
+            average = sum(job_durations)/len(job_durations) if job_durations else float(expected_job_seconds)
+            remaining_jobs = len(queue) + len(pending)
+            eta = int((remaining_jobs * average) / max(1, workers))
+            event('stage', 'zap_active', f'{completed}/{len(jobs)} jobs finished',
+                  f'ETA {eta//60:02d}:{eta%60:02d} | requests {requests_executed} | '
+                  f'{len(pending)}/{workers} workers | deferred {len(deferred)}')
             print(f'[zap] {completed}/{len(jobs)} groups finished', flush=True)
 
     try:
@@ -186,6 +212,14 @@ def drive(jobs, start, workers=2, cookie_mode='strict', policy=None, auto=None, 
             collect(block=False)
             if stop:
                 break
+            if deadline is not None:
+                remaining_time = deadline-time.monotonic()-max(0, reserve_seconds)
+                average = (sum(job_durations)/len(job_durations) if job_durations
+                           else float(expected_job_seconds))
+                if remaining_time < max(1.0, average):
+                    deferred.extend(row[0] for row in queue); queue.clear()
+                    stop_reason = 'Active jobs deferred because the remaining session budget is insufficient'
+                    break
             if len(pending) >= workers:
                 collect()
                 continue
@@ -265,7 +299,14 @@ def drive(jobs, start, workers=2, cookie_mode='strict', policy=None, auto=None, 
                 serial_barrier_wait_ms=sum(float(row.get('serial_barrier_wait_ms',0)) for row in rows),
                 bootstrap_wait_ms=sum(float(row.get('bootstrap_wait_ms',0)) for row in rows),
                 auto_concurrency_wait_ms=sum(float(row.get('auto_concurrency_wait_ms',0)) for row in rows),
-                origin_saturation_ms=sum(float(row.get('origin_saturation_ms',0)) for row in rows))
+                origin_saturation_ms=sum(float(row.get('origin_saturation_ms',0)) for row in rows),
+                completed_jobs=completed, deferred_jobs=len(deferred),
+                requests_executed=requests_executed,
+                deferred_request_ids=sorted({member.get('request_id') for entry in deferred
+                    for member in (entry.get('_batch_members') or [entry]) if member.get('request_id')}),
+                average_job_seconds=(sum(job_durations)/len(job_durations) if job_durations else 0),
+                estimated_remaining_seconds=int(len(deferred) * (sum(job_durations)/len(job_durations)
+                    if job_durations else float(expected_job_seconds)) / max(1, workers)))
         return stop_reason
     finally:
         cancelled.set()

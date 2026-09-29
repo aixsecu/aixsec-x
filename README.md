@@ -223,13 +223,15 @@ Choose the coverage/speed trade-off directly on the command line; no profile
 environment variable is required:
 
 When `python3 agent.py` is started interactively, it first displays a menu and
-lets the user select `1` (Fast), `2` (Balanced), or `3` (Full). Pressing Enter
+lets the user select `1` (Fast), `2` (Balanced), `3` (Full), or `4`
+(Exhaustive). Pressing Enter
 selects Balanced. The chosen mode is shown in the startup banner.
 
 ```bash
 python3 agent.py --scan-profile fast
 python3 agent.py --scan-profile balanced
 python3 agent.py --scan-profile full
+python3 agent.py --scan-profile exhaustive
 python3 agent.py --list-scan-profiles
 ```
 
@@ -237,8 +239,12 @@ python3 agent.py --list-scan-profiles
   route-family reduction and shorter crawl/scan limits.
 - `balanced`: recommended default balance, with technology used only for
   prioritization rather than excluding checks.
-- `full`: disables route-family and technology reduction, uses High ZAP
-  strength, and raises crawl/scan limits. It can take substantially longer.
+- `full`: covers every discovered attack-surface category with High strength,
+  per-request rule applicability, adaptive route-family expansion, risk-first
+  ordering, and a session-aware budget. Work that cannot fit is recorded as
+  `deferred_by_budget` and remains eligible for a resumed scan.
+- `exhaustive`: disables route-family, technology, and active-budget reduction.
+  It retains the broad endpoint × rule workload and can run for many hours.
 
 Profiles use separate soft phase budgets and a larger hard guardrail:
 
@@ -247,6 +253,15 @@ Profiles use separate soft phase budgets and a larger hard guardrail:
 | Fast | 1m | 1m | 1m | 1m | 5m | 15m |
 | Balanced | 2m | 3m | 1m | 3m | 12m | 45m |
 | Full | 5m | 8m | 2m | 8m | 22m | 120m |
+| Exhaustive | 8m | 12m | 3m | 10m | 30m | 360m |
+
+Before active scanning, AIXSEC-X builds `attack-plan.json`. Each captured
+request is scored from its method, input locations, content type, sensitive
+route/parameter names, and authentication context. ZAP rules are assigned only
+when their required surface is present; unknown third-party rules are retained
+conservatively. Progress reports completed jobs, live ETA, active workers and
+deferred work. Full keeps enough session time for validation and reporting,
+whereas Exhaustive intentionally does not apply this active-stage budget.
 
 ZAP exports recovery checkpoints after the traditional Spider and AJAX Spider.
 If a later phase reaches its hard limit, the last valid HAR/URL checkpoint is
@@ -351,7 +366,7 @@ Boolean switches use `1` (enabled) and `0` (disabled). Defaults below come from 
 | `WEBX_ZAP_COOKIE_PARALLEL` | `auto` | `auto`: fresh controls, one worker/origin initially, up to two after a stable trial, back to one on instability. `strict`: serialize cookies; `guest`: operator opt-in for guest cookies. Explicit policy takes precedence. |
 | `WEBX_ZAP_ROUTE_GROUPS_FILE` | *(empty)* | Operator-owned JSON route groups for slug deduplication; empty preserves default structural grouping. See the worker guide below. |
 | `WEBX_ZAP_ROUTE_FAMILY_MODE` | `1` | Enable structural route-family grouping. Coverage seeds are admitted before this optimization. |
-| `WEBX_FAMILY_SCAN` | `on` | `on` scans family representatives; `off` retains all scheduled groups. The `full` terminal profile sets this off. |
+| `WEBX_FAMILY_SCAN` | `on` | `on` scans family representatives; `off` retains all scheduled groups. Full keeps adaptive representatives on; Exhaustive turns reduction off. |
 | `WEBX_FAMILY_DIVERGENCE_SAMPLES` | `2` | Number of additional family members sampled for divergence checks (minimum 1). |
 | `WEBX_FAMILY_SPLIT_MAX_DEPTH` | `4` | Maximum recursive splits when members of a route family diverge. |
 | `WEBX_FAMILY_CONFIDENCE_THRESHOLD` | `0.6` | Confidence threshold, clamped to 0–1, for accepting a route family. |

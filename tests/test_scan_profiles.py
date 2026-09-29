@@ -19,10 +19,16 @@ def test_profiles_have_increasing_scan_limits():
     fast = SCAN_PROFILES["fast"]
     balanced = SCAN_PROFILES["balanced"]
     full = SCAN_PROFILES["full"]
+    exhaustive = SCAN_PROFILES["exhaustive"]
     assert fast["zap_max_urls"] < balanced["zap_max_urls"] < full["zap_max_urls"]
     assert fast["zap_ajax_states"] < balanced["zap_ajax_states"] < full["zap_ajax_states"]
-    assert full["technology_filter_mode"] == "off"
-    assert full["family_scan"] is False
+    assert full["technology_filter_mode"] == "priority"
+    assert full["family_scan"] is True
+    assert full["zap_route_family_mode"] is True
+    assert full["budget_aware_active"] is True
+    assert exhaustive["technology_filter_mode"] == "off"
+    assert exhaustive["family_scan"] is False
+    assert exhaustive["budget_aware_active"] is False
     assert fast['zap_timeout'] >= 60 * (
         fast['zap_spider_minutes'] + fast['zap_ajax_minutes'] + fast['zap_passive_minutes'])
     assert balanced['zap_timeout'] >= 60 * (
@@ -54,7 +60,7 @@ def test_profile_overrides_performance_values_without_mutating_source():
 
 
 def test_unknown_profile_is_rejected():
-    with pytest.raises(ValueError, match="fast, balanced, full"):
+    with pytest.raises(ValueError, match="fast, balanced, full, exhaustive"):
         apply_scan_profile({}, "turbo")
 
 

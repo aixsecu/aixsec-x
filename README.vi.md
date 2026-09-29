@@ -222,7 +222,7 @@ Chế độ `--non-interactive`/`--oneshot` chỉ đọc env (không hỏi) — 
 ### Chế độ scan chọn từ terminal
 
 Khi chạy `python3 agent.py` ở chế độ interactive, tool hiển thị menu để chọn
-`1` (Fast), `2` (Balanced) hoặc `3` (Full). Nhấn Enter sẽ chọn Balanced. Chế độ
+`1` (Fast), `2` (Balanced), `3` (Full) hoặc `4` (Exhaustive). Nhấn Enter sẽ chọn Balanced. Chế độ
 đang dùng được hiển thị ở dòng `SCAN-MODE` trên banner đầu phiên.
 
 Bạn cũng có thể chọn trực tiếp bằng tham số dòng lệnh, không cần biến env:
@@ -231,6 +231,7 @@ Bạn cũng có thể chọn trực tiếp bằng tham số dòng lệnh, không
 python3 agent.py --scan-profile fast
 python3 agent.py --scan-profile balanced
 python3 agent.py --scan-profile full
+python3 agent.py --scan-profile exhaustive
 python3 agent.py --list-scan-profiles
 ```
 
@@ -238,8 +239,12 @@ python3 agent.py --list-scan-profiles
   theo route-family và dùng giới hạn crawl/scan ngắn hơn.
 - `balanced`: chế độ khuyên dùng, cân bằng tốc độ và độ phủ; công nghệ chỉ dùng
   để ưu tiên thứ tự thay vì loại bỏ kiểm tra.
-- `full`: tắt rút gọn route-family và technology filtering, dùng ZAP strength
-  `High`, đồng thời tăng giới hạn crawl/scan nên có thể chạy lâu hơn đáng kể.
+- `full`: phủ mọi nhóm attack surface đã phát hiện với ZAP strength `High`,
+  ghép rule theo từng request, mở rộng route-family thích nghi, ưu tiên theo rủi
+  ro và tuân theo ngân sách phiên. Phần không đủ thời gian được ghi rõ là
+  `deferred_by_budget` và vẫn có thể chạy tiếp khi resume.
+- `exhaustive`: tắt rút gọn route-family, technology và active budget. Chế độ
+  này giữ workload endpoint × rule rất rộng và có thể chạy nhiều giờ.
 
 Mỗi profile dùng soft budget riêng cho từng phase và một hard guardrail lớn hơn:
 
@@ -248,6 +253,14 @@ Mỗi profile dùng soft budget riêng cho từng phase và một hard guardrail
 | Fast | 1 phút | 1 phút | 1 phút | 1 phút | 5 phút | 15 phút |
 | Balanced | 2 phút | 3 phút | 1 phút | 3 phút | 12 phút | 45 phút |
 | Full | 5 phút | 8 phút | 2 phút | 8 phút | 22 phút | 120 phút |
+| Exhaustive | 8 phút | 12 phút | 3 phút | 10 phút | 30 phút | 360 phút |
+
+Trước Active Scan, AIXSEC-X tạo `attack-plan.json`. Mỗi request được chấm điểm
+từ method, vị trí input, content type, route/tham số nhạy cảm và ngữ cảnh xác
+thực. ZAP rule chỉ được gán khi request có attack surface tương ứng; rule bên
+thứ ba chưa nhận dạng vẫn được giữ lại để tránh bỏ sót. Progress hiển thị số
+job hoàn tất, ETA, worker đang dùng và phần deferred. Full giữ lại thời gian cho
+validation/reporting; Exhaustive chủ động không áp dụng active-stage budget này.
 
 ZAP xuất checkpoint khôi phục sau Spider truyền thống và AJAX Spider. Nếu phase
 sau chạm hard limit, tool dùng HAR/URL checkpoint hợp lệ gần nhất thay vì trả
@@ -350,7 +363,7 @@ Các công tắc boolean dùng `1` (bật) và `0` (tắt). Mặc định dướ
 | `WEBX_ZAP_COOKIE_PARALLEL` | `auto` | `auto`: tự kiểm tra đối chứng, bắt đầu 1 worker/origin, tăng tối đa 2 khi ổn định và giảm về 1 khi có tín hiệu lỗi. `strict`: tuần tự khi có cookie; `guest`: operator cho phép cookie khách. Policy thủ công vẫn được ưu tiên. |
 | `WEBX_ZAP_ROUTE_GROUPS_FILE` | *(trống)* | File JSON nhóm route do operator khai báo để gộp slug; trống giữ cách nhóm cấu trúc mặc định. Xem hướng dẫn worker bên dưới. |
 | `WEBX_ZAP_ROUTE_FAMILY_MODE` | `1` | Bật nhóm route-family theo cấu trúc. Coverage seed được đưa vào trước bước tối ưu này. |
-| `WEBX_FAMILY_SCAN` | `on` | `on` quét các đại diện của family; `off` giữ toàn bộ nhóm đã lập lịch. Profile `full` đặt biến này thành off trong nội bộ. |
+| `WEBX_FAMILY_SCAN` | `on` | `on` quét các đại diện của family; `off` giữ toàn bộ nhóm đã lập lịch. Full bật đại diện thích nghi; Exhaustive tắt rút gọn. |
 | `WEBX_FAMILY_DIVERGENCE_SAMPLES` | `2` | Số member bổ sung lấy mẫu để kiểm tra khác biệt trong family (tối thiểu 1). |
 | `WEBX_FAMILY_SPLIT_MAX_DEPTH` | `4` | Độ sâu chia tách đệ quy tối đa khi các member trong route-family khác nhau. |
 | `WEBX_FAMILY_CONFIDENCE_THRESHOLD` | `0.6` | Ngưỡng tin cậy, giới hạn 0–1, để chấp nhận một route-family. |

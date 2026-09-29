@@ -32,8 +32,8 @@ def test_user_config_applies_profile_then_explicit_operator_choices():
         'allow_active_scan': False,
     })
     assert resolved['scan_profile'] == 'full'
-    assert resolved['family_scan'] is False
-    assert resolved['technology_filter_mode'] == 'off'
+    assert resolved['family_scan'] is True
+    assert resolved['technology_filter_mode'] == 'priority'
     assert resolved['allow_active_scan'] is False
 
 

@@ -95,6 +95,7 @@ class ScanSchedule:
         self.import_errors = []
         self.stop_reason = ''
         self.limit_report = {'configured': 0, 'before': 0, 'after': 0, 'dropped': 0}
+        self.deferred = {}
 
     @contextmanager
     def connection(self):
@@ -267,13 +268,22 @@ class ScanSchedule:
                     artifact = ((result.get('data') or {}).get('coverage') or {}).get('report_path', '')
                     db.execute('UPDATE attempts SET state=?,artifact_ref=? WHERE namespace=? AND family=? AND rule=?', (state, artifact, self.namespace, fid, rule))
 
+    def defer(self, fid, rules, reason='session budget'):
+        """Record unclaimed work as deferred without poisoning persistent history."""
+        bucket = self.deferred.setdefault(fid, {})
+        for rule in rules:
+            bucket[int(rule)] = reason
+
     def summary(self, rules):
         rows = []
         with self.connection() as db:
             for fid, entry in self.entries.items():
                 states = {r[0]: (r[1], r[2]) for r in db.execute('SELECT rule,state,artifact_ref FROM attempts WHERE namespace=? AND family=?', (self.namespace, fid))}
                 rows.append({k:v for k,v in entry.items() if not k.startswith('_')} | {
-                    'rules': [{'id':r, 'state':states.get(r,('not_run',''))[0],
+                    'rules': [{'id':r,
+                               'state':states.get(r,('deferred_by_budget',''))[0]
+                                   if r in self.deferred.get(fid,{}) else states.get(r,('not_run',''))[0],
+                               'reason':self.deferred.get(fid,{}).get(r,''),
                                'artifact_ref':states.get(r,('not_run',''))[1]} for r in rules]})
         return {'namespace': self.namespace, 'history_path': str(self.path), 'families': rows,
                 'rules': self.rules, 'skipped_static_requests': self.skipped_static,

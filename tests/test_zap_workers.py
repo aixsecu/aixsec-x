@@ -20,6 +20,20 @@ def entry(path, method='GET', headers=None):
 
 
 class WorkersTests(unittest.TestCase):
+    def test_budget_defers_low_risk_jobs_and_reports_eta_inputs(self):
+        metrics={};started=[]
+        jobs=[entry(str(i)) for i in range(5)]
+        for index,job in enumerate(jobs):
+            job['request_id']=str(index);job['risk_score']=100-index
+        def start(job,cancelled):
+            started.append(job['request_id'])
+            yield lambda: {'outcome':'ok'}
+        drive(jobs,start,workers=1,metrics=metrics,
+              deadline=time.monotonic()+10,reserve_seconds=0,expected_job_seconds=4)
+        self.assertEqual(started,['0','1'])
+        self.assertEqual(metrics['deferred_jobs'],3)
+        self.assertEqual(metrics['deferred_request_ids'],['2','3','4'])
+
     def test_drive_exposes_scheduler_metrics_without_changing_results(self):
         metrics={};results=[]
         def start(job,cancelled):
