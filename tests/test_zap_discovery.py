@@ -95,6 +95,8 @@ class DiscoveryTests(unittest.TestCase):
         self.assertEqual(endpoint['method'],'GET')
         self.assertEqual(endpoint['parameters'],['keyword'])
         self.assertIn('javascript_literal',endpoint['sources'])
+        self.assertEqual(endpoint['request_template'],URL+'tim-kiem.html&keyword={value}')
+        self.assertEqual(endpoint['template_parameter'],'keyword')
         self.assertEqual(result['inputs'][0]['name'],'keyword')
         self.assertFalse(result['inputs'][0]['in_form'])
 

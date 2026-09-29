@@ -35,8 +35,13 @@ def discovered_get_probe(config, endpoint, timeout=45):
     session=he.HttpSession('discovered-get-probe',proxies=he.get_proxies())
     deadline=time.monotonic()+max(5,int(timeout));rows=[];alerts=[]
     def request(parameter,value,kind):
-        p=urlsplit(url);query=parse_qsl(p.query,keep_blank_values=True);query.append((parameter,value))
-        target=urlunsplit((p.scheme,p.netloc,p.path,urlencode(query),''))
+        template=str(endpoint.get('request_template') or '')
+        if template and endpoint.get('template_parameter') == parameter and '{value}' in template:
+            from urllib.parse import quote
+            target=template.replace('{value}',quote(value,safe=''))
+        else:
+            p=urlsplit(url);query=parse_qsl(p.query,keep_blank_values=True);query.append((parameter,value))
+            target=urlunsplit((p.scheme,p.netloc,p.path,urlencode(query),''))
         remaining=deadline-time.monotonic()
         if remaining<=0: raise TimeoutError('Discovered GET probe timed out')
         response,_=session.request('GET',target,headers={'User-Agent':'Mozilla/5.0'},
@@ -50,10 +55,16 @@ def discovered_get_probe(config, endpoint, timeout=45):
             control1=request(parameter,'test','control');payload1=request(parameter,"test'",'payload')
             control2=request(parameter,'test','control');payload2=request(parameter,"test'",'payload')
             escaped=request(parameter,"test''",'escaped')
-            stable_controls=(control1['status'],control1['sha256'])==(control2['status'],control2['sha256'])
-            stable_payloads=(payload1['status'],payload1['sha256'])==(payload2['status'],payload2['sha256'])
-            payload_diff=(payload1['status'],payload1['sha256'])!=(control1['status'],control1['sha256'])
-            escaped_matches=(escaped['status'],escaped['sha256'])==(control1['status'],control1['sha256'])
+            def equivalent(left,right,ratio=.03,floor=64):
+                tolerance=max(floor,int(max(left['length'],right['length'])*ratio))
+                return left['status']==right['status'] and abs(left['length']-right['length'])<=tolerance
+            stable_controls=equivalent(control1,control2)
+            stable_payloads=equivalent(payload1,payload2)
+            payload_diff=(payload1['status']!=control1['status']
+                          or abs(payload1['length']-control1['length'])
+                             > max(128,int(max(payload1['length'],control1['length'])*.20))
+                          or payload1['sql_error'] != control1['sql_error'])
+            escaped_matches=equivalent(escaped,control1,ratio=.05,floor=128)
             if stable_controls and stable_payloads and payload_diff and escaped_matches:
                 alerts.append({'category':'SQL Injection','rule_id':'aixsec-quote-differential',
                     'severity':'high','url':url,'method':'GET','parameter':parameter,
@@ -113,10 +124,16 @@ def discovered_search_form_probe(config, form, timeout=45):
             control1=request(parameter,'test','control');payload1=request(parameter,"test'",'payload')
             control2=request(parameter,'test','control');payload2=request(parameter,"test'",'payload')
             escaped=request(parameter,"test''",'escaped')
-            stable_controls=(control1['status'],control1['sha256'])==(control2['status'],control2['sha256'])
-            stable_payloads=(payload1['status'],payload1['sha256'])==(payload2['status'],payload2['sha256'])
-            payload_diff=(payload1['status'],payload1['sha256'])!=(control1['status'],control1['sha256'])
-            escaped_matches=(escaped['status'],escaped['sha256'])==(control1['status'],control1['sha256'])
+            def equivalent(left,right,ratio=.03,floor=64):
+                tolerance=max(floor,int(max(left['length'],right['length'])*ratio))
+                return left['status']==right['status'] and abs(left['length']-right['length'])<=tolerance
+            stable_controls=equivalent(control1,control2)
+            stable_payloads=equivalent(payload1,payload2)
+            payload_diff=(payload1['status']!=control1['status']
+                          or abs(payload1['length']-control1['length'])
+                             > max(128,int(max(payload1['length'],control1['length'])*.20))
+                          or payload1['sql_error'] != control1['sql_error'])
+            escaped_matches=equivalent(escaped,control1,ratio=.05,floor=128)
             blocked=payload1['status'] in (401,403) or control1['status'] in (401,403)
             if stable_controls and stable_payloads and payload_diff and escaped_matches and not blocked:
                 alerts.append({'category':'SQL Injection','rule_id':'aixsec-form-quote-differential',

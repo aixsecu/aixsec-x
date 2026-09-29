@@ -13,11 +13,13 @@ class VerificationTests(unittest.TestCase):
         from types import SimpleNamespace
         def response(text):
             return SimpleNamespace(text=text,content=text.encode(),status_code=200), {}
-        endpoint={'url':'https://example.test/ajax/load_search.php','method':'UNKNOWN',
-                  'parameters':['txt_key'],'sources':['javascript_literal']}
+        endpoint={'url':'https://example.test/tim-kiem.html','method':'GET',
+                  'parameters':['txt_key'],'sources':['javascript_literal'],
+                  'request_template':'https://example.test/tim-kiem.html&txt_key={value}',
+                  'template_parameter':'txt_key'}
         with tempfile.TemporaryDirectory() as root, patch('http_engine.HttpSession') as session:
             session.return_value.request.side_effect=[response(v) for v in
-                ('ok','SQL syntax error','ok','SQL syntax error','ok')]
+                ('ok','syntax error: select id','ok','syntax error: select id','ok')]
             data=discovered_get_probe({'evidence_dir':root},endpoint)
         self.assertEqual(len(data['alerts']),1)
         self.assertEqual(data['alerts'][0]['parameter'],'txt_key')
@@ -25,6 +27,8 @@ class VerificationTests(unittest.TestCase):
         self.assertEqual(session.return_value.request.call_count,5)
         for call in session.return_value.request.call_args_list:
             self.assertFalse(call.kwargs['follow_redirects'])
+            self.assertIn('tim-kiem.html&txt_key=',call.args[1])
+            self.assertNotIn('?txt_key=',call.args[1])
 
     def test_discovered_post_search_form_quote_parity_creates_candidate(self):
         from types import SimpleNamespace
@@ -64,8 +68,8 @@ class VerificationTests(unittest.TestCase):
         response=lambda text: (SimpleNamespace(text=text,content=text.encode(),status_code=200),{})
         form={'action':'https://example.test/search?category=news','method':'GET',
               'parameters':['q','page']}
-        replies=[response('ok'),response('different'),response('ok'),
-                 response('different'),response('ok')]*2
+        replies=[response('A'*1000),response('B'*100),response('A'*1001),
+                 response('B'*101),response('A'*1002)]*2
         with tempfile.TemporaryDirectory() as root, patch('http_engine.HttpSession') as session:
             session.return_value.request.side_effect=replies
             data=discovered_search_form_probe({'evidence_dir':root},form)
@@ -82,8 +86,8 @@ class VerificationTests(unittest.TestCase):
         from types import SimpleNamespace
         response=lambda text: (SimpleNamespace(text=text,content=text.encode(),status_code=200),{})
         form={'action':'https://example.test/x7','method':'GET','parameters':['product_code']}
-        replies=[response('ok'),response('different'),response('ok'),
-                 response('different'),response('ok')]
+        replies=[response('A'*1000),response('B'*100),response('A'*1001),
+                 response('B'*101),response('A'*1002)]
         with tempfile.TemporaryDirectory() as root, patch('http_engine.HttpSession') as session:
             session.return_value.request.side_effect=replies
             data=discovered_search_form_probe({'evidence_dir':root},form)
