@@ -67,7 +67,7 @@ def discovered_get_probe(config, endpoint, timeout=45):
 
 
 def discovered_search_form_probe(config, form, timeout=45):
-    """Bounded quote-parity check for an anonymous GET/POST search form."""
+    """Bounded check for a GET form or an anonymous POST search form."""
     import time
     import http_engine as he
     from adapters.zap import within
@@ -78,9 +78,10 @@ def discovered_search_form_probe(config, form, timeout=45):
         raise ValueError('Discovered form probe requires a same-origin GET/POST form with parameters')
     search=re.compile(r'(?:^|[_-])(q|query|search|keyword|key|term)(?:$|[_-])|timkiem|txt.?key',re.I)
     sensitive=re.compile(r'csrf|xsrf|token|session|password|secret|api.?key',re.I)
-    candidates=[v for v in parameters if search.search(v) and not sensitive.search(v)]
+    candidates=[v for v in parameters
+                if not sensitive.search(v) and (method == 'GET' or search.search(v))]
     if not candidates:
-        raise ValueError('Discovered form is not a search form')
+        raise ValueError('Discovered form has no safely probeable parameters')
     root=Path(config.get('evidence_dir','.aixsec-evidence')).resolve()
     directory=Path(tempfile.mkdtemp(prefix='discovered-form-',dir=root));path=directory/'pairs.json'
     session=he.HttpSession('discovered-form-probe',proxies=he.get_proxies())

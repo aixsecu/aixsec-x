@@ -65,7 +65,7 @@ class VerificationTests(unittest.TestCase):
         form={'action':'https://example.test/search?category=news','method':'GET',
               'parameters':['q','page']}
         replies=[response('ok'),response('different'),response('ok'),
-                 response('different'),response('ok')]
+                 response('different'),response('ok')]*2
         with tempfile.TemporaryDirectory() as root, patch('http_engine.HttpSession') as session:
             session.return_value.request.side_effect=replies
             data=discovered_search_form_probe({'evidence_dir':root},form)
@@ -77,6 +77,19 @@ class VerificationTests(unittest.TestCase):
             self.assertIn('q=',call.args[1])
             self.assertIn('page=',call.args[1])
             self.assertNotIn('form',call.kwargs)
+
+    def test_discovered_get_form_does_not_require_search_parameter_name(self):
+        from types import SimpleNamespace
+        response=lambda text: (SimpleNamespace(text=text,content=text.encode(),status_code=200),{})
+        form={'action':'https://example.test/x7','method':'GET','parameters':['product_code']}
+        replies=[response('ok'),response('different'),response('ok'),
+                 response('different'),response('ok')]
+        with tempfile.TemporaryDirectory() as root, patch('http_engine.HttpSession') as session:
+            session.return_value.request.side_effect=replies
+            data=discovered_search_form_probe({'evidence_dir':root},form)
+        self.assertEqual(data['alerts'][0]['parameter'],'product_code')
+        self.assertTrue(all('product_code=' in call.args[1]
+                            for call in session.return_value.request.call_args_list))
 
     def test_variants_preserve_post_context_and_avoid_ambiguous_parameters(self):
         entry={'request':{'url':URL,'method':'POST','postData':{'mimeType':'application/x-www-form-urlencoded','text':'name=bob'}}}
