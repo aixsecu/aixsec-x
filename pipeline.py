@@ -292,6 +292,7 @@ def _run(agent, user_text):
     zap_performance = []
     zap_scheduler_performance = {}
     active_performance_report = None
+    attack_plan = None
     route_family_report = None
     representative_report = None
     family_evidence_report = None
@@ -739,6 +740,19 @@ def _run(agent, user_text):
                                   if representative_report is None or not cfg.get('family_scan',True)
                                   or request_id in selected), key=lambda e: (
             not bool(e['structure']['query'] or e['structure']['body']), e['url']))
+        from attack_planning import plan_attack_points
+        attack_plan = plan_attack_points(representatives, eligible_rule_rows,
+                                         cfg.get('scan_profile') != 'exhaustive')
+        atomic(journal.directory/'attack-plan.json', attack_plan)
+        representatives = sorted((row for row in representatives if row.get('_applicable_rules')),
+                                 key=lambda row: (-row.get('risk_score',0), row.get('url','')))
+        journal.data['stages']['zap_active']['attack_plan'] = {
+            'path':str(journal.directory/'attack-plan.json'),
+            'request_groups':attack_plan['request_groups'],
+            'rule_pairs_before':attack_plan['rule_pairs_before'],
+            'rule_pairs_after':attack_plan['rule_pairs_after'],
+            'excluded_pairs':attack_plan['excluded_pairs']}
+        journal.save()
         workers = max(1, min(8, int(cfg.get('zap_workers', 2))))
         if active_rules and representatives:
             from zap_workers import batch_jobs, drive, scheduling_summary
@@ -761,7 +775,8 @@ def _run(agent, user_text):
             if scheduling['serial_reasons'].get('cookie_requires_opt_in'):
                 print('[zap] Guest cookies can be allowed with WEBX_ZAP_COOKIE_PARALLEL=guest '
                       'only after verifying these captures are unauthenticated and independent.', flush=True)
-            print(f'[zap] {len(representatives)} request groups; {len(active_rules)} rules; {workers} workers', flush=True)
+            print(f"[zap] {len(representatives)} attack points; {attack_plan['rule_pairs_after']} applicable "
+                  f"request/rule pairs; {workers} workers", flush=True)
             dispatch_jobs = batch_jobs(representatives, cfg.get('zap_batch_size', 8), cookie_mode, concurrency_policy)
             def start(representative, cancelled):
                 return execution('zap_active_scan', {'url':representative['_entry']['request']['url'],
@@ -771,10 +786,19 @@ def _run(agent, user_text):
                     'representative_url':representative.get('url',''),
                     'member_urls':representative.get('route_family_member_urls',[]),
                     'member_count':representative.get('route_family_member_count',1),
-                    'rule_ids':active_rules}, scheduled=True, cancelled=cancelled,
+                    'rule_ids':representative.get('_applicable_rules', active_rules)}, scheduled=True, cancelled=cancelled,
                     batch=representative.get('_batch_members'))
             schedule.stop_reason = drive(dispatch_jobs, start, workers, cookie_mode, concurrency_policy,
-                auto_concurrency, zap_scheduler_performance) or schedule.stop_reason
+                auto_concurrency, zap_scheduler_performance,
+                deadline=agent._pipeline_deadline if cfg.get('budget_aware_active',True) else None,
+                reserve_seconds=int(cfg.get('active_budget_reserve_seconds',300)),
+                expected_job_seconds=int(cfg.get('active_expected_job_seconds',90))) or schedule.stop_reason
+            deferred_ids=set(zap_scheduler_performance.get('deferred_request_ids',[]))
+            for request_id in deferred_ids:
+                member=schedule.entries.get(request_id)
+                if member:
+                    schedule.defer(request_id,member.get('_applicable_rules',active_rules),
+                                   'deferred_by_budget: insufficient session time')
             active_performance_report = _active_performance(zap_performance, zap_scheduler_performance,
                 len(representatives), sum(len(row.get('_batch_members') or [row]) for row in dispatch_jobs), workers)
             if cfg.get('_zap_worker_pool'):
@@ -807,12 +831,26 @@ def _run(agent, user_text):
             cfg.get('zap_route_family_representatives_large',3),
             cfg.get('zap_route_family_representatives_extra_large',4))
         for generation in range(1,cfg.get('family_split_max_depth',4)+1):
+            if (cfg.get('budget_aware_active',True) and agent._pipeline_deadline is not None
+                    and agent._pipeline_deadline-time.monotonic()
+                    <= int(cfg.get('active_budget_reserve_seconds',300))):
+                schedule.stop_reason = ('Adaptive family replays deferred because the remaining '
+                                        'session budget is reserved for validation and reporting')
+                break
             confidence_report=confidence_calculator.build(route_family_report,family_history.validated)
             divergence_plans=detector.plan(route_family_report,family_evidence_report,family_history.tested,
                 confidence_report['families_requiring_replay'])
             if not divergence_plans:break
             completed_plans=[]
             for plan in divergence_plans:
+                if (cfg.get('budget_aware_active',True) and agent._pipeline_deadline is not None
+                        and agent._pipeline_deadline-time.monotonic()
+                        <= int(cfg.get('active_budget_reserve_seconds',300))):
+                    member=schedule.entries.get(plan['member_id'])
+                    if member:
+                        schedule.defer(member['request_id'],plan.get('rule_ids',[]),
+                                       'deferred_by_budget: adaptive replay')
+                    continue
                 member=schedule.entries.get(plan['member_id'])
                 if member is None:continue
                 representative=schedule.entries.get(plan['representative_id']) or member
@@ -879,6 +917,10 @@ def _run(agent, user_text):
             'family_confirmation_rate':divergence_report['family_confirmation_rate']}
         journal.save()
     close_stage('zap_active')
+    if schedule.deferred:
+        deferred_pairs=sum(len(rules) for rules in schedule.deferred.values())
+        journal.stage('zap_active','partial',
+                      f'{deferred_pairs} request/rule pairs deferred_by_budget; resume to continue')
     stage_name = 'nuclei'
     if backend == 'none':
         journal.stage('nuclei', 'skipped', 'Scan backend disabled')
@@ -1055,6 +1097,9 @@ def _run(agent, user_text):
     if active_performance_report:
         result['active_scan_performance']=active_performance_report
         result['active_scan_performance_path']=str(journal.directory/'active-scan-performance.json')
+    if attack_plan is not None:
+        result['attack_plan']={k:v for k,v in attack_plan.items() if k!='attack_points'}
+        result['attack_plan_path']=str(journal.directory/'attack-plan.json')
     schedule_path = agent.evidence_store.directory / 'active-schedule.json'
     schedule_path.write_text(json.dumps(result['active_schedule'], ensure_ascii=False, indent=2))
     schedule_path.chmod(0o600)

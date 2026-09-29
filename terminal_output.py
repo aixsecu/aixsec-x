@@ -191,6 +191,7 @@ class TerminalOutput:
                 '', 'Active Scan', f'  Jobs: {len(active) if tasks else "N/A"}',
                 f'  Success: {sum(t.get("status") in ("complete", "ok", "success") for t in active) if tasks else "N/A"}',
                 f'  Failed: {sum(t.get("status") in ("error", "failed", "timeout", "interrupted") for t in active) if tasks else "N/A"}',
+                f'  Deferred by budget: {result.get("active_scan_performance", {}).get("scheduler", {}).get("deferred_jobs", 0)}',
                 '', 'Findings (confirmed)']
         for severity in ('critical', 'high', 'medium', 'low', 'info'):
             rows.append(f'  {severity.title()}: {sum(f.status == "confirmed" and f.severity.lower() == severity for f in findings)}')

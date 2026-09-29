@@ -10,6 +10,7 @@ from adapters.zap import build_plan
 from config import load_config
 from agent import WebXAgent
 from tools import TOOL_INDEX
+from attack_planning import applicable_rules, risk_score
 
 BASE='https://example.test/'
 def request(url=BASE+'item?id=1',method='GET',post=None):
@@ -39,6 +40,28 @@ class FamilyTests(unittest.TestCase):
                          family(request(BASE+'users/aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee')))
 
 class ScheduleTests(unittest.TestCase):
+    def test_rule_applicability_is_per_request_and_conservative(self):
+        plain={'url':BASE+'plain','method':'GET','auth_context':'anonymous',
+               'structure':{'query':[],'body':[]},'_entry':entry(request(BASE+'plain'))}
+        search={'url':BASE+'tim-kiem.html?keyword=a','method':'GET','auth_context':'anonymous',
+                'structure':{'query':[('keyword','')],'body':[]},
+                '_entry':entry(request(BASE+'tim-kiem.html?keyword=a'))}
+        rules=[{'id':40018,'name':'SQL Injection'},{'id':40012,'name':'Cross Site Scripting'},
+               {'id':10001,'name':'Unknown third-party check'}]
+        kept,excluded=applicable_rules(plain,rules)
+        self.assertEqual(kept,[10001])
+        self.assertEqual({row['id'] for row in excluded},{40012,40018})
+        self.assertEqual(applicable_rules(search,rules)[0],[10001,40012,40018])
+        self.assertGreater(risk_score(search)[0],risk_score(plain)[0])
+
+    def test_deferred_budget_is_reported_without_persistent_claim(self):
+        with tempfile.TemporaryDirectory() as root:
+            schedule=ScanSchedule(root);schedule.entries['f']={'request_id':'f','url':BASE,'method':'GET'}
+            schedule.defer('f',[40018],'deferred_by_budget')
+            row=schedule.summary([40018])['families'][0]['rules'][0]
+            self.assertEqual(row['state'],'deferred_by_budget')
+            self.assertEqual(schedule.remaining('f',[40018]),[40018])
+
     def test_malformed_har_downgrades_coverage_without_crashing(self):
         with tempfile.TemporaryDirectory() as root:
             har = Path(root) / 'traffic.har'

@@ -91,12 +91,12 @@ def _yes_no(prompt, default):
 def configure_interactive(existing=None):
     """Collect the compact set of operator decisions; never collect secrets."""
     old = existing or {}
-    profile_numbers = {'1': 'fast', '2': 'balanced', '3': 'full'}
+    profile_numbers = {'1': 'fast', '2': 'balanced', '3': 'full', '4': 'exhaustive'}
     default_profile = old.get('scan_profile', 'balanced')
     default_number = next((n for n, p in profile_numbers.items() if p == default_profile), '2')
     print('\nAIXSEC-X — CÀI ĐẶT NGƯỜI DÙNG')
     print('Không lưu mật khẩu/token. Credential phải nằm trong auth profile hoặc secret env riêng.')
-    number = _choice('Profile: 1 Fast, 2 Balanced, 3 Full', tuple(profile_numbers), default_number)
+    number = _choice('Profile: 1 Fast, 2 Balanced, 3 Full, 4 Exhaustive', tuple(profile_numbers), default_number)
     targets_default = ','.join(old.get('targets', []))
     targets = input(f'Target được cấp quyền, cách nhau bằng dấu phẩy [{targets_default}]: ').strip()
     sources_default = ','.join(old.get('src_dirs', []))
