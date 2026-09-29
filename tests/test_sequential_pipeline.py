@@ -45,12 +45,21 @@ class SequentialTests(unittest.TestCase):
             probe={'alerts':[],'coverage':{'tool':'discovered_get_probe',
                    'target':URL+'x7','status':'complete','requests':5}}
             with patch.object(TOOL_INDEX['zap_baseline'],'exec_fn',return_value=seed), \
-                 patch.object(TOOL_INDEX['zap_active_scan'],'exec_fn',return_value=('ok',{'coverage':{'status':'complete'}})), \
+                 patch.object(TOOL_INDEX['zap_active_scan'],'exec_fn',return_value=('ok',{'coverage':{'status':'complete'}})) as active, \
                  patch('verification.discovered_get_probe',return_value=probe) as get_probe, \
                  contextlib.redirect_stdout(io.StringIO()):
-                WebXAgent(config(root,nuclei_enabled=False)).run('scan')
+                result=WebXAgent(config(root,nuclei_enabled=False)).run('scan')
             get_probe.assert_called_once()
             self.assertEqual(get_probe.call_args.args[1]['parameters'],['product_code'])
+            seeded=[entry['request']['url'] for call in active.call_args_list
+                    for entry in call.kwargs['_config'].get('_zap_seed_entries',[])]
+            self.assertIn(URL+'x7?product_code=aixsec-test',seeded)
+            item=next(row for row in result['request_coverage']['inputs']
+                      if row['parameter']=='product_code')
+            self.assertEqual(item['state'],'active_attempted')
+            self.assertTrue(Path(result['request_coverage_path']).is_file())
+            self.assertTrue(Path(result['advanced_coverage_path']).is_file())
+            self.assertIn('dom_browser',{row['surface'] for row in result['advanced_coverage']['surfaces']})
 
     def test_discovered_post_search_form_is_probed_without_har_submission(self):
         with tempfile.TemporaryDirectory() as root:
@@ -91,8 +100,8 @@ class SequentialTests(unittest.TestCase):
                  patch.object(TOOL_INDEX['zap_active_scan'],'exec_fn',side_effect=active), \
                  contextlib.redirect_stdout(io.StringIO()):
                 result = WebXAgent(cfg).run('scan')
-            self.assertEqual(seen, [40018])
-            self.assertEqual(result['technology_capability_benchmark']['executed_payload_families'], 1)
+            self.assertEqual(set(seen), {40018,90001})
+            self.assertTrue(any(row.get('deferred') for row in result['technology_scanner_skips']))
             directory = Path(result['progress']['path']).parent
             for name in ('technology-capabilities.json', 'planner-capabilities.json',
                          'planner-decisions.json'):

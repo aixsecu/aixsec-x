@@ -217,6 +217,31 @@ python3 agent.py --non-interactive                # run automatically
 
 `--non-interactive`/`--oneshot` only read env (no prompts) — for scripts/CI.
 
+### Scan profiles from the terminal
+
+Choose the coverage/speed trade-off directly on the command line; no profile
+environment variable is required:
+
+```bash
+python3 agent.py --scan-profile fast
+python3 agent.py --scan-profile balanced
+python3 agent.py --scan-profile full
+python3 agent.py --list-scan-profiles
+```
+
+- `fast`: keeps the coverage gate and safe GET/POST form seeding, then uses
+  route-family reduction and shorter crawl/scan limits.
+- `balanced`: recommended default balance, with technology used only for
+  prioritization rather than excluding checks.
+- `full`: disables route-family and technology reduction, uses High ZAP
+  strength, and raises crawl/scan limits. It can take substantially longer.
+
+The selected CLI profile overrides performance-related environment settings.
+It never enables authorization-sensitive capabilities such as active scanning,
+OAST, SQLMap, or data extraction when those gates are disabled. Without
+`--scan-profile`, existing configuration is preserved and the banner reports
+the profile as `custom`.
+
 ### Configuration via env
 
 Boolean switches use `1` (enabled) and `0` (disabled). Defaults below come from `config.py`; an empty value means no explicit setting.
@@ -280,6 +305,13 @@ Boolean switches use `1` (enabled) and `0` (disabled). Defaults below come from 
 | `WEBX_ZAP_PARAMETERIZED_FIRST` | `1` | When captured parameterized/body requests exist, omit unparameterized groups from automatic active scanning. Set `0` to retain legacy broad scheduling. |
 | `WEBX_ZAP_DISCOVERED_GET_PROBES` | `5` | Maximum read-like JavaScript-discovered GET/UNKNOWN endpoints checked with bounded quote-parity when SQLi rule 40018 is enabled. `0` disables it. |
 | `WEBX_ZAP_DISCOVERED_FORM_PROBES` | `5` | Maximum HTML-discovered anonymous GET/POST search forms checked input-by-input with bounded quote-parity when SQLi rule 40018 is enabled. `0` disables it; non-search or sensitive forms are not submitted automatically. |
+| `WEBX_COVERAGE_GATE` | `1` | Require every discovered input to be seeded, captured, tested, explicitly unsupported, or skipped with a policy reason before discovery is considered coverage-ready. |
+| `WEBX_SEED_GET_FORMS` | `1` | Generate harmless `aixsec-test` GET request seeds for discovered inputs before route-family reduction, then import those requests into targeted ZAP active scans. Sensitive fields are never seeded. |
+| `WEBX_SEED_SAFE_POST_FORMS` | `1` | Seed uncaptured POST forms only when their fields classify them as search/filter operations and no dynamic token or destructive field is present. Other writes remain visible as policy skips. |
+| `WEBX_TECH_FILTER_MODE` | `priority` | `priority` keeps every allowed ZAP rule and runs likely families first; `strict` permits capability filtering; `off` disables technology-based ordering/filtering. |
+| `WEBX_ADVANCED_COVERAGE` | `1` | Produce `advanced-coverage.json` for multi-role authorization, DOM/browser, GraphQL, SOAP/XML, WebSocket, OAST and business-workflow surfaces. Missing prerequisites remain explicit gaps. |
+| `WEBX_ALLOW_OAST` | `0` | Declare that out-of-band testing is authorized. This does not invent or provision a callback service. |
+| `WEBX_OAST_CALLBACK_URL` | *(empty)* | Operator-controlled HTTP(S) callback endpoint used only to mark OAST prerequisites ready; secrets and callback paths are not copied into public coverage. |
 | `WEBX_ZAP_DELAY_MS` | `200` | Delay between active scan requests, in milliseconds. |
 | `WEBX_ZAP_AJAX` | `1` | Enable AJAX Spider for browser-driven discovery. |
 | `WEBX_ZAP_BROWSER` | `firefox-headless` | Selenium browser ID for AJAX Spider; requires the corresponding browser/driver. |

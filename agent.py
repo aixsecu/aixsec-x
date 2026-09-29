@@ -25,7 +25,7 @@ from urllib.parse import urljoin
 
 # ── local imports ──
 from terminal_output import TerminalOutput, prompt as terminal_prompt
-from config import load_config
+from config import SCAN_PROFILES, apply_scan_profile, load_config
 from inventory import Inventory, TestHistory
 from ledger import (Ledger, parse_findings_json, render_markdown, validation_plan,
                    check_findings_evidence)
@@ -1652,6 +1652,7 @@ def _banner(cfg: dict, scope: str = "", missing=None, mode: str = "interactive",
     lines.append("")
     lines.append(f"{C}{B}[>]{RS} {D}{'model':<9}{RS} {B}{info['python']} | {cfg.get('model', '?')}{RS}")
     lines.append(f"{C}{B}[>]{RS} {D}{'scope':<9}{RS} {G}{scope}{RS}")
+    lines.append(f"{C}{B}[>]{RS} {D}{'profile':<9}{RS} {A}{cfg.get('scan_profile', 'custom')}{RS}")
     lines.append(f"{C}{B}[>]{RS} {D}{'auto-exec':<9}{RS} {Y}{cfg.get('auto_exec', 'ask')}{RS}{D}   mode: {A}{mode}{RS}")
     lines.append(f"{C}{B}[>]{RS} {D}{'host':<9}{RS} {B}{info['host']}{RS}{D}  kernel {info['kernel']}{RS}")
     lines.append(f"{C}{B}[>]{RS} {D}{'session':<9}{RS} {info['ts']}{D}  pid {info['pid']}{RS}")
@@ -1679,8 +1680,48 @@ def _print_banner(cfg: dict, scope: str = "", missing=None, mode: str = "interac
     print(_banner(cfg, scope=scope, missing=missing, mode=mode), flush=True)
 
 
+def _cli_option_value(flag: str, argv=None):
+    """Read either ``--flag value`` or ``--flag=value``."""
+    args = list(sys.argv[1:] if argv is None else argv)
+    prefix = flag + "="
+    for index, arg in enumerate(args):
+        if arg.startswith(prefix):
+            value = arg[len(prefix):].strip()
+            if not value:
+                raise ValueError(f"{flag} requires a value")
+            return value
+        if arg == flag:
+            if index + 1 >= len(args) or args[index + 1].startswith("-"):
+                raise ValueError(f"{flag} requires a value")
+            return args[index + 1]
+    return None
+
+
+def _print_scan_profiles():
+    descriptions = {
+        "fast": "basic coverage, aggressive family reduction, shorter limits",
+        "balanced": "recommended coverage/speed balance",
+        "full": "no route/technology reduction, high strength, wider limits",
+    }
+    print("Available scan profiles:")
+    for name in SCAN_PROFILES:
+        print(f"  {name:<8} {descriptions[name]}")
+
+
 def _main():
     cfg = load_config()
+
+    if "--list-scan-profiles" in sys.argv:
+        _print_scan_profiles()
+        return
+    try:
+        scan_profile = _cli_option_value("--scan-profile")
+        if scan_profile:
+            cfg = apply_scan_profile(cfg, scan_profile)
+    except ValueError as exc:
+        print(f"[!] {exc}", file=sys.stderr)
+        print("    Use --list-scan-profiles to see available modes.", file=sys.stderr)
+        raise SystemExit(2) from exc
 
     # Chẩn đoán kết nối Ollama (không cần target/scope) — dùng nhiều nhất
     # khi model chạy trên MÁY KHÁC và Kali chỉ trỏ WEBX_OLLAMA_URL sang.
@@ -1821,7 +1862,8 @@ def _verbose():
 
 def main():
     batch = any(flag in sys.argv for flag in ("--non-interactive", "-n", "--oneshot"))
-    utility = any(flag in sys.argv for flag in ("--check-ollama", "--capabilities"))
+    utility = any(flag in sys.argv for flag in ("--check-ollama", "--capabilities",
+                                                 "--list-scan-profiles"))
     cfg = load_config()
     if batch and not utility and (cfg.get("targets") or cfg.get("src_dirs")):
         with TerminalOutput(verbose=_verbose()):
