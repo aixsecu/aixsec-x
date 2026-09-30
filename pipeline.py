@@ -177,6 +177,11 @@ def _print_active_performance(report):
             ('Average Shutdown','shutdown_ms')):
         print(f'{label}: {report["averages_ms"][key]:.3f} ms', flush=True)
     print(f'Worker Utilization: {report["worker_utilization"]*100:.2f}%', flush=True)
+    print(f'Average Active Workers: {report["scheduler"].get("average_active_workers",0):.2f}',flush=True)
+    print(f'Peak Active/Effective: {int(report["scheduler"].get("peak_active_workers",0))}/'
+          f'{int(report["scheduler"].get("peak_effective_limit",0))}',flush=True)
+    print(f'Deferred by Budget: {int(report["scheduler"].get("deferred_jobs",0))} — '
+          f'{report["scheduler"].get("deferred_reason_counts",{})}',flush=True)
     for label,key in (('Scheduler Idle','scheduler_idle_ms'),('Barrier Wait','serial_barrier_wait_ms'),
             ('AutoConcurrency Wait','auto_concurrency_wait_ms'),('Bootstrap Wait','bootstrap_wait_ms')):
         print(f'{label}: {report["scheduler"].get(key,0):.3f} ms', flush=True)
@@ -301,7 +306,7 @@ def _run(agent, user_text):
     import http_engine
     import security_analysis
     from agent import _LiveDisplay, _llm_failure
-    from ledger import Ledger
+    from ledger import Ledger, Finding
     from inventory import Inventory, TestHistory
     from tools import TOOL_INDEX
 
@@ -315,6 +320,11 @@ def _run(agent, user_text):
     auth_manifest = load_auth_manifest(cfg)
     require_ready(auth_manifest,cfg.get('zap_auth_context','anonymous'))
     bound_auth_contexts = bind_runtime(auth_manifest, auth_context.manager())
+    from auth_zap_bridge import prepare as prepare_zap_auth, public as public_zap_auth
+    zap_auth_material=prepare_zap_auth(auth_manifest,cfg.get('zap_auth_context','anonymous'),
+                                       auth_context.manager())
+    if zap_auth_material:
+        cfg['_zap_auth_material']=zap_auth_material
     auth_lifecycle = AuthLifecycle(cfg.get('zap_auth_context', 'anonymous'))
     security_analysis.reset()
     # A new session cannot borrow old candidate evidence or a previous scan's auth state.
@@ -334,6 +344,7 @@ def _run(agent, user_text):
     route_family_report = None
     representative_report = None
     family_evidence_report = None
+    multi_role_report = None
     divergence_report = None
     family_history_report = None
     technology_capability_reports = None
@@ -469,12 +480,27 @@ def _run(agent, user_text):
             args['rule_ids'] = sorted(claimed)
             agent._zap_active_entry = representative['_entry']
             agent._zap_active_entries = [member['_entry'] for member in batch_members]
+            agent._zap_active_members = list(batch_members)
+            from session_classifier import classify_entry
+            from adapters.zap import origin as zap_origin
+            lanes={classify_entry(member) for member in batch_members}
+            session_sensitive=bool(lanes & {'csrf','guest_session','authenticated_session','unknown'} or
+                any(str(member.get('method','GET')).upper() not in ('GET','HEAD') for member in batch_members))
+            worker_slot=int(representative.get('_scheduler_worker_slot',0) or 0)
+            agent._zap_session_binding=(digest([zap_origin(args['url']),args.get('auth_context','anonymous'),
+                args.get('auth_generation',0),sorted(lanes),worker_slot]) if session_sensitive else '')
         trigger = 'baseline' if baseline else 'scheduler' if scheduled else 'planner'
         if args.get('auth_context','anonymous') != 'anonymous':
             args['auth_generation']=auth_lifecycle.public()['generation']
+        if representative and agent._zap_session_binding:
+            agent._zap_session_binding=digest([zap_origin(args['url']),
+                args.get('auth_context','anonymous'),args.get('auth_generation',0),sorted(lanes),worker_slot])
         safe_auth_retry = (baseline or not batch_members or all(
             str(member.get('method') or (member.get('_entry',{}).get('request') or {}).get('method') or 'GET').upper()
             in ('GET','HEAD') for member in batch_members))
+        auth_pairs=[{'request_id':member.get('request_id',''),
+                     'rule_ids':list(args.get('rule_ids') or [])}
+                    for member in batch_members if member.get('request_id')]
         print(f'[→] {name} ({trigger})', flush=True)
         execution_started=0
         if cancelled is not None:
@@ -492,6 +518,11 @@ def _run(agent, user_text):
             worker._risk_ok = lambda spec: approved
             worker._zap_active_entry = representative['_entry'] if representative else None
             worker._zap_active_entries = [member['_entry'] for member in batch_members]
+            worker._zap_active_members = list(batch_members)
+            worker._zap_session_binding = agent._zap_session_binding
+            worker.config['_zap_guest_session_isolation']=(lanes == {'guest_session'} and
+                all(str((member.get('_entry',{}).get('request') or {}).get('method','GET')).upper()
+                    in ('GET','HEAD') for member in batch_members))
             if approved and auto_concurrency and representative:
                 scope_error = agent.policy.check_param(name, 'url', args['url'])
                 if not scope_error:
@@ -501,6 +532,8 @@ def _run(agent, user_text):
                         (time.perf_counter_ns()-prepare_started)/1_000_000
             agent._zap_active_entry = None
             agent._zap_active_entries = None
+            agent._zap_active_members = None
+            agent._zap_session_binding = None
             execution_started=time.perf_counter_ns()
             def dispatch_worker():
                 operation=lambda: worker._dispatch(name,args)
@@ -508,7 +541,8 @@ def _run(agent, user_text):
                     def expired(value):
                         coverage=((value.get('data') or {}).get('coverage') or {}) if isinstance(value,dict) else {}
                         return coverage.get('auth_state') not in ('verified',)
-                    return auth_lifecycle.run(operation,expired,safe_retry=safe_auth_retry,job_id=key)
+                    return auth_lifecycle.run(operation,expired,safe_retry=safe_auth_retry,
+                                              job_id=key,pairs=auth_pairs)
                 return operation()
             result = yield dispatch_worker
         else:
@@ -519,12 +553,15 @@ def _run(agent, user_text):
                     def expired(value):
                         coverage=((value.get('data') or {}).get('coverage') or {}) if isinstance(value,dict) else {}
                         return coverage.get('auth_state') not in ('verified',)
-                    result=auth_lifecycle.run(operation,expired,safe_retry=safe_auth_retry,job_id=key)
+                    result=auth_lifecycle.run(operation,expired,safe_retry=safe_auth_retry,
+                                              job_id=key,pairs=auth_pairs)
                 else:
                     result=operation()
             finally:
                 agent._zap_active_entry = None
                 agent._zap_active_entries = None
+                agent._zap_active_members = None
+                agent._zap_session_binding = None
         if representative:
             if auto_concurrency:
                 for member in batch_members:
@@ -770,6 +807,25 @@ def _run(agent, user_text):
         journal.data['stages']['discovery']['route_families']={
             'status':'skipped','reason':'coverage gate is not ready; request groups were not reduced'}
         journal.save()
+    if len(auth_manifest.get('contexts',{})) and schedule.entries:
+        from multi_role_campaign import run as run_multi_role_campaign
+        multi_role_report=run_multi_role_campaign(auth_manifest,auth_context.manager(),
+            list(schedule.entries.values()),targets[0],cfg.get('auth_campaign_max_requests',20))
+        for comparison in multi_role_report.get('comparisons',[]):
+            record_result(agent,'auth_compare',{'contexts':comparison.get('contexts',[]),
+                'request':{'url':comparison.get('url'),'method':comparison.get('method','GET')}},
+                {'name':'auth_compare','outcome':'ok','data':comparison},baseline=True)
+        for candidate in multi_role_report.get('candidates',[]):
+            finding=agent.ledger.add(Finding(name=('Potential IDOR/BOLA: '+candidate['kind']),
+                url=candidate['url'],severity=candidate['severity'],
+                description='; '.join(candidate['evidence']),source_tool='multi_role_campaign',
+                sources=['multi_role_campaign'],status='candidate',
+                evidence_gaps=list(candidate['evidence_gaps']),method='GET',
+                auth_context=','.join(candidate['contexts']),finding_id=candidate['candidate_id']))
+            agent.evidence_store.candidates[candidate['candidate_id']]=finding
+        agent.inventory.analysis['multi_role_campaign']={k:v for k,v in multi_role_report.items()
+            if k!='comparisons'}
+        atomic(journal.directory/'multi-role-campaign.json',multi_role_report)
     if cfg.get('technology_capability_engine', False):
         from technology_capability import TechnologyCapabilityEngine, persist
         capability_engine = TechnologyCapabilityEngine(cfg.get('planner_mode', 'balanced'))
@@ -813,6 +869,12 @@ def _run(agent, user_text):
         attack_plan = plan_attack_points(representatives, eligible_rule_rows,
                                          cfg.get('scan_profile') != 'exhaustive')
         atomic(journal.directory/'attack-plan.json', attack_plan)
+        # Persistent history and auth retry state are pair-scoped. Remove
+        # completed request/rule pairs before batching so a partially expired
+        # batch is rebuilt only from the affected pairs on resume/retry.
+        for row in representatives:
+            row['_applicable_rules'] = schedule.remaining(
+                row['request_id'], row.get('_applicable_rules') or [])
         representatives = sorted((row for row in representatives if row.get('_applicable_rules')),
                                  key=lambda row: (-row.get('risk_score',0), row.get('url','')))
         journal.data['stages']['zap_active']['attack_plan'] = {
@@ -840,6 +902,9 @@ def _run(agent, user_text):
             if scheduling.get('session_lanes'):
                 print('[zap] session lanes: '+', '.join(
                     f'{name}={count}' for name,count in sorted(scheduling['session_lanes'].items())),flush=True)
+            if scheduling.get('scheduler_lanes'):
+                print('[zap] scheduler lanes: '+', '.join(
+                    f'{name}={count}' for name,count in sorted(scheduling['scheduler_lanes'].items())),flush=True)
             for policy_id, count in scheduling['policy_matches'].items():
                 print(f'[zap] concurrency policy: {policy_id}={count} groups', flush=True)
             for reason, count in scheduling['serial_reasons'].items():
@@ -1145,6 +1210,10 @@ def _run(agent, user_text):
     result['auth_manifest'] = public_auth_manifest(auth_manifest)
     result['auth_manifest_path'] = str(auth_manifest_path)
     result['auth_runtime'] = {**runtime_auth_status, 'bound_contexts': bound_auth_contexts}
+    result['auth_zap_bridge'] = public_zap_auth(zap_auth_material)
+    if multi_role_report is not None:
+        result['multi_role_campaign']={k:v for k,v in multi_role_report.items() if k!='comparisons'}
+        result['multi_role_campaign_path']=str(journal.directory/'multi-role-campaign.json')
     if cfg.get('advanced_coverage', True):
         from advanced_coverage import evaluate as evaluate_advanced_coverage
         advanced_coverage = evaluate_advanced_coverage(request_templates,

@@ -62,7 +62,19 @@ class ZapBatchingTests(unittest.TestCase):
             self.assertEqual(types.count('report'), 1)
             seed = json.loads((Path(root) / 'seed.har').read_text())
             self.assertEqual(len(seed['log']['entries']), 2)
+            self.assertTrue(all(row['request']['httpVersion']=='HTTP/1.1' for row in seed['log']['entries']))
+            self.assertTrue(all(row['response']['httpVersion']=='HTTP/1.1' for row in seed['log']['entries']))
             self.assertEqual(len(plan['env']['contexts'][0]['includePaths']), 2)
+
+    def test_null_har_http_version_is_normalized_before_zap_import(self):
+        with tempfile.TemporaryDirectory() as root:
+            item=captured('search?q=x')['_entry']
+            item['request']['httpVersion']=None;item['response']['httpVersion']=None
+            build_plan({'zap_allowed_rules':[40018],'_zap_seed_entry':item},
+                       BASE+'search?q=x',root,active=True,rule_ids=[40018])
+            imported=json.loads((Path(root)/'seed.har').read_text())['log']['entries'][0]
+            self.assertEqual(imported['request']['httpVersion'],'HTTP/1.1')
+            self.assertEqual(imported['response']['httpVersion'],'HTTP/1.1')
 
     def test_batch_rejects_cross_origin_seed(self):
         with tempfile.TemporaryDirectory() as root:
@@ -71,6 +83,23 @@ class ZapBatchingTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, 'one origin'):
                 build_plan({'zap_allowed_rules': [40018], '_zap_seed_entries': [foreign]},
                            BASE, root, active=True, rule_ids=[40018])
+
+    def test_guest_worker_seed_drops_session_state_but_keeps_benign_cookies(self):
+        with tempfile.TemporaryDirectory() as root:
+            item=captured('catalog',headers=[{'name':'Cookie',
+                'value':'PHPSESSID=shared; _ga=analytics; AWSALB=route'}])['_entry']
+            item['response']['headers']=[{'name':'Set-Cookie','value':
+                'PHPSESSID=shared; Path=/, _ga=analytics; Path=/'}]
+            build_plan({'zap_allowed_rules':[40018],'_zap_seed_entry':item,
+                '_zap_guest_session_isolation':True,'_zap_session_binding':'slot-1'},
+                BASE+'catalog',root,active=True,rule_ids=[40018])
+            seed=json.loads((Path(root)/'seed.har').read_text())['log']['entries'][0]
+            serialized=json.dumps(seed)
+            self.assertNotIn('PHPSESSID',serialized)
+            self.assertIn('_ga=analytics',serialized)
+            self.assertIn('AWSALB=route',serialized)
+            report=json.loads((Path(root)/'csrf-binding.json').read_text())
+            self.assertEqual(report['guest_session_isolation']['removed_cookie_names'],['PHPSESSID'])
 
 
 if __name__ == '__main__':

@@ -1,6 +1,7 @@
 """Non-secret authentication state diagnostics."""
 from pathlib import Path
 import json
+from session_classifier import classify_entry
 
 AUTH_STATES = ('anonymous_stateless', 'guest_session', 'auth_configured',
                'auth_verified', 'auth_expired', 'auth_refreshing', 'auth_blocked')
@@ -29,12 +30,9 @@ def observe(config, coverages):
         try: data = json.loads(Path(har).read_text(encoding='utf-8'))
         except (OSError, ValueError, TypeError): continue
         for entry in data.get('log', {}).get('entries', []):
-            request = entry.get('request') or {}; response = entry.get('response') or {}
-            cookies = request.get('cookies', [])
-            set_cookie = any(str(h.get('name', '')).lower() == 'set-cookie'
-                             for h in response.get('headers', []))
-            if cookies or set_cookie:
+            lane=classify_entry({'_entry':entry,'auth_context':'anonymous'})
+            if lane in ('guest_session','csrf','unknown'):
                 status.update(state='guest_session', generation=1,
-                              reason='Website-issued guest cookie/session observed')
+                              reason=f'Website-issued {lane} state observed')
                 return status
     return status

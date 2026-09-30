@@ -2,7 +2,7 @@ import json
 import os
 from types import SimpleNamespace
 
-from captured_auth import artifact_expired
+from captured_auth import artifact_expired, artifact_expired_pairs
 from evidence import EvidenceStore
 from family_evidence import FamilyEvidenceStore
 from inventory import Inventory, TestHistory as HistoryStore
@@ -22,6 +22,24 @@ def test_login_page_in_active_artifact_is_expired(tmp_path):
     evidence=tmp_path/'active.jsonl'
     evidence.write_text(json.dumps({'response_body':'Please login to continue'})+'\n')
     assert artifact_expired({'zap_auth_file':str(auth_file(tmp_path))},'user_A',evidence)
+
+
+def test_login_marker_is_attributed_to_exact_request_rule_pair(tmp_path):
+    evidence=tmp_path/'active.jsonl'
+    evidence.write_text('\n'.join((
+        json.dumps({'request_url':'https://example.test/a?id=payload','method':'GET',
+                    'rule_id':'40018','response_body':'Please login to continue'}),
+        json.dumps({'request_url':'https://example.test/b','method':'GET',
+                    'rule_id':'40018','response_body':'Logout'}))))
+    pairs,complete=artifact_expired_pairs({'zap_auth_file':str(auth_file(tmp_path))},
+        'user_A',evidence,[
+            {'request_id':'request-a','url':'https://example.test/a?id=1',
+             'method':'GET','rule_ids':[40018]},
+            {'request_id':'request-b','url':'https://example.test/b',
+             'method':'GET','rule_ids':[40018]}])
+    assert complete is True
+    assert pairs==[{'request_id':'request-a','rule_id':40018,
+                    'auth_disposition':'deferred_auth_expired'}]
 
 
 def test_uncertain_authenticated_result_cannot_create_findings(tmp_path):

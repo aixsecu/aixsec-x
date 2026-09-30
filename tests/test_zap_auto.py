@@ -72,8 +72,70 @@ class AutoTests(unittest.TestCase):
         self.assertEqual(cookie_lane(authenticated),'authenticated_session')
         self.assertTrue(bootstrap_eligible(analytics)); self.assertTrue(bootstrap_eligible(affinity))
         auto=self.controller([analytics,affinity,session,authenticated])
-        self.assertEqual(auto.limit('https://example.test',session),1)
+        self.assertEqual(auto.limit('https://example.test',session),2)
         self.assertEqual(auto.limit('https://example.test',authenticated),1)
+
+    def test_anonymous_guest_session_uses_bounded_two_worker_bootstrap(self):
+        items=[bootstrap_job('public-a',headers=[{'name':'Cookie','value':'PHPSESSID=a'}]),
+               bootstrap_job('public-b',headers=[{'name':'Cookie','value':'PHPSESSID=b'}])]
+        auto=self.controller(items);barrier=threading.Barrier(2);started=[]
+        good=self.result()
+        def start(item,cancelled):
+            auto.prepare(item)
+            def work():
+                started.append(item['request_id']);barrier.wait(3);return good
+            result=yield work
+            auto.observe(item,result)
+        with patch('zap_auto.controls',return_value={'stable':True}):
+            drive(items,start,workers=4,cookie_mode='auto',policy=self.policy,auto=auto)
+        state=auto.data['origins']['https://example.test']
+        self.assertCountEqual(started,['public-a','public-b'])
+        self.assertEqual((state['mode'],state['level'],state['bootstrap_result']),('steady',2,'clean'))
+
+    def test_guest_bootstrap_keeps_stateful_requests_serial(self):
+        get=bootstrap_job('public',headers=[{'name':'Cookie','value':'PHPSESSID=a'}])
+        post=bootstrap_job('save',method='POST',headers=[{'name':'Cookie','value':'PHPSESSID=a'}])
+        auto=self.controller([get,post])
+        self.assertEqual(auto.limit('https://example.test',get),2)
+        self.assertEqual(auto.limit('https://example.test',post),1)
+        self.assertTrue(auto.bootstrap_serial(post))
+
+    def test_stable_guest_session_can_promote_from_two_to_configured_four(self):
+        items=[bootstrap_job(f'public-{index}',headers=[{'name':'Cookie','value':'PHPSESSID=x'}])
+               for index in range(6)]
+        auto=self.controller(items,zap_auto_recovery_groups=2,
+                             zap_auto_promotion_cooldown_groups=3)
+        state=auto.data['origins']['https://example.test'];state.update(mode='steady',level=2)
+        for item in items[:3]:auto.observe(item,self.result())
+        self.assertEqual(auto.limit('https://example.test',items[3]),4)
+        self.assertEqual(auto.summary()['promotions'],1)
+
+    def test_four_isolated_guest_slots_overlap_after_promotion(self):
+        items=[bootstrap_job(f'public-{index}',headers=[{'name':'Cookie','value':'PHPSESSID=x'}])
+               for index in range(4)]
+        auto=self.controller(items);auto.data['origins']['https://example.test'].update(mode='steady',level=4)
+        barrier=threading.Barrier(4);slots=[]
+        def start(item,cancelled):
+            def work():
+                slots.append(item['_scheduler_worker_slot']);barrier.wait(3);return self.result()
+            result=yield work
+            auto.observe(item,result)
+        drive(items,start,workers=4,cookie_mode='auto',policy=self.policy,auto=auto)
+        self.assertCountEqual(slots,[0,1,2,3])
+
+    def test_bootstrap_reads_are_prioritized_before_high_risk_serial_work(self):
+        serial=bootstrap_job('save',method='POST');serial['risk_score']=100
+        reads=[bootstrap_job('public-a'),bootstrap_job('public-b')]
+        for item in reads:item['risk_score']=10
+        auto=self.controller([serial,*reads]);started=[]
+        def start(item,cancelled):
+            started.append(item['request_id'])
+            result=yield lambda:self.result()
+            auto.observe(item,result)
+        with patch('zap_auto.controls',return_value={'stable':True}):
+            drive([serial,*reads],start,workers=4,cookie_mode='auto',policy=self.policy,auto=auto)
+        self.assertCountEqual(started[:2],['public-a','public-b'])
+        self.assertEqual(started[2],'save')
 
     def test_authenticated_roles_have_independent_concurrency_state(self):
         user_a=bootstrap_job('a'); user_a['auth_context']='user_A'
@@ -200,14 +262,33 @@ class AutoTests(unittest.TestCase):
             self.assertFalse(controls({'zap_delay_ms':0},item,self.root)['stable'])
             fake.status_code=301;fake.headers={'Location':'/products/'}
             self.assertTrue(controls({'zap_delay_ms':0},item,self.root)['stable'])
+
+    def test_controls_accept_initial_guest_cookie_and_reuse_same_session(self):
+        item=bootstrap_job('products')
+        responses=[]
+        for _ in range(2):
+            responses.append(SimpleNamespace(status_code=200,text='ok',content=b'ok',
+                headers={'Set-Cookie':'PHPSESSID=fresh; Path=/'}))
+        with patch('http_engine.HttpSession') as session:
+            instance=session.return_value
+            instance.request.side_effect=[(responses[0],None),(responses[1],None)]
+            instance.s.cookies.keys.side_effect=[[],['PHPSESSID']]
+            result=controls({'zap_delay_ms':0},item,self.root)
+        self.assertTrue(result['stable'],result)
+        self.assertEqual(session.call_count,1)
+        self.assertEqual(instance.request.call_count,2)
     def test_group_local_quarantine_then_origin_escalation(self):
-        items=[job('products'),job('orders')];auto=self.controller(items)
+        items=[job(name) for name in ('products','orders','account-a','account-b','account-c')]
+        auto=self.controller(items)
         auto.data['origins']['https://example.test']={'level':4,'score':8,'stable_groups':0,
             'unstable_groups':{},'groups_since_change':3}
         auto.observe(items[0],self.result(302,redirect=True,location='/login'))
         self.assertEqual(auto.limit('https://example.test'),4)
         self.assertTrue(auto.data['groups']['products']['quarantined'])
         auto.observe(items[1],self.result(302,redirect=True,location='/login'))
+        self.assertEqual(auto.limit('https://example.test'),2)
+        for item in items[2:]:
+            auto.observe(item,self.result(302,redirect=True,location='/login'))
         self.assertEqual(auto.limit('https://example.test'),1)
     def test_two_worker_trial_after_first_success(self):
         items=[job(v) for v in ('a','b','c','d','e','f')];auto=self.controller(items)

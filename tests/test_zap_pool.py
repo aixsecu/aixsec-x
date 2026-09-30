@@ -82,6 +82,25 @@ class WorkerPoolTests(unittest.TestCase):
         self.assertEqual(len({row[0] for row in seen}),2)
         self.assertEqual(len({row[2] for row in seen}),2)
 
+    def test_session_binding_returns_workflow_to_same_worker(self):
+        pool,_=self.pool(2);pool.start()
+        first=pool.acquire(binding='context-a');worker_a=first.__enter__()
+        second=pool.acquire(binding='context-b');worker_b=second.__enter__()
+        self.assertNotEqual(worker_a.worker_id,worker_b.worker_id)
+        first.__exit__(None,None,None);second.__exit__(None,None,None)
+        with pool.acquire(binding='context-a') as resumed:
+            self.assertEqual(resumed.worker_id,worker_a.worker_id)
+
+    def test_guest_session_slots_bind_to_distinct_workers(self):
+        pool,_=self.pool(4);pool.start();barrier=threading.Barrier(4);seen=[]
+        def task(slot):
+            with pool.acquire(binding=f'guest-origin-slot-{slot}') as worker:
+                seen.append((slot,worker.worker_id));barrier.wait(2)
+        threads=[threading.Thread(target=task,args=(slot,)) for slot in range(4)]
+        for thread in threads:thread.start()
+        for thread in threads:thread.join()
+        self.assertEqual(len({worker for _,worker in seen}),4)
+
     def test_shutdown_closes_every_worker(self):
         pool,created=self.pool(2);pool.start();pool.close()
         self.assertTrue(all(worker.closed for worker in created));self.assertTrue(pool._closed)

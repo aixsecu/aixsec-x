@@ -123,6 +123,27 @@ class ScheduleTests(unittest.TestCase):
             self.assertEqual(summary['auth_retry_ledger'][0]['auth_generation'],3)
             self.assertEqual(summary['families'],[])  # ledger survives even before a new HAR entry is collected
 
+    def test_partial_batch_auth_expiry_releases_only_affected_request_rule_pair(self):
+        with tempfile.TemporaryDirectory() as root:
+            schedule=ScanSchedule(root)
+            schedule.claim('request-a',[40018]);schedule.claim('request-b',[40018])
+            result={'outcome':'ok','data':{'coverage':{
+                'status':'partial','auth_context':'member','auth_generation':4,
+                'auth_disposition':'deferred_auth_expired','scan_id':'attempt-9',
+                'auth_pair_attribution_complete':True,
+                'auth_pair_dispositions':[{'request_id':'request-a','rule_id':40018,
+                    'auth_generation':4,'auth_disposition':'deferred_auth_expired'}]}}}
+            schedule.finish('request-a',[40018],result)
+            schedule.finish('request-b',[40018],result)
+            assert schedule.remaining('request-a',[40018])==[40018]
+            assert schedule.remaining('request-b',[40018])==[]
+            retry=schedule.summary([40018])['auth_retry_ledger']
+            assert len(retry)==1
+            assert retry[0]['request_id']=='request-a'
+            assert retry[0]['rule']==40018
+            assert retry[0]['auth_context']=='member'
+            assert retry[0]['attempt_id']=='attempt-9'
+
 
     def test_persistent_per_rule_reservation_and_denial_release(self):
         with tempfile.TemporaryDirectory() as root:

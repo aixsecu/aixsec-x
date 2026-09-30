@@ -191,6 +191,8 @@ class TerminalOutput:
         findings = agent.ledger.all()
         tasks = result.get('progress', {}).get('tasks', [])
         active = [t for t in tasks if t.get('stage') in ('zap_active', 'nuclei')]
+        active_scheduler=result.get('active_scan_performance',{}).get('scheduler',{})
+        automatic=result.get('progress',{}).get('stages',{}).get('zap_active',{}).get('automatic',{})
         discovery = result.get('discovery', [])
         urls = {e.get('url') for d in discovery for e in d.get('endpoints', []) if e.get('url')}
         rows = ['=' * 50, 'AIXSEC-X Scan Summary', '=' * 50,
@@ -204,6 +206,10 @@ class TerminalOutput:
                 f'  Success: {sum(t.get("status") in ("complete", "ok", "success") for t in active) if tasks else "N/A"}',
                 f'  Failed: {sum(t.get("status") in ("error", "failed", "timeout", "interrupted") for t in active) if tasks else "N/A"}',
                 f'  Deferred by budget: {result.get("active_scan_performance", {}).get("scheduler", {}).get("deferred_jobs", 0)}',
+                f'  Peak active/effective workers: {active_scheduler.get("peak_active_workers", "N/A")}/{active_scheduler.get("peak_effective_limit", "N/A")}',
+                f'  Average active workers: {float(active_scheduler.get("average_active_workers", 0)):.2f}',
+                f'  Serial barrier wait: {float(active_scheduler.get("serial_barrier_wait_ms", 0))/1000:.1f}s',
+                f'  Promotions/Demotions: {automatic.get("promotions", 0)}/{automatic.get("demotions", 0)}',
                 '', 'Authentication',
                 f'  Context: {clean(result.get("auth_status", {}).get("context", "N/A"))}',
                 f'  State: {clean(result.get("auth_status", {}).get("state", "N/A"))}',

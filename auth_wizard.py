@@ -125,7 +125,7 @@ def interactive(config):
     while True:
         selected=str(config.get('zap_auth_context') or 'anonymous')
         print(f'\nAUTH — selected: {selected}; file: {path}')
-        print('1 List  2 Add/edit  3 Test  4 Select  5 Remove  6 Guest  7 Resume MFA  8 Import cookies  0 Done')
+        print('1 List  2 Add/edit  3 Test  4 Select  5 Remove  6 Guest  7 Resume MFA  8 Import cookies  9 Role policy  0 Done')
         action=input('Choose: ').strip() or '0'
         if action=='0': break
         if action=='1':
@@ -143,8 +143,9 @@ def interactive(config):
         elif action=='4':
             name=_value('Profile name')
             if name not in profiles: print('[!] Unknown profile.'); continue
-            if (profiles[name].get('authentication') or {}).get('method') not in SUPPORTED_METHODS:
-                print('[!] Runtime-only profile: usable by HTTP verification, not selectable for ZAP scan.'); continue
+            if ((profiles[name].get('authentication') or {}).get('method') not in SUPPORTED_METHODS
+                    and not profiles[name].get('runtime')):
+                print('[!] Profile does not provide a ZAP-compatible runtime session.'); continue
             pause=profiles[name].get('operator_pause') or {}
             if pause and not os.environ.get(pause.get('ready_env','')):
                 print('[!] MFA đang pause. Hoàn tất bước MFA rồi chọn action 7.'); continue
@@ -157,6 +158,14 @@ def interactive(config):
             name=_value('Profile name',selected if selected!='anonymous' else '')
             pause=(profiles.get(name) or {}).get('operator_pause') or {}; env=pause.get('ready_env')
             if not env: print('[!] Profile không cấu hình MFA pause.'); continue
+            profile=profiles.get(name) or {}; method=(profile.get('authentication') or {}).get('method')
+            cookies=(((profile.get('runtime') or {}).get('transport') or {}).get('cookies') or {})
+            if method=='browser' and not cookies:
+                cookie_path=_value('Exported browser cookie JSON/Netscape file')
+                imported=import_cookies(name,profile.get('origin',''),cookie_path)
+                profile['runtime']={'transport':{'cookies':imported},
+                    'verification':(profile.get('authentication') or {}).get('verification') or {}}
+                save_profiles(profiles,path)
             os.environ[env]='1'; print('[✓] MFA resume chỉ có hiệu lực trong process hiện tại.')
         elif action=='8':
             name=_value('Profile name'); origin=_value('Application origin'); cookie_path=_value('Cookie JSON/Netscape file')
@@ -164,5 +173,20 @@ def interactive(config):
             profiles[name]={'origin':origin,'authentication':{'method':'manual','parameters':{},'verification':{}},
                 'runtime':{'transport':{'cookies':cookies}},'credential_env':{}}
             save_profiles(profiles,path); print(f'[✓] Imported {len(cookies)} scoped cookie names; values remain session-only.')
+        elif action=='9':
+            name=_value('Profile name')
+            if name not in profiles: print('[!] Unknown profile.'); continue
+            current=profiles[name].get('authorization') or {}
+            role=_value('Role label',current.get('role',name))
+            subject=_value('Subject/owner label (optional)',current.get('subject',''))
+            protected=[v.strip() for v in _value('Protected path globs, comma-separated',
+                ','.join(current.get('protected_paths') or [])).split(',') if v.strip()]
+            owned=[v.strip() for v in _value('Paths owned by this subject, comma-separated',
+                ','.join(current.get('owned_paths') or [])).split(',') if v.strip()]
+            if any(not value.startswith('/') for value in protected+owned):
+                print('[!] Authorization paths must start with /.'); continue
+            profiles[name]['authorization']={'role':role,'subject':subject,
+                'protected_paths':protected,'owned_paths':owned}
+            save_profiles(profiles,path);print('[✓] Role policy saved; it contains no secrets.')
     if profiles: config['zap_auth_file']=str(path.resolve())
     return config

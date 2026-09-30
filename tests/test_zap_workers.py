@@ -35,11 +35,46 @@ class WorkersTests(unittest.TestCase):
         self.assertEqual(metrics['deferred_request_ids'],['2','3','4'])
         self.assertEqual(metrics['scheduled_jobs'],2)
         self.assertEqual(metrics['planned_jobs'],5)
+        self.assertEqual(metrics['deferred_reason_counts'],{'insufficient_remaining_time':3})
+
+    def test_adaptive_budget_does_not_predefer_using_configured_maximum(self):
+        from zap_auto import AutoConcurrency
+        from zap_concurrency import ConcurrencyPolicy
+        import tempfile
+        jobs=[entry(f'public-{index}') for index in range(5)]
+        for index,job in enumerate(jobs):job['request_id']=str(index)
+        with tempfile.TemporaryDirectory() as root:
+            auto=AutoConcurrency({'zap_workers':4,'zap_bootstrap_ceiling':2,'zap_delay_ms':0},
+                                 root,jobs,ConcurrencyPolicy())
+            started=[];metrics={}
+            def start(job,cancelled):
+                started.append(job['request_id'])
+                result=yield lambda:{'outcome':'ok'}
+                auto.observe(job,result)
+            drive(jobs,start,workers=4,cookie_mode='auto',policy=ConcurrencyPolicy(),auto=auto,
+                  metrics=metrics,deadline=time.monotonic()+10,expected_job_seconds=4)
+            self.assertEqual(len(started),5)
+            self.assertEqual(metrics['deferred_jobs'],0)
+            self.assertGreater(metrics['budget_recalculations'],0)
+
+    def test_fixed_budget_accounts_for_serial_lane_cost(self):
+        jobs=[entry(f'write-{index}','POST') for index in range(5)]
+        for index,job in enumerate(jobs):job['request_id']=str(index)
+        started=[];metrics={}
+        def start(job,cancelled):
+            started.append(job['request_id']);yield lambda:{'outcome':'ok'}
+        drive(jobs,start,workers=4,metrics=metrics,deadline=time.monotonic()+10,
+              reserve_seconds=0,expected_job_seconds=4)
+        self.assertEqual(started,['0','1'])
+        self.assertEqual(metrics['deferred_jobs'],3)
 
     def test_drive_exposes_scheduler_metrics_without_changing_results(self):
-        metrics={};results=[]
+        metrics={};results=[];barrier=threading.Barrier(2)
         def start(job,cancelled):
-            value=yield lambda: job['request_id']
+            def work():
+                barrier.wait(3)
+                return job['request_id']
+            value=yield work
             results.append(value)
         jobs=[entry('a'),entry('b')]
         for index,job in enumerate(jobs): job['request_id']=str(index)
@@ -49,6 +84,20 @@ class WorkersTests(unittest.TestCase):
         self.assertIn('worker_utilization',metrics)
         self.assertIn('scheduler_idle_ms',metrics)
         self.assertIn('origin_saturation_ms',metrics)
+        self.assertEqual(metrics['configured_workers'],2)
+        self.assertEqual(metrics['peak_effective_limit'],2)
+        self.assertEqual(metrics['peak_active_workers'],2)
+
+    def test_progress_distinguishes_effective_and_configured_workers(self):
+        metrics={};events=[]
+        job=entry('write','POST');job['request_id']='write'
+        def start(item,cancelled):
+            yield lambda: {'outcome':'ok'}
+        with patch('terminal_output.event',side_effect=lambda *args:events.append(args)):
+            drive([job],start,workers=4,metrics=metrics)
+        details=[row[3] for row in events if len(row)>3]
+        self.assertTrue(any('W 1/1 effective (configured 4)' in value for value in details),details)
+        self.assertEqual(metrics['peak_effective_limit'],1)
 
     def test_overlap_and_serial_barrier_and_owner_thread(self):
         main = threading.get_ident()
@@ -237,6 +286,8 @@ class CookiePolicyTests(unittest.TestCase):
         self.assertEqual(summary['parallel_eligible'],1)
         self.assertEqual(summary['serial_groups'],2)
         self.assertEqual(summary['serial_reasons']['cookie_requires_opt_in'],1)
+        self.assertEqual(summary['scheduler_lanes']['serial_stateful'],1)
+        self.assertEqual(summary['scheduler_lanes']['bootstrap_safe'],1)
         self.assertNotIn('private-token',json.dumps(summary))
         self.assertEqual(scheduling_summary([job],cookie_mode='guest')['parallel_eligible'],1)
         with self.assertRaises(ValueError): scheduling_summary([job],cookie_mode='invalid')
