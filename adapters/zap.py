@@ -101,9 +101,13 @@ def _operator_context(config, target, context_name):
     if not isinstance(profile, dict) or origin(profile.get('origin', '')) != origin(target):
         raise ValueError('ZAP auth profile missing or bound to another origin')
     auth = copy.deepcopy(profile.get('authentication') or {})
+    bridge=config.get('_zap_auth_material') or {}
     # Executable scripts and arbitrary imported plans are not accepted from tool arguments.
-    if auth.get('method') not in ('form', 'json', 'http', 'browser'):
+    if auth.get('method') not in ('form', 'json', 'http', 'browser','manual'):
         raise ValueError('ZAP auth method must be form/json/http/browser')
+    if auth.get('method') in ('manual','browser') and bridge.get('context')==context_name and bridge.get('verified'):
+        context['sessionManagement'] = copy.deepcopy(profile.get('sessionManagement') or {'method':'cookie'})
+        return context,None
     verification = auth.get('verification') or {}
     if not verification.get('loggedInRegex') or not verification.get('loggedOutRegex'):
         raise ValueError('ZAP auth profile requires loggedInRegex and loggedOutRegex')
@@ -176,6 +180,19 @@ def build_plan(config, target, workdir, *, active=False, rule_ids=(), auth_conte
     common = {'context': 'aixsec', **({'user': user} if user else {})}
     depth = max(1, int(config.get('zap_spider_depth', 10)))
     jobs = [{'type': 'passiveScan-config', 'parameters': {'scanOnlyInScope': True}}]
+    bridge=config.get('_zap_auth_material') or {}
+    if bridge:
+        rules=[]
+        for name,value in sorted((bridge.get('headers') or {}).items()):
+            rules.append({'description':'aixsec-auth-header-'+hashlib.sha256(name.encode()).hexdigest()[:8],
+                'enabled':True,'matchType':'REQ_HEADER','matchString':name,
+                'replacementString':str(value),'initiators':''})
+        cookies=bridge.get('cookies') or {}
+        if cookies:
+            value='; '.join(f'{name}={cookie}' for name,cookie in sorted(cookies.items()))
+            rules.append({'description':'aixsec-auth-cookie','enabled':True,
+                'matchType':'REQ_HEADER','matchString':'Cookie','replacementString':value,'initiators':''})
+        if rules:jobs.append({'type':'replacer','rules':rules})
     if not active:
         catalog = Path(workdir) / 'rule-catalog.js'
         catalog.write_text((Path(__file__).resolve().parent.parent / 'examples/zap/rule-catalog.js').read_text().replace(
@@ -189,12 +206,49 @@ def build_plan(config, target, workdir, *, active=False, rule_ids=(), auth_conte
     # selected endpoint so active scans are not limited to a fresh GET crawl.
     seed_entry = config.get('_zap_seed_entry') if active else None
     seed = config.get('_zap_seed_har') if active else None
+    def bind_csrf(entries):
+        from csrf_binding import bind
+        report=bind(entries)
+        report.update(session_binding=str(config.get('_zap_session_binding') or ''),
+                      worker_bound=bool(config.get('_zap_session_binding')),
+                      guest_session_isolation=config.get('_zap_guest_session_isolation_report') or
+                          {'isolated':False,'removed_cookie_names':[]})
+        path=Path(workdir)/'csrf-binding.json'
+        path.write_text(json.dumps(report,ensure_ascii=False,indent=2));path.chmod(0o600)
+        return report
+    def inject_bridge(entries):
+        if not bridge:return
+        for entry in entries:
+            request=entry.get('request') or {};headers=request.setdefault('headers',[])
+            denied={str(name).lower() for name in (bridge.get('headers') or {})}|({'cookie'} if bridge.get('cookies') else set())
+            headers[:]=[header for header in headers if str(header.get('name','')).lower() not in denied]
+            headers.extend({'name':str(name),'value':str(value)} for name,value in (bridge.get('headers') or {}).items())
+            if bridge.get('cookies'):
+                headers.append({'name':'Cookie','value':'; '.join(
+                    f'{name}={value}' for name,value in sorted(bridge['cookies'].items()))})
+    def normalize_har_entries(entries):
+        for entry in entries:
+            request=entry.setdefault('request',{});response=entry.setdefault('response',{})
+            if not isinstance(request.get('httpVersion'),str) or not request.get('httpVersion','').startswith('HTTP/'):
+                request['httpVersion']='HTTP/1.1'
+            if not isinstance(response.get('httpVersion'),str) or not response.get('httpVersion','').startswith('HTTP/'):
+                response['httpVersion']='HTTP/1.1'
+            request['method']=str(request.get('method') or 'GET').upper()
+            request.setdefault('headers',[]);request.setdefault('cookies',[])
+            response.setdefault('headers',[]);response.setdefault('cookies',[])
+            response.setdefault('statusText','')
+        return entries
     if seed_entries or seed_entry:
         seed_path = Path(workdir) / 'seed.har'
-        entries = copy.deepcopy(seed_entries or [seed_entry])
+        entries = normalize_har_entries(copy.deepcopy(seed_entries or [seed_entry]))
+        if config.get('_zap_guest_session_isolation'):
+            from session_classifier import isolate_guest_entries
+            config['_zap_guest_session_isolation_report']=isolate_guest_entries(entries)
         for entry in entries:
             entry['request']['headers'] = [h for h in entry['request'].get('headers', [])
                                            if h.get('name', '').lower() != 'x-zap-scan-id']
+        inject_bridge(entries)
+        bind_csrf(entries)
         seed_path.write_text(json.dumps({'log': {'version': '1.2', 'creator': {'name': 'AIXSEC-X', 'version': '1'}, 'entries': entries}}))
         seed_path.chmod(0o600)
         jobs.append({'type': 'import', 'parameters': {'type': 'har', 'fileName': str(seed_path)}})
@@ -216,6 +270,9 @@ def build_plan(config, target, workdir, *, active=False, rule_ids=(), auth_conte
                 if h.get('name', '').lower() != 'x-zap-scan-id']
             entries.append(entry)
         if entries:
+            normalize_har_entries(entries)
+            inject_bridge(entries)
+            bind_csrf(entries)
             seed_path = Path(workdir) / 'seed.har'
             seed_path.write_text(json.dumps({'log': {'version': '1.2',
                 'creator': {'name': 'AIXSEC-X', 'version': '1'}, 'entries': entries}}))
@@ -489,8 +546,28 @@ def shutdown_worker_pools():
 atexit.register(shutdown_worker_pools)
 
 
+def _scrub_bridge_artifacts(directory, bridge):
+    """Remove process-only auth values after all local parsers have consumed artifacts."""
+    values=[str(value) for value in (bridge.get('headers') or {}).values()]
+    values.extend(str(value) for value in (bridge.get('cookies') or {}).values())
+    values=sorted({value for value in values if value},key=len,reverse=True)
+    if not values:return 0
+    changed=0
+    for path in Path(directory).iterdir():
+        if not path.is_file() or path.suffix.lower() not in ('.json','.jsonl','.har','.log','.txt','.yaml','.yml'):
+            continue
+        try:text=path.read_text(errors='replace')
+        except OSError:continue
+        updated=text
+        for value in values:updated=updated.replace(value,'<runtime-auth-redacted>')
+        if updated!=text:
+            path.write_text(updated);path.chmod(0o600);changed+=1
+    return changed
+
+
 def run_scan(config, url, *, active=False, rule_ids=(), auth_context='anonymous', ajax=False, timeout=None):
     total_started=time.perf_counter_ns()
+    bridge=config.get('_zap_auth_material') or {}
     blocking={'subprocess_wait_ms':0.0,'subprocess_wait_calls':0,'polling_loop_iterations':0,
               'subprocess_wait_timeouts':0,'timeout_wait_ms':0.0,'timeout_wait_calls':0,
               'sleep_ms':0.0,'sleep_calls':0,
@@ -525,13 +602,18 @@ def run_scan(config, url, *, active=False, rule_ids=(), auth_context='anonymous'
     try:
         if pool is not None:
             acquire_started=time.perf_counter_ns()
-            lease=pool.acquire(timeout=deadline)
+            session_binding=str(config.get('_zap_session_binding') or '')
+            lease=pool.acquire(timeout=deadline,binding=session_binding)
             pool_worker=lease.__enter__()
             try:
                 persistent_engine_log=pool_worker.workspace/'home'/'zap.log'
                 engine_log_offset=persistent_engine_log.stat().st_size if persistent_engine_log.exists() else 0
                 process_began_ms=time.time()*1000
-                result=pool_worker.run_plan(plan_path,deadline,config.get('_zap_cancelled'))
+                if session_binding:
+                    result=pool_worker.run_plan(plan_path,deadline,config.get('_zap_cancelled'),
+                                                session_binding=session_binding)
+                else:
+                    result=pool_worker.run_plan(plan_path,deadline,config.get('_zap_cancelled'))
                 code=result['returncode'];process_ended_ms=time.time()*1000
                 pool.metrics['worker_busy_ms']+=float(result.get('job_ms',0))
                 pool_metrics={'worker_id':pool_worker.worker_id,
@@ -597,6 +679,8 @@ def run_scan(config, url, *, active=False, rule_ids=(), auth_context='anonymous'
         auth_state = 'verified' if logged_in > 0 and logged_out == 0 else 'unverified'
         if auth_state != 'verified' and state == 'complete':
             state = 'partial'
+        if bridge.get('context')==auth_context and bridge.get('verified'):
+            auth_state='verified'
     for row in rows:
         row['auth_state'] = auth_state
     from zap_discovery import Discovery
@@ -631,12 +715,21 @@ def run_scan(config, url, *, active=False, rule_ids=(), auth_context='anonymous'
             inventory_error = 'Cannot parse active request evidence: ' + str(exc)
     from zap_active_evidence import analyze
     diagnostics, candidates = analyze(directory, url, rule_ids, auth_context, scan_id) if active else ({}, [])
+    auth_pair_dispositions=[]; auth_pair_attribution_complete=False
     if active and auth_context != 'anonymous':
-        from captured_auth import artifact_expired
-        if artifact_expired(config,auth_context,directory/'active-evidence.jsonl'):
+        from captured_auth import artifact_expired, artifact_expired_pairs
+        evidence_artifact=directory/'active-evidence.jsonl'
+        explicitly_expired=artifact_expired(config,auth_context,evidence_artifact)
+        if explicitly_expired:
             auth_state='unverified'
             diagnostics.setdefault('gaps',[]).append('Logged-out marker observed in active response evidence')
             if state=='complete': state='partial'
+            auth_pair_dispositions,auth_pair_attribution_complete=artifact_expired_pairs(
+                config,auth_context,evidence_artifact,config.get('_zap_request_pairs') or [])
+            # An empty attribution cannot explain an explicit expiry. Keep the
+            # global fallback so no request/rule pair is incorrectly trusted.
+            if not auth_pair_dispositions:
+                auth_pair_attribution_complete=False
     for candidate in candidates:
         candidate['auth_state'] = auth_state
     rows.extend(candidates)
@@ -743,6 +836,12 @@ def run_scan(config, url, *, active=False, rule_ids=(), auth_context='anonymous'
         'log_path': str(log_path), 'error': parse_error, **metadata,
         'performance': performance}
     coverage['active_evidence'] = diagnostics
+    csrf_binding_path=directory/'csrf-binding.json'
+    if csrf_binding_path.is_file():
+        try:coverage['csrf_binding']=json.loads(csrf_binding_path.read_text())
+        except (OSError,ValueError,TypeError):coverage['csrf_binding']={'status':'unreadable'}
+    coverage['auth_pair_dispositions'] = auth_pair_dispositions
+    coverage['auth_pair_attribution_complete'] = auth_pair_attribution_complete
     coverage.update(status_meaning='execution_only_not_full_coverage', phases=phases, gaps=gaps,
                     inventory_path=str(inventory_path), har_path=str(har_path),
                     har_checkpoint_used=har_path.name if har_path != final_har else '',
@@ -759,6 +858,8 @@ def run_scan(config, url, *, active=False, rule_ids=(), auth_context='anonymous'
         except (ValueError, TypeError, AttributeError):
             active_rules = []
     summary = inventory['summary']
+    scrubbed_artifacts=_scrub_bridge_artifacts(directory,bridge) if bridge else 0
+    coverage['runtime_auth_artifacts_scrubbed']=scrubbed_artifacts
     return (f"ZAP {state}: {len(urls)} URLs, {len(rows)} alert instances; "
             f"{summary['forms']} forms, {summary['inputs']} inputs; "
             f"endpoints discovered-only/requested/tested="

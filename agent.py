@@ -547,6 +547,15 @@ class WebXAgent:
                     kw["_config"]["_zap_seed_entry"] = self._zap_active_entry
                 if name == "zap_active_scan" and getattr(self, "_zap_active_entries", None):
                     kw["_config"]["_zap_seed_entries"] = self._zap_active_entries
+                if name == "zap_active_scan" and getattr(self, "_zap_active_members", None):
+                    kw["_config"]["_zap_request_pairs"] = [{
+                        'request_id': member.get('request_id',''),
+                        'url': member.get('_entry',{}).get('request',{}).get('url',''),
+                        'method': member.get('method','GET'),
+                        'rule_ids': list(arguments.get('rule_ids') or []),
+                    } for member in self._zap_active_members]
+                if name == "zap_active_scan" and getattr(self, "_zap_session_binding", None):
+                    kw["_config"]["_zap_session_binding"] = self._zap_session_binding
                 if name == "zap_active_scan" and getattr(self, "evidence_store", None):
                     from adapters.zap import within
                     from pathlib import Path

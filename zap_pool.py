@@ -44,6 +44,7 @@ class ZapWorker:
     last_error: str = ''
     policy_signature: str = ''
     context_signature: str = ''
+    session_binding: str = ''
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
 
     @property
@@ -107,9 +108,11 @@ class ZapWorker:
     def needs_recycle(self):
         return self.jobs>=self.max_jobs or bool(self.memory_limit_mb and self.memory_mb()>self.memory_limit_mb)
 
-    def reset(self):
+    def reset(self, preserve_session=False):
         try:
             self._api('core','action','deleteAllAlerts',timeout=10)
+            if preserve_session:
+                return
             sites=self._api('core','view','sites',timeout=10).get('sites') or []
             for site in sites:
                 # deleteSiteNode removes the site's history/tree without replacing
@@ -121,16 +124,21 @@ class ZapWorker:
         except (HTTPError,URLError,TimeoutError,OSError,ValueError,WorkerError) as exc:
             raise WorkerError(f'worker reset failed: {exc}') from exc
 
-    def run_plan(self, plan_path, timeout, cancelled=None):
+    def run_plan(self, plan_path, timeout, cancelled=None, session_binding=''):
         with self._lock:
             if not self.healthy(): raise WorkerError('worker is unhealthy before job')
             self.state=WorkerState.BUSY;began=_milliseconds()
+            replacer_descriptions=[]
             try:
-                self.reset()
+                same_binding=bool(session_binding and session_binding==self.session_binding)
+                self.reset(preserve_session=same_binding)
                 plan=json.loads(Path(plan_path).read_text())
+                replacer_descriptions=[str(rule.get('description') or '')
+                    for job in plan.get('jobs',[]) if job.get('type')=='replacer'
+                    for rule in job.get('rules',[]) if rule.get('description')]
                 contexts=((plan.get('env') or {}).get('contexts') or [])
                 context_names=[str(context.get('name') or 'anonymous') for context in contexts]
-                session_slot=f'worker-{self.worker_id}:' + ','.join(context_names or ['anonymous'])
+                session_slot=f'worker-{self.worker_id}:' + (session_binding[:16] if session_binding else ','.join(context_names or ['anonymous']))
                 context_signature=hashlib.sha256(json.dumps(contexts,sort_keys=True).encode()).hexdigest()
                 context_reused=bool(contexts and context_signature==self.context_signature)
                 policies=[job for job in plan.get('jobs',[]) if job.get('type')=='activeScan-policy']
@@ -152,16 +160,26 @@ class ZapWorker:
                         if errors: raise WorkerError('Automation plan failed: '+str(errors)[:500])
                         if signature:self.policy_signature=signature
                         if contexts:self.context_signature=context_signature
+                        self.session_binding=session_binding
                         self.jobs+=1;return {'returncode':0,'job_ms':_milliseconds()-began,
                             'plan_id':str(plan_id),'progress':value,'policy_reused':policy_reused,
                             'context_reused':context_reused,'session_slot':session_slot,
-                            'session_isolation':'dedicated_worker_home_reset_before_job'}
+                            'session_isolation':('worker_bound_session_preserved' if same_binding else
+                                                 'dedicated_worker_home_reset_before_job')}
                     time.sleep(.1)
                 raise TimeoutError('ZAP automation plan timed out')
             except BaseException as exc:
                 self.last_error=str(exc);self.state=WorkerState.DEAD
                 raise
             finally:
+                if replacer_descriptions and self.state!=WorkerState.DEAD:
+                    try:
+                        for description in replacer_descriptions:
+                            self._api('replacer','action','removeRule',
+                                      {'description':description},timeout=5)
+                    except Exception as exc:
+                        self.last_error='auth replacer cleanup failed: '+type(exc).__name__
+                        self.state=WorkerState.DEAD
                 if self.state!=WorkerState.DEAD: self.state=WorkerState.HEALTHY
 
     def close(self, timeout=10):
@@ -195,6 +213,7 @@ class WorkerPool:
         self.memory_limit_mb=max(0,int(config.get('zap_worker_memory_mb',0)))
         self.startup_timeout=max(15,int(config.get('zap_startup_timeout',120)))
         self._available=queue.Queue(self.size);self._workers=[];self._lock=threading.Lock();self._closed=False
+        self._binding_workers={}
         self.metrics={'jvm_created':0,'jobs':0,'reused_jobs':0,'recycled':0,'crashes':0,
                       'acquire_wait_ms':0.0,'worker_busy_ms':0.0}
 
@@ -223,11 +242,24 @@ class WorkerPool:
                 self.close();raise
         return self
 
-    def acquire(self,timeout=None):
+    def acquire(self,timeout=None,binding=''):
         if self._closed: raise WorkerError('worker pool is closed')
         self.start();began=_milliseconds()
+        worker=None
+        bound_id=None
+        if binding:
+            with self._lock:bound_id=self._binding_workers.get(binding)
+        if bound_id is not None:
+            deadline=time.monotonic()+(float(timeout) if timeout else 3600)
+            while worker is None:
+                remaining=max(0,deadline-time.monotonic())
+                if not remaining:raise TimeoutError('ZAP bound session worker is busy')
+                try:candidate=self._available.get(timeout=min(.1,remaining))
+                except queue.Empty:continue
+                if candidate.worker_id==bound_id:worker=candidate
+                else:self._available.put(candidate);time.sleep(min(.01,remaining))
         try:
-            worker=self._available.get_nowait()
+            if worker is None:worker=self._available.get_nowait()
         except queue.Empty:
             worker=None
             with self._lock:
@@ -236,6 +268,16 @@ class WorkerPool:
             if worker is None:
                 try: worker=self._available.get(timeout=timeout)
                 except queue.Empty as exc: raise TimeoutError('ZAP worker pool exhausted') from exc
+        if binding:
+            with self._lock:
+                existing=self._binding_workers.get(binding)
+                if existing is None:
+                    self._binding_workers={key:value for key,value in self._binding_workers.items()
+                                           if value!=worker.worker_id}
+                    self._binding_workers[binding]=worker.worker_id
+                elif existing!=worker.worker_id:
+                    self._available.put(worker)
+                    return self.acquire(timeout=timeout,binding=binding)
         self.metrics['acquire_wait_ms']+=_milliseconds()-began
         return WorkerLease(self,worker)
 
@@ -245,6 +287,9 @@ class WorkerPool:
         if recycle:
             if unhealthy:self.metrics['crashes']+=1
             worker.close();self.port_releaser(worker.port);self.metrics['recycled']+=1
+            with self._lock:
+                self._binding_workers={key:value for key,value in self._binding_workers.items()
+                                       if value!=worker.worker_id}
             try:
                 replacement=self._new_worker(worker.worker_id)
                 with self._lock:

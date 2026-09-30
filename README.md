@@ -363,7 +363,7 @@ Boolean switches use `1` (enabled) and `0` (disabled). Defaults below come from 
 | `WEBX_ZAP_BATCH_SIZE` | `8` | Maximum request groups placed in one scheduling batch (1–32). |
 | `WEBX_ZAP_STARTUP_TIMEOUT` | `120` | Seconds allowed for a persistent ZAP worker to become API-ready. Timed-out processes are terminated so their port/home can be reused safely. |
 | `WEBX_ZAP_CONCURRENCY_FILE` | *(empty)* | JSON policy by origin, auth_context and path: `parallel_read` for declared independent reads including authenticated captures; `serial` takes precedence. Does not create new sessions; see worker guide. |
-| `WEBX_ZAP_COOKIE_PARALLEL` | `auto` | `auto`: fresh controls, one worker/origin initially, up to two after a stable trial, back to one on instability. `strict`: serialize cookies; `guest`: operator opt-in for guest cookies. Explicit policy takes precedence. |
+| `WEBX_ZAP_COOKIE_PARALLEL` | `auto` | `auto`: bounded two-worker bootstrap for safe reads, then adaptive promotion toward the intensity maximum with isolated guest-session slots; instability backs off `4 → 2 → 1`. `strict`: serialize cookies; `guest`: operator opt-in for guest cookies. Explicit policy takes precedence. |
 | `WEBX_ZAP_ROUTE_GROUPS_FILE` | *(empty)* | Operator-owned JSON route groups for slug deduplication; empty preserves default structural grouping. See the worker guide below. |
 | `WEBX_ZAP_ROUTE_FAMILY_MODE` | `1` | Enable structural route-family grouping. Coverage seeds are admitted before this optimization. |
 | `WEBX_FAMILY_SCAN` | `on` | `on` scans family representatives; `off` retains all scheduled groups. Full keeps adaptive representatives on; Exhaustive turns reduction off. |
@@ -478,11 +478,11 @@ export WEBX_LLM_TIMEOUT=300
 
 ### ZAP workers and route groups
 
-The new default is `auto`: no policy file is required for automatically eligible requests. Two fresh controls preserve cookies and disable redirects; concurrency increases only after a stable trial. Uncertain groups still scan serially. See the worker guide for limits and `auto-concurrency.json`. Previously exported settings still take precedence; use `unset WEBX_ZAP_COOKIE_PARALLEL` to use the new default in a new session.
+The default is `auto`: no policy file is required for automatically eligible requests. The scheduler prioritizes a bounded pair of safe read-only groups before long serial work, then promotes concurrency only after stable controls. Uncertain groups still scan serially. See the worker guide for limits and `auto-concurrency.json`. Previously exported settings still take precedence; use `unset WEBX_ZAP_COOKIE_PARALLEL` to use the default in a new session.
 
 Set `WEBX_ZAP_WORKERS=2` for up to two independent request groups at once, or `1` for serial execution. `WEBX_ZAP_DELAY_MS` is coordinated across workers per origin for active scanner requests, so each worker does not multiply the configured rate. Journal and evidence updates remain serial, with `[zap] x/y` progress.
 
-Use `WEBX_ZAP_ROUTE_GROUPS_FILE=/path/to/routes.json` only for slugs known to share a route. See [parallel scan configuration](docs/ZAP_WORKERS.md) for an example and limitations. Only the representative is tested; grouped URLs are not individually verified. Each task still starts an isolated ZAP process; this version does not reuse JVMs across groups.
+Use `WEBX_ZAP_ROUTE_GROUPS_FILE=/path/to/routes.json` only for slugs known to share a route. See [parallel scan configuration](docs/ZAP_WORKERS.md) for an example and limitations. Only the representative is tested; grouped URLs are not individually verified. The persistent pool starts one ZAP JVM lazily and expands only when concurrent work needs more isolated worker homes.
 
 ### Live display (streaming)
 
@@ -582,11 +582,46 @@ Authenticated work is generation-fenced. Coverage and evidence carry both
 attempts never create findings or poison persistent scan history, and the
 non-secret refresh ledger is retained across resume.
 
+Refresh is single-flight per auth context and generation: one worker owns the
+refresh while peers wait, then reuse the verified generation. A failed or
+interrupted generation is recorded and is not refreshed repeatedly after
+resume. Active retry history is tracked by `request_id`, `rule_id`,
+`auth_context`, `auth_generation`, and `attempt_id`. When bounded response evidence can attribute a
+login marker to exact pairs, only those pairs are released for retry; ambiguous
+evidence safely defers the whole job.
+
+Discovery, auth observability, concurrency and reporting use one cookie/session
+classifier. Its Set-Cookie parser supports repeated and combined fields, quoted
+commas and Expires dates; malformed fields become `unknown` and remain
+conservative. CSRF/workflow jobs receive a binding derived from origin, auth
+context and generation. The pool routes that binding back to the same isolated
+worker, preserves its session only for an exact binding match, and resets on a
+generation change or recycle. Private HAR copies propagate observed HTML/JSON/
+header CSRF tokens to later requests in the same ordered slot; reports contain
+counts and binding IDs only, never token values.
+
+Runtime cookie, Bearer, API-key and OAuth/OIDC refresh profiles can now be
+selected for ZAP. A process-only bridge logs in or refreshes the runtime
+context, performs a same-origin preflight, and injects resolved headers/cookies
+through an ephemeral ZAP plan. Secret replacer rules are removed after every
+job; failed cleanup recycles the worker. Browser/MFA resume requires an imported
+scoped browser cookie file, so a READY flag alone is not treated as a session.
+
+`/auth` also lets the operator declare a role, subject, protected path globs and
+owned paths without storing secrets. A bounded multi-role campaign compares the
+same captured GET/HEAD requests as anonymous and up to seven ready roles.
+Differential responses are always retained as facts; IDOR/BOLA candidates are
+created only when they match an operator-declared protected/owned path, and
+remain candidates requiring object and policy confirmation. Output is written
+to `multi-role-campaign.json`.
+
 Automatic concurrency classifies request state as stateless, analytics,
 preference, affinity, CSRF, guest session, authenticated session, or unknown.
-Stateless and benign-cookie GET groups can promote from two workers toward the
-configured maximum. Guest/authenticated sessions remain capped at one or two
-workers per origin/context; POST and workflow routes remain serial. Promotion
+Stateless, benign-cookie and anonymous guest-session GET groups can promote
+from a bounded two-worker bootstrap toward the configured intensity maximum.
+Guest slots use separate worker homes and discard captured session/CSRF cookies
+before obtaining fresh worker-local state. Authenticated contexts remain capped
+at one or two workers; POST, CSRF and workflow routes remain serial. Promotion
 requires stable controls and backs off on cookie mutation, login/logout
 redirects, CAPTCHA/WAF indicators, rate limits, server errors, or high latency.
 
@@ -595,6 +630,15 @@ Fast/Balanced/Full/Exhaustive, while intensity is Gentle/Normal/Fast/Custom.
 Intensity configures workers, per-origin delay/rate, bootstrap ceiling,
 promotion/backoff thresholds and cooldowns. Custom values are saved through
 `/config`; users do not need to edit environment variables.
+
+Budget-aware scheduling uses effective concurrency and measured serial/parallel
+lane duration rather than the configured worker maximum. Adaptive scans are not
+pre-deferred before bootstrap can establish capacity; the remaining budget is
+recalculated as workers promote or back off. The final report includes peak and
+average active workers, serial-barrier time, promotion/demotion counts, and
+deferred-job reasons. Full keeps its complete-coverage behavior without an
+up-front active-work cutoff; bounded profiles still reserve validation/reporting
+time and persist deferred request/rule pairs for resume.
 
 Each persistent ZAP worker has a private home and session slot. Before reuse it
 clears the active HTTP session, alerts and site tree; failure to clear any auth

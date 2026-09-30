@@ -360,7 +360,7 @@ Các công tắc boolean dùng `1` (bật) và `0` (tắt). Mặc định dướ
 | `WEBX_ZAP_WORKER_MEMORY_MB` | `0` | Ngưỡng bộ nhớ worker tính bằng MiB để tái khởi động; `0` tắt kiểm tra theo bộ nhớ. |
 | `WEBX_ZAP_BATCH_SIZE` | `8` | Số nhóm request tối đa trong một batch lập lịch (1–32). |
 | `WEBX_ZAP_CONCURRENCY_FILE` | *(trống)* | Policy JSON theo origin, auth_context và đường dẫn: `parallel_read` cho request đọc đã xác định độc lập, kể cả có đăng nhập; `serial` ưu tiên giữ thứ tự. Không tạo session mới; xem hướng dẫn worker. |
-| `WEBX_ZAP_COOKIE_PARALLEL` | `auto` | `auto`: tự kiểm tra đối chứng, bắt đầu 1 worker/origin, tăng tối đa 2 khi ổn định và giảm về 1 khi có tín hiệu lỗi. `strict`: tuần tự khi có cookie; `guest`: operator cho phép cookie khách. Policy thủ công vẫn được ưu tiên. |
+| `WEBX_ZAP_COOKIE_PARALLEL` | `auto` | `auto`: bootstrap tối đa 2 worker cho request đọc an toàn, sau đó tăng thích ứng tới trần intensity với guest-session slot cô lập; khi bất ổn sẽ giảm `4 → 2 → 1`. `strict`: tuần tự khi có cookie; `guest`: operator cho phép cookie khách. Policy thủ công vẫn được ưu tiên. |
 | `WEBX_ZAP_ROUTE_GROUPS_FILE` | *(trống)* | File JSON nhóm route do operator khai báo để gộp slug; trống giữ cách nhóm cấu trúc mặc định. Xem hướng dẫn worker bên dưới. |
 | `WEBX_ZAP_ROUTE_FAMILY_MODE` | `1` | Bật nhóm route-family theo cấu trúc. Coverage seed được đưa vào trước bước tối ưu này. |
 | `WEBX_FAMILY_SCAN` | `on` | `on` quét các đại diện của family; `off` giữ toàn bộ nhóm đã lập lịch. Full bật đại diện thích nghi; Exhaustive tắt rút gọn. |
@@ -478,11 +478,11 @@ export WEBX_LLM_OVERALL_TIMEOUT=210
 
 ### Worker ZAP và nhóm route
 
-Mặc định mới là `auto`: không cần file policy cho các request đủ điều kiện kiểm tra tự động. Hệ thống gửi hai request đối chứng (giữ cookie, không theo redirect), chỉ tăng song song sau lượt thử ổn định. Không xác định được tính ổn định thì vẫn quét tuần tự. Xem giới hạn và nhật ký `auto-concurrency.json` trong hướng dẫn worker. Biến env cũ đã export vẫn được ưu tiên; dùng `unset WEBX_ZAP_COOKIE_PARALLEL` để dùng mặc định mới trong phiên mới.
+Mặc định là `auto`: không cần file policy cho các request đủ điều kiện kiểm tra tự động. Scheduler ưu tiên một cặp nhóm read-only an toàn có giới hạn trước các job serial dài, rồi chỉ tăng song song khi control ổn định. Không xác định được tính ổn định thì vẫn quét tuần tự. Xem giới hạn và nhật ký `auto-concurrency.json` trong hướng dẫn worker. Biến env cũ đã export vẫn được ưu tiên; dùng `unset WEBX_ZAP_COOKIE_PARALLEL` để dùng mặc định trong phiên mới.
 
 Đặt `WEBX_ZAP_WORKERS=2` để chạy tối đa hai nhóm request độc lập cùng lúc; đặt `1` để chạy tuần tự. Khoảng cách `WEBX_ZAP_DELAY_MS` được phối hợp giữa các worker theo origin cho request active scanner, tránh mỗi worker tự nhân tốc độ. Journal và evidence được cập nhật tuần tự, có tiến độ `[zap] x/y`.
 
-Dùng `WEBX_ZAP_ROUTE_GROUPS_FILE=/path/to/routes.json` khi đã xác định các slug dùng chung route. File mẫu và giới hạn được mô tả trong [hướng dẫn quét song song](docs/ZAP_WORKERS.md). Chỉ request đại diện được kiểm tra; không coi mọi URL trong nhóm đã được kiểm tra riêng. Mỗi tác vụ vẫn khởi động một tiến trình ZAP riêng; bản này chưa tái sử dụng JVM giữa các nhóm.
+Dùng `WEBX_ZAP_ROUTE_GROUPS_FILE=/path/to/routes.json` khi đã xác định các slug dùng chung route. File mẫu và giới hạn được mô tả trong [hướng dẫn quét song song](docs/ZAP_WORKERS.md). Chỉ request đại diện được kiểm tra; không coi mọi URL trong nhóm đã được kiểm tra riêng. Pool persistent khởi động lazy một ZAP JVM và chỉ mở rộng khi công việc song song cần thêm worker home cô lập.
 
 ### Màn hình live (streaming)
 
@@ -573,10 +573,44 @@ thành `auth_uncertain`, `retry_after_refresh` hoặc `deferred_auth_expired`.
 Attempt không chắc chắn không tạo finding, không làm bẩn persistent history và
 refresh ledger không chứa secret được giữ lại khi resume.
 
+Refresh dùng single-flight theo từng auth context và generation: một worker làm
+owner refresh, các worker còn lại chờ rồi dùng generation mới đã kiểm chứng.
+Generation refresh lỗi hoặc bị gián đoạn được ghi lại và không bị refresh lặp
+khi resume. Lịch sử retry active scan được lưu theo `request_id`, `rule_id`,
+`auth_context`, `auth_generation` và `attempt_id`. Khi bounded response evidence xác
+định được login marker thuộc chính xác cặp nào, chỉ các cặp đó được mở lại để
+retry; nếu không thể quy trách nhiệm an toàn thì toàn job được defer.
+
+Discovery, auth observability, concurrency và reporting dùng chung một bộ phân
+loại cookie/session. Parser Set-Cookie hỗ trợ header lặp hoặc gộp, dấu phẩy trong
+chuỗi quoted và ngày Expires; header malformed được xếp `unknown` và xử lý thận
+trọng. Job CSRF/workflow nhận binding theo origin, auth context và generation.
+Pool đưa binding đó về đúng worker cô lập, chỉ giữ session khi binding khớp hoàn
+toàn, đồng thời reset khi generation đổi hoặc worker bị recycle. Bản sao HAR
+riêng tư truyền token CSRF quan sát từ HTML/JSON/header sang request sau trong
+cùng slot có thứ tự; report chỉ chứa số lượng và binding ID, không chứa giá trị
+token.
+
+Profile cookie runtime, Bearer, API key và OAuth/OIDC refresh giờ có thể được
+chọn cho ZAP. Bridge chỉ tồn tại trong process sẽ login hoặc refresh runtime
+context, chạy preflight cùng origin rồi inject header/cookie đã resolve qua plan
+ZAP tạm thời. Rule replacer chứa secret bị xóa sau mỗi job; nếu cleanup lỗi thì
+worker bị recycle. Resume browser/MFA bắt buộc import file cookie trình duyệt đã
+giới hạn scope, nên riêng cờ READY không còn được coi là một session hợp lệ.
+
+`/auth` còn cho phép khai báo role, subject, glob đường dẫn protected và đường
+dẫn owned mà không lưu secret. Campaign nhiều role có giới hạn sẽ gửi cùng
+request GET/HEAD đã bắt dưới anonymous và tối đa bảy role sẵn sàng. Response
+differential luôn chỉ là facts; candidate IDOR/BOLA chỉ được tạo khi khớp policy
+protected/owned do operator khai báo và vẫn cần xác nhận object cùng policy.
+Kết quả được lưu tại `multi-role-campaign.json`.
+
 Adaptive concurrency phân loại stateless, analytics, preference, affinity,
-CSRF, guest session, authenticated session và unknown. GET stateless hoặc chỉ
-có cookie vô hại có thể tăng từ hai worker tới mức tối đa. Guest/authenticated
-session bị giới hạn một đến hai worker theo origin/context; POST và workflow
+CSRF, guest session, authenticated session và unknown. GET stateless, chỉ có
+cookie vô hại hoặc anonymous guest-session có thể tăng từ bootstrap tối đa hai
+worker tới trần intensity đã cấu hình. Guest slot dùng worker home riêng và bỏ
+session/CSRF cookie cũ trong capture trước khi nhận state mới riêng cho worker.
+Authenticated context vẫn giới hạn một đến hai worker; POST, CSRF và workflow
 luôn serial. Chỉ tăng worker sau control ổn định và tự giảm khi cookie đổi,
 redirect login/logout, CAPTCHA/WAF, rate limit, lỗi server hoặc latency cao.
 
@@ -585,6 +619,15 @@ Fast/Balanced/Full/Exhaustive, còn cường độ là Gentle/Normal/Fast/Custom
 Intensity cấu hình worker, delay/rate theo origin, bootstrap ceiling, ngưỡng
 tăng/giảm và cooldown. Giá trị Custom được lưu qua `/config`, không buộc người
 dùng sửa biến môi trường.
+
+Scheduler có budget dùng effective concurrency và thời lượng đo được riêng cho
+lane serial/parallel thay vì lấy số worker cấu hình làm công suất thật. Scan
+adaptive không bị pre-defer trước khi bootstrap xác định được năng lực; budget
+còn lại được tính lại mỗi khi worker tăng hoặc giảm. Báo cáo cuối hiển thị peak
+và average active worker, thời gian chờ serial barrier, số lần promotion/demotion
+và lý do deferred. Full giữ hành vi ưu tiên độ phủ hoàn chỉnh, không cắt active
+work ngay từ đầu; profile có giới hạn vẫn dành thời gian cho validation/reporting
+và lưu request/rule pair deferred để resume.
 
 Mỗi ZAP worker dùng home và session slot riêng. Trước khi tái sử dụng, worker
 xóa HTTP session, alert và site tree; nếu không xóa sạch auth state thì worker

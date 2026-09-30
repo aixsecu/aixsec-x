@@ -14,64 +14,16 @@ WORKFLOW = re.compile(r'(?:^|[/_.\-])(login|logout|signin|signout|auth|account|p
 LOGIN = re.compile(r'(?:^|[/_.\-])(login|signin|sign-in|auth|sso)(?:$|[/_.\-])', re.I)
 LOGOUT = re.compile(r'(?:^|[/_.\-])(logout|signout|sign-out)(?:$|[/_.\-])', re.I)
 LANGUAGE = re.compile(r'^/(?:[a-z]{2}(?:-[A-Z]{2})?)(?:/|$)')
-SESSION_COOKIE = re.compile(r'(?:^|[._-])(session|sess|sid|auth|jwt|token)(?:$|[._-])|phpsessid|jsessionid|asp\.net_sessionid', re.I)
-CSRF_COOKIE = re.compile(r'csrf|xsrf', re.I)
-AFFINITY_COOKIE = re.compile(r'arrAffinity|awsalb|awsalbcors|bigip|jroute|routeid|sticky', re.I)
-ANALYTICS_COOKIE = re.compile(r'^_(?:ga|gid|gat)|analytics|amplitude|^mp_', re.I)
-PREFERENCE_COOKIE = re.compile(r'lang|locale|theme|consent|preference|^pref', re.I)
 REDIRECT_STATUS = {301, 302, 303, 307, 308}
-
-
-def _cookie_class(name):
-    if CSRF_COOKIE.search(name): return 'csrf'
-    if AFFINITY_COOKIE.search(name): return 'affinity'
-    if ANALYTICS_COOKIE.search(name): return 'analytics'
-    if PREFERENCE_COOKIE.search(name): return 'preference'
-    if SESSION_COOKIE.search(name): return 'session'
-    return 'unknown'
+from session_classifier import classify_entry, classify_mutation
 
 
 def cookie_lane(entry):
-    """Classify cookie identity by names only; values never enter diagnostics."""
-    request=(entry.get('_entry') or {}).get('request') or {}
-    response=(entry.get('_entry') or {}).get('response') or {}
-    names={str(c.get('name','')) for c in request.get('cookies',[]) if c.get('name')}
-    for header in request.get('headers',[]):
-        if str(header.get('name','')).lower()=='cookie':
-            names.update(part.split('=',1)[0].strip() for part in str(header.get('value','')).split(';') if '=' in part)
-    for header in response.get('headers',[]):
-        if str(header.get('name','')).lower()=='set-cookie':
-            first=str(header.get('value','')).split(';',1)[0]
-            if '=' in first: names.add(first.split('=',1)[0].strip())
-    classes={_cookie_class(name) for name in names if name}
-    if entry.get('auth_context','anonymous')!='anonymous': return 'authenticated_session'
-    if not classes: return 'stateless'
-    if classes <= {'analytics'}: return 'analytics'
-    if classes <= {'preference'}: return 'preference'
-    if classes <= {'affinity'}: return 'affinity'
-    if classes <= {'analytics','preference','affinity'}: return 'benign_cookie'
-    if 'csrf' in classes: return 'csrf'
-    if 'session' in classes: return 'guest_session'
-    return 'unknown'
+    return classify_entry(entry)
 
 
 def classify_cookies(row):
-    """Classify names only. Cookie values must never enter scheduler state/logs."""
-    response = {str(v) for v in row.get('set_cookie_names', []) if v}
-    request = {str(v) for v in row.get('request_cookie_names', []) if v}
-    if not response and row.get('set_cookie'):
-        return 'unknown', -1
-    classified = {name:_cookie_class(name) for name in response}
-    classes = set(classified.values())
-    if 'session' in classes:
-        session_names = {name for name,kind in classified.items() if kind == 'session'}
-        return ('session_refresh', -1) if session_names & request else ('session_mutation', -3)
-    if 'csrf' in classes: return 'csrf_rotation', -1
-    if 'unknown' in classes: return 'unknown', -1
-    if 'affinity' in classes: return 'affinity', 0
-    if 'analytics' in classes: return 'analytics', 0
-    if 'preference' in classes: return 'preference', 0
-    return 'none', 0
+    return classify_mutation(row)
 
 
 def classify_redirect(row):
@@ -189,14 +141,23 @@ def pace(root, url, delay_ms):
 
 def controls(config, entry, root):
     import http_engine as he
+    from session_classifier import classify_name
     req=entry['_entry']['request']; context=entry.get('auth_context','anonymous')
     check=oracle(config,context,req['url'])
     observations=[]
-    for _ in range(2):
-        pace(root,req['url'],max(0,int(config.get('zap_delay_ms',200))))
-        session=he.HttpSession('zap-auto-control',proxies=he.get_proxies())
-        started=time.monotonic()
-        try:
+    session=he.HttpSession('zap-auto-control',proxies=he.get_proxies())
+    explicit_names={part.split('=',1)[0].strip() for part in
+        headers(req).get('Cookie','').split(';') if '=' in part}
+    captured_has_state=any(classify_name(name) in {'session','csrf'} for name in explicit_names)
+    try:
+        for index in range(2):
+            pace(root,req['url'],max(0,int(config.get('zap_delay_ms',200))))
+            started=time.monotonic()
+            try:
+                jar_names=set(session.s.cookies.keys())
+            except (AttributeError,TypeError):
+                jar_names=set()
+            request_names=explicit_names|jar_names
             response,meta=session.request(req.get('method','GET'),req['url'],headers=headers(req),
                 follow_redirects=False,timeout=10,max_response_bytes=1048576)
             text=response.text
@@ -210,14 +171,13 @@ def controls(config, entry, root):
             if redirect_delta < 0:
                 return {'stable':False,'reason':'control_session_redirect','redirect_class':redirect_class}
             if 'set-cookie' in response_headers:
-                # The controls cannot retain values. Extract only the first name;
-                # combined headers remain conservatively classified as unknown.
-                set_name=response_headers['set-cookie'].split(';',1)[0].split('=',1)[0].strip()
-                request_names={part.split('=',1)[0].strip() for part in headers(req).get('Cookie','').split(';') if part.strip()}
                 cookie_class,cookie_delta=classify_cookies({'set_cookie':True,
-                    'set_cookie_names':[set_name] if set_name else [],
+                    'response_headers':response_headers,
                     'request_cookie_names':sorted(request_names)})
-                if cookie_delta <= -3:
+                initial_guest_session=(index==0 and context=='anonymous' and not captured_has_state and
+                    req.get('method','GET').upper() in ('GET','HEAD') and
+                    bootstrap_eligible(entry) and cookie_class=='session_mutation')
+                if cookie_delta <= -3 and not initial_guest_session:
                     return {'stable':False,'reason':'control_session_mutation','cookie_class':cookie_class}
             if re.search(r'type\s*=\s*["\x27]?password|(?:csrf|xsrf)',text,re.I):
                 return {'stable':False,'reason':'control_login_or_csrf'}
@@ -231,7 +191,8 @@ def controls(config, entry, root):
                 'redirect_class':redirect_class,
                 'location_sha256':hashlib.sha256(response_headers.get('location','').encode()).hexdigest() if benign_redirect else '',
                 'elapsed':round(time.monotonic()-started,3)})
-        finally: session.s.close()
+    finally:
+        session.s.close()
     stable=(observations[0]['sha256']==observations[1]['sha256'] and
             observations[0]['status']==observations[1]['status'] and
             observations[0]['content_type']==observations[1]['content_type'] and
@@ -257,7 +218,7 @@ class AutoConcurrency:
         self.promotion_cooldown=max(self.minimum_dwell,int(config.get('zap_auto_promotion_cooldown_groups',4)))
         self.demotion_cooldown=max(self.minimum_dwell,int(config.get('zap_auto_demotion_cooldown_groups',3)))
         self.data=json.loads(self.path.read_text()) if self.path.exists() else {'version':2,'origins':{},'groups':{},'decisions':{}}
-        self.data['version']=2;self.data.setdefault('groups',{})
+        self.data['version']=2;self.data.setdefault('groups',{});self.data.setdefault('changes',[])
         for state in self.data.setdefault('origins',{}).values():
             if 'level' not in state:
                 state['level']=1 if state.pop('backoff',False) else (2 if state.pop('promoted',False) else 1)
@@ -279,20 +240,34 @@ class AutoConcurrency:
     def save(self): atomic(self.path,self.data)
     def summary(self):
         from collections import Counter
+        changes=self.data.get('changes',[])
         return {'path':str(self.path), 'assessed_groups':len(self.data['decisions']),
                 'stable_controls':sum(bool(d.get('stable')) for d in self.data['decisions'].values()),
                 'origins':self.data['origins'],
+                'promotions':sum(row.get('direction')=='promotion' for row in changes),
+                'demotions':sum(row.get('direction')=='demotion' for row in changes),
+                'changes':changes,
                 'session_lanes':dict(Counter(self.session_lanes.values()))}
     def limit(self,target_origin,entry=None):
         state=self.data['origins'].get(self.lane_key(target_origin,entry),{})
         lane=cookie_lane(entry) if entry else None
         if lane in ('csrf','unknown'): return 1
-        if lane in ('guest_session','authenticated_session'):
-            return min(2,self.max_workers,max(1,int(state.get('level',1))))
+        # A website-issued guest cookie does not by itself make a low-risk,
+        # read-only anonymous request unsafe for the bounded bootstrap trial.
+        # Evaluate bootstrap before the steady-state guest cap; otherwise the
+        # initial level=1 makes zap_bootstrap_ceiling unreachable.
         if state.get('mode')=='bootstrap':
             if entry is not None and not bootstrap_eligible(entry):
                 return 1
+            if lane == 'authenticated_session':
+                return 1
             return min(self.max_workers,self.bootstrap_ceiling)
+        if lane == 'guest_session':
+            # Worker-local cookie jars/session bindings make steady-state guest
+            # reads eligible for the same adaptive ceiling as stateless reads.
+            return min(self.max_workers,max(1,int(state.get('level',1))))
+        if lane == 'authenticated_session':
+            return min(2,self.max_workers,max(1,int(state.get('level',1))))
         return min(self.max_workers,max(1,int(state.get('level',1))))
     def limit_status(self, target_origin, entry=None):
         state=self.data['origins'].get(self.lane_key(target_origin,entry),{})
@@ -302,7 +277,7 @@ class AutoConcurrency:
             if entry is not None and not bootstrap_eligible(entry):
                 reasons=entry.get('_auto_reasons') or ['guest/session or stateful request']
                 reason='bootstrap serial: '+','.join(reasons[:2])
-            else: reason='safe anonymous bootstrap'
+            else: reason='bounded read-only bootstrap'
         elif state.get('reason'):
             reason=str(state['reason'])
         elif limit < self.max_workers:
@@ -345,6 +320,12 @@ class AutoConcurrency:
         return max(1,level//2)
     def _log_change(self,entry,previous,current,reason,evidence,cookie_class='none',redirect_class='none'):
         state=self._state(entry)
+        self.data.setdefault('changes',[]).append({
+            'origin':origin(entry['_entry']['request']['url']),
+            'previous':previous,'current':current,
+            'direction':'promotion' if current>previous else 'demotion',
+            'reason':reason,'request_id':entry.get('request_id','')})
+        self.save()
         print('[zap:auto] concurrency changed\n'
               f'  Origin: {origin(entry["_entry"]["request"]["url"])}\n'
               f'  Current workers: {current}\n  Previous workers: {previous}\n'

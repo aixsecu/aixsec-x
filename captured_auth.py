@@ -3,6 +3,7 @@ import json
 from pathlib import Path
 import re
 from adapters.zap import within
+from urllib.parse import urlsplit
 
 
 def headers(request):
@@ -57,6 +58,67 @@ def artifact_expired(config, context, path):
                 if pattern.search(body): return True
     except OSError: return True
     return False
+
+
+def artifact_expired_pairs(config, context, path, request_pairs):
+    """Attribute explicit logged-out responses to request/rule pairs.
+
+    Returns ``(pairs, complete)``. ``complete=False`` tells callers to fall
+    back to quarantining the whole job because the artifact could not be
+    interpreted safely.
+    """
+    if context == 'anonymous':
+        return [], True
+    if not path or not Path(path).is_file():
+        return [], False
+    try:
+        profile=json.loads(Path(config['zap_auth_file']).read_text()).get(context) or {}
+        verification=(profile.get('authentication') or {}).get('verification') or {}
+        marker=verification.get('loggedOutRegex')
+        if not marker:
+            return [], False
+        pattern=re.compile(marker)
+    except (OSError, ValueError, TypeError, re.error, KeyError):
+        return [], False
+
+    def identity(url, method):
+        parsed=urlsplit(str(url or ''))
+        return (parsed.scheme.lower(), parsed.hostname,
+                parsed.port or (443 if parsed.scheme.lower() == 'https' else 80),
+                parsed.path or '/', str(method or 'GET').upper())
+
+    references=[]
+    for pair in request_pairs or []:
+        if not isinstance(pair,dict) or not pair.get('request_id'):
+            continue
+        references.append((identity(pair.get('url'),pair.get('method')),
+                           str(pair['request_id']),
+                           {int(rule) for rule in pair.get('rule_ids',[]) if str(rule).isdigit()}))
+    affected=set()
+    try:
+        with Path(path).open(errors='replace') as stream:
+            for index,line in enumerate(stream):
+                if index >= 10000:
+                    return [], False
+                try:
+                    row=json.loads(line)
+                    if not pattern.search(str(row.get('response_body') or '')):
+                        continue
+                    rule=int(row.get('rule_id'))
+                    row_identity=identity(row.get('request_url'),row.get('method'))
+                except (ValueError,TypeError,AttributeError):
+                    continue
+                matches=[(request_id,rules) for reference,request_id,rules in references
+                         if reference == row_identity and rule in rules]
+                if not matches:
+                    return [], False
+                for request_id,_ in matches:
+                    affected.add((request_id,rule))
+    except OSError:
+        return [], False
+    return [{'request_id':request_id,'rule_id':rule,
+             'auth_disposition':'deferred_auth_expired'}
+            for request_id,rule in sorted(affected)], True
 
 
 def preflight(config, entry, context, timeout=15):

@@ -15,10 +15,11 @@ def load(config):
         if not isinstance(profile,dict): continue
         authentication=profile.get('authentication') or {}
         contexts[name]={'name':name,'origin':profile.get('origin',''),
-            'zap':{'supported':authentication.get('method') in ('form','json','http','browser'),
+            'zap':{'supported':authentication.get('method') in ('form','json','http','browser') or bool(profile.get('runtime')),
                    'authentication':authentication,
                    'sessionManagement':profile.get('sessionManagement') or {'method':'cookie'}},
             'runtime':profile.get('runtime') or {},
+            'authorization':profile.get('authorization') or {},
             'operator_pause':profile.get('operator_pause') or {},
             'credential_env':profile.get('credential_env') or {}}
     return {'version':1,'source':str(Path(path).resolve()),'contexts':contexts}
@@ -66,6 +67,7 @@ def public(manifest):
                 'zap_supported':r['zap']['supported'],
                 'runtime_configured':bool(r.get('runtime') or r['zap'].get('authentication')),
                 'operator_pause':(r.get('operator_pause') or {}).get('kind',''),
+                'authorization_role':(r.get('authorization') or {}).get('role',''),
                 'credential_names':sorted((r.get('credential_env') or {}).keys())}
                 for r in manifest.get('contexts',{}).values()]}
 

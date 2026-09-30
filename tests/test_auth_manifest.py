@@ -20,12 +20,12 @@ def test_zap_form_profile_binds_shared_runtime(tmp_path, monkeypatch):
     assert public(manifest)['contexts'][0]['zap_supported'] is True
 
 
-def test_runtime_bearer_profile_is_not_claimed_as_zap_supported(tmp_path):
+def test_runtime_bearer_profile_is_zap_bridge_supported(tmp_path):
     path=tmp_path/'auth.json'; path.write_text(json.dumps({'api':{
         'origin':'https://example.test','authentication':{'method':'manual'},
         'runtime':{'transport':{'auth':'bearer:${ENV:TOKEN}'}},
         'credential_env':{'token':'TOKEN'}}}))
-    assert public(load({'zap_auth_file':str(path)}))['contexts'][0]['zap_supported'] is False
+    assert public(load({'zap_auth_file':str(path)}))['contexts'][0]['zap_supported'] is True
 
 
 def test_mfa_pause_requires_explicit_process_resume(tmp_path, monkeypatch):

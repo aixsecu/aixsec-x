@@ -86,6 +86,7 @@ class ScanSchedule:
             db.execute('BEGIN IMMEDIATE')
             db.execute('CREATE TABLE IF NOT EXISTS attempts (namespace TEXT, family TEXT, rule INTEGER, state TEXT, artifact_ref TEXT DEFAULT "", PRIMARY KEY(namespace,family,rule))')
             db.execute('CREATE TABLE IF NOT EXISTS auth_retry_ledger (namespace TEXT, family TEXT, rule INTEGER, generation INTEGER, state TEXT, artifact_ref TEXT DEFAULT "", created_at REAL, PRIMARY KEY(namespace,family,rule,generation,state))')
+            db.execute('CREATE TABLE IF NOT EXISTS auth_retry_pairs (namespace TEXT, request_id TEXT, rule INTEGER, auth_context TEXT, generation INTEGER, attempt_id TEXT, state TEXT, artifact_ref TEXT DEFAULT "", created_at REAL, PRIMARY KEY(namespace,request_id,rule,generation,attempt_id,state))')
             if 'artifact_ref' not in {r[1] for r in db.execute('PRAGMA table_info(attempts)')}:
                 db.execute('ALTER TABLE attempts ADD COLUMN artifact_ref TEXT DEFAULT ""')
             if 'auth_generation' not in {r[1] for r in db.execute('PRAGMA table_info(attempts)')}:
@@ -260,20 +261,36 @@ class ScanSchedule:
         coverage=((result.get('data') or {}).get('coverage') or {})
         disposition=coverage.get('auth_disposition','')
         generation=int(coverage.get('auth_generation') or 0)
+        auth_context=str(coverage.get('auth_context') or '')
+        attempt_id=str(coverage.get('scan_id') or result.get('attempt_id') or '')
+        pair_rows=coverage.get('auth_pair_dispositions') if isinstance(
+            coverage.get('auth_pair_dispositions'),list) else []
+        pair_complete=bool(coverage.get('auth_pair_attribution_complete'))
+        pair_map={(str(row.get('request_id')),int(row.get('rule_id'))):row
+                  for row in pair_rows if isinstance(row,dict) and row.get('request_id')
+                  and str(row.get('rule_id','')).isdigit()}
         observed = {int(rule) for row in ((result.get('data') or {}).get('discovery') or {}).get('endpoints', [])
                     for rule in row.get('tested_rule_ids', []) if str(rule).isdigit()}
         captured = set(((result.get('data') or {}).get('coverage') or {}).get('active_evidence', {}).get('rules_with_evidence', []))
         with self.connection() as db:
             for rule in rules:
-                if disposition in ('auth_uncertain','deferred_auth_expired'):
+                pair=pair_map.get((str(fid),int(rule)))
+                pair_disposition=(str(pair.get('auth_disposition') or disposition) if pair else
+                                  '' if pair_complete else disposition)
+                pair_generation=int((pair or {}).get('auth_generation') or generation)
+                if pair_disposition in ('auth_uncertain','deferred_auth_expired'):
                     import time
                     db.execute('INSERT OR REPLACE INTO auth_retry_ledger VALUES (?,?,?,?,?,?,?)',
-                        (self.namespace,fid,rule,generation,disposition,coverage.get('report_path',''),time.time()))
+                        (self.namespace,fid,rule,pair_generation,pair_disposition,coverage.get('report_path',''),time.time()))
+                    db.execute('INSERT OR REPLACE INTO auth_retry_pairs VALUES (?,?,?,?,?,?,?,?,?)',
+                        (self.namespace,fid,rule,auth_context,pair_generation,attempt_id,
+                         pair_disposition,coverage.get('report_path',''),time.time()))
                     db.execute('DELETE FROM attempts WHERE namespace=? AND family=? AND rule=?', (self.namespace,fid,rule))
-                    self.defer(fid,[rule],disposition)
+                    self.defer(fid,[rule],pair_disposition)
                 elif outcome in ('denied', 'blocked', 'scope_rejected'):
                     db.execute('DELETE FROM attempts WHERE namespace=? AND family=? AND rule=?', (self.namespace, fid, rule))
                 else:
+                    self.deferred.get(fid,{}).pop(int(rule),None)
                     state = (outcome if outcome in ('error', 'timeout', 'partial') else
                              'responses_recorded' if rule in observed and rule in captured else
                              'requests_observed' if rule in observed else 'attempted_unverified')
@@ -298,8 +315,11 @@ class ScanSchedule:
                                'reason':self.deferred.get(fid,{}).get(r,''),
                                'artifact_ref':states.get(r,('not_run','',0))[1],
                                'auth_generation':states.get(r,('not_run','',0))[2]} for r in rules]})
-            retry_rows=[dict(zip(('family','rule','auth_generation','state','artifact_ref','created_at'),r))
-                for r in db.execute('SELECT family,rule,generation,state,artifact_ref,created_at FROM auth_retry_ledger WHERE namespace=? ORDER BY created_at',(self.namespace,))]
+            retry_rows=[dict(zip(('request_id','rule','auth_context','auth_generation','attempt_id','state','artifact_ref','created_at'),r))
+                for r in db.execute('SELECT request_id,rule,auth_context,generation,attempt_id,state,artifact_ref,created_at FROM auth_retry_pairs WHERE namespace=? ORDER BY created_at',(self.namespace,))]
+            if not retry_rows:
+                retry_rows=[dict(zip(('request_id','rule','auth_generation','state','artifact_ref','created_at'),r))
+                    for r in db.execute('SELECT family,rule,generation,state,artifact_ref,created_at FROM auth_retry_ledger WHERE namespace=? ORDER BY created_at',(self.namespace,))]
         return {'namespace': self.namespace, 'history_path': str(self.path), 'families': rows,
                 'auth_retry_ledger':retry_rows,
                 'rules': self.rules, 'skipped_static_requests': self.skipped_static,

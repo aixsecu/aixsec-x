@@ -20,6 +20,7 @@ from urllib.parse import parse_qsl, urlencode, urljoin, urlsplit, urlunsplit
 
 import http_engine as he
 import requests
+import base64
 
 MAX_CONTEXTS = 16
 MAX_STEPS = 12
@@ -206,6 +207,25 @@ class AuthContext:
             "generation": self.generation,
             "refreshes": self.refreshes,
         }
+
+    def zap_material(self) -> dict:
+        """Resolve process-only transport for ZAP without persisting values."""
+        transport=_substitute(_resolve_secret(copy.deepcopy(self.transport)),self.variables)
+        headers={str(k):str(v) for k,v in (transport.get('headers') or {}).items()}
+        cookies={str(k):str(v) for k,v in (transport.get('cookies') or {}).items()}
+        auth=he.parse_auth(transport.get('auth'))
+        if auth:
+            if auth['kind']=='bearer':headers['Authorization']='Bearer '+auth['token']
+            elif auth['kind']=='api_key':headers[auth['name']]=auth['value']
+            elif auth['kind']=='basic':
+                raw=(auth['user']+':'+auth['pass']).encode()
+                headers['Authorization']='Basic '+base64.b64encode(raw).decode()
+            elif auth['kind']=='apiquery':
+                raise ValueError('ZAP bridge does not inject secret query parameters')
+        if self.session is not None:
+            cookies.update({str(k):str(v) for k,v in self.session.s.cookies.items()})
+        return {'headers':headers,'cookies':cookies,'generation':self.generation,
+                'header_names':sorted(headers),'cookie_names':sorted(cookies)}
 
     def sensitive_query_names(self) -> tuple[str, ...]:
         names = []
