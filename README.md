@@ -270,21 +270,6 @@ baseline starts one worker even when Full allows four active workers. Persistent
 scanner history is separated by profile; repeated runs of the same profile
 still avoid already attempted work.
 
-Profiles use separate soft phase budgets and a larger hard guardrail:
-
-| Profile | Spider | AJAX | Passive | Active/group | ZAP hard limit | Session hard limit |
-|---|---:|---:|---:|---:|---:|---:|
-| Fast | 1m | 1m | 1m | 1m | 5m | 15m |
-| Balanced | 2m | 3m | 1m | 3m | 12m | 45m |
-| Full | 5m | 8m | 2m | 8m | 22m | 120m |
-
-ZAP exports recovery checkpoints after the traditional Spider and AJAX Spider.
-If a later phase reaches its hard limit, the last valid HAR/URL checkpoint is
-used instead of reducing discovery to zero. Worker JVMs start lazily, so a
-baseline starts one worker even when Full allows four active workers. Persistent
-scanner history is separated by profile; repeated runs of the same profile
-still avoid already attempted work.
-
 The selected CLI profile overrides performance-related environment settings.
 It never enables authorization-sensitive capabilities such as active scanning,
 OAST, SQLMap, or data extraction when those gates are disabled. Without

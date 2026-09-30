@@ -141,6 +141,20 @@ class TerminalTests(unittest.TestCase):
             self.assertIn('✓ [Active Scan] complete', screen.getvalue())
             self.assertIsNone(terminal.stage_name)
 
+    def test_tty_progress_never_wraps_narrow_terminal(self):
+        class TTY(io.StringIO):
+            def isatty(self): return True
+            def fileno(self): return 99
+        with tempfile.TemporaryDirectory() as root, \
+                patch('terminal_output.os.get_terminal_size', return_value=SimpleNamespace(columns=64)):
+            screen=TTY();terminal,_=self.session(root,screen)
+            terminal.stage('zap_active','4/168 jobs finished',
+                           'W 4/4 | ETA ~1h53m low | req 495 | def 1011/1179')
+            rendered=screen.getvalue().split('\033[2K')[-1]
+            self.assertLessEqual(len(rendered),63)
+            self.assertFalse(rendered.endswith('\n'))
+            self.assertIn('4/168',rendered)
+
     def test_non_tty_stage_output_stays_static_for_clean_logs(self):
         with tempfile.TemporaryDirectory() as root:
             screen = io.StringIO()
