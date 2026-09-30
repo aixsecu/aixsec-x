@@ -5,6 +5,7 @@ from pathlib import Path
 import re
 import sys
 import tempfile
+import shutil
 import threading
 import time
 
@@ -90,7 +91,18 @@ class TerminalOutput:
             filled = int(width * ratio)
             progress = f" [{'█' * filled}{'░' * (width - filled)}] {current}/{total}"
         detail = f' — {clean(self.stage_reason)}' if self.stage_reason else ''
-        return f'{frame} [{self.stage_name}] running {timer}{progress}{detail}'
+        try:
+            columns=os.get_terminal_size(self.screen.fileno()).columns
+        except (AttributeError, OSError, ValueError):
+            columns=shutil.get_terminal_size((120,24)).columns
+        maximum=max(20,columns-1)
+        line=f'{frame} [{self.stage_name}] running {timer}{progress}{detail}'
+        # Preserve the meaningful counters on narrow terminals. The decorative
+        # bar is the first thing removed, preventing an ANSI redraw from wrapping.
+        if len(line)>maximum and self.stage_progress and detail:
+            current,total=self.stage_progress
+            line=f'{frame} [{self.stage_name}] running {timer} {current}/{total}{detail}'
+        return line if len(line)<=maximum else line[:maximum-1]+'…'
 
     def _animate(self):
         while not self._animation_stop.wait(0.12):

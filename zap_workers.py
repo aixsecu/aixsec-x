@@ -144,11 +144,31 @@ def drive(jobs, start, workers=2, cookie_mode='strict', policy=None, auto=None, 
     metrics_started = time.perf_counter_ns()
     scheduler_idle_ns = 0
     completed = 0
+    scheduled_total = len(ordered)
     requests_executed = 0
     job_durations = []
+    preparing = 0
     stop = False
     stop_reason = ('Active jobs deferred because the estimated workload exceeds the remaining session budget'
                    if deferred else '')
+
+    def eta_text(seconds):
+        seconds=max(0,int(seconds))
+        if seconds >= 3600:
+            hours,remainder=divmod(seconds,3600);minutes,_=divmod(remainder,60)
+            return f'~{hours}h{minutes:02d}m'
+        minutes,seconds=divmod(seconds,60)
+        return f'~{minutes}m{seconds:02d}s'
+
+    def emit_progress():
+        from terminal_output import event
+        average = sum(job_durations)/len(job_durations) if job_durations else float(expected_job_seconds)
+        eta = ((len(queue)+len(pending))*average)/max(1,workers)
+        confidence = 'low' if len(job_durations) < 10 else 'medium' if len(job_durations) < 30 else 'high'
+        event('stage','zap_active',f'{completed}/{scheduled_total} jobs finished',
+              f'W {len(pending)}/{workers}' + (f' + prep {preparing}' if preparing else '') +
+              f' | ETA {eta_text(eta)} {confidence} | '
+              f'req {requests_executed} | def {len(deferred)}/{len(jobs)}')
 
     def mark_wait(entry, kind):
         now = time.perf_counter_ns();state = waiting.get(id(entry))
@@ -174,13 +194,9 @@ def drive(jobs, start, workers=2, cookie_mode='strict', policy=None, auto=None, 
         if block:
             scheduler_idle_ns += time.perf_counter_ns()-wait_started
         if not done and block:
-            from terminal_output import event
-            average = sum(job_durations)/len(job_durations) if job_durations else float(expected_job_seconds)
-            eta = int(((len(queue)+len(pending))*average)/max(1,workers))
-            event('stage', 'zap_active', f'{completed}/{len(jobs)} jobs finished',
-                  f'ETA {eta//60:02d}:{eta%60:02d} | requests {requests_executed} | '
-                  f'{len(pending)}/{workers} workers | deferred {len(deferred)}')
-            print(f'[zap] {completed}/{len(jobs)} groups finished; {len(pending)} running', flush=True)
+            emit_progress()
+            print(f'[zap] {completed}/{scheduled_total} scheduled groups finished; '
+                  f'{len(pending)} running; {len(deferred)} deferred', flush=True)
         for future in done:
             generator, _, _ = pending.pop(future)
             completed_at[future] = getattr(future, '_aixsec_finished_ns', time.perf_counter_ns())
@@ -197,16 +213,11 @@ def drive(jobs, start, workers=2, cookie_mode='strict', policy=None, auto=None, 
                 if isinstance(finished.value, dict) and finished.value.get('outcome') in ('blocked', 'denied'):
                     stop = True
                     stop_reason = str(finished.value.get('output') or finished.value['outcome'])
-            from terminal_output import event
-            average = sum(job_durations)/len(job_durations) if job_durations else float(expected_job_seconds)
-            remaining_jobs = len(queue) + len(pending)
-            eta = int((remaining_jobs * average) / max(1, workers))
-            event('stage', 'zap_active', f'{completed}/{len(jobs)} jobs finished',
-                  f'ETA {eta//60:02d}:{eta%60:02d} | requests {requests_executed} | '
-                  f'{len(pending)}/{workers} workers | deferred {len(deferred)}')
-            print(f'[zap] {completed}/{len(jobs)} groups finished', flush=True)
+            emit_progress()
+            print(f'[zap] {completed}/{scheduled_total} scheduled groups finished', flush=True)
 
     try:
+        emit_progress()
         while queue and not stop:
             # Collect already finished tasks before reserving additional work.
             collect(block=False)
@@ -217,8 +228,11 @@ def drive(jobs, start, workers=2, cookie_mode='strict', policy=None, auto=None, 
                 average = (sum(job_durations)/len(job_durations) if job_durations
                            else float(expected_job_seconds))
                 if remaining_time < max(1.0, average):
+                    newly_deferred=len(queue)
                     deferred.extend(row[0] for row in queue); queue.clear()
+                    scheduled_total=max(completed+len(pending),scheduled_total-newly_deferred)
                     stop_reason = 'Active jobs deferred because the remaining session budget is insufficient'
+                    emit_progress()
                     break
             if len(pending) >= workers:
                 collect()
@@ -255,6 +269,7 @@ def drive(jobs, start, workers=2, cookie_mode='strict', policy=None, auto=None, 
                 collect()
                 continue
             entry, target_origin, _ = queue.pop(index)
+            preparing=1;emit_progress()
             finish_wait(entry)
             perf=entry.setdefault('_scheduler_performance', {})
             perf['scheduler_wait_ms']=(time.perf_counter_ns()-enqueued[id(entry)])/1_000_000
@@ -267,6 +282,7 @@ def drive(jobs, start, workers=2, cookie_mode='strict', policy=None, auto=None, 
             try:
                 call = next(generator)
             except StopIteration as finished:
+                preparing=0
                 completed += 1
                 if isinstance(finished.value, dict) and finished.value.get('outcome') in ('blocked', 'denied'):
                     stop_reason = str(finished.value.get('output') or finished.value['outcome'])
@@ -284,6 +300,8 @@ def drive(jobs, start, workers=2, cookie_mode='strict', policy=None, auto=None, 
             future=pool.submit(call);submitted[future]=time.perf_counter_ns()
             future.add_done_callback(lambda value:setattr(value,'_aixsec_finished_ns',time.perf_counter_ns()))
             pending[future] = (generator, target_origin, serial)
+            preparing=0
+            emit_progress()
         while pending:
             collect()
         if metrics is not None:
@@ -301,6 +319,7 @@ def drive(jobs, start, workers=2, cookie_mode='strict', policy=None, auto=None, 
                 auto_concurrency_wait_ms=sum(float(row.get('auto_concurrency_wait_ms',0)) for row in rows),
                 origin_saturation_ms=sum(float(row.get('origin_saturation_ms',0)) for row in rows),
                 completed_jobs=completed, deferred_jobs=len(deferred),
+                scheduled_jobs=scheduled_total, planned_jobs=len(jobs),
                 requests_executed=requests_executed,
                 deferred_request_ids=sorted({member.get('request_id') for entry in deferred
                     for member in (entry.get('_batch_members') or [entry]) if member.get('request_id')}),

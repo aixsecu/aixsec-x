@@ -33,6 +33,8 @@ class WorkersTests(unittest.TestCase):
         self.assertEqual(started,['0','1'])
         self.assertEqual(metrics['deferred_jobs'],3)
         self.assertEqual(metrics['deferred_request_ids'],['2','3','4'])
+        self.assertEqual(metrics['scheduled_jobs'],2)
+        self.assertEqual(metrics['planned_jobs'],5)
 
     def test_drive_exposes_scheduler_metrics_without_changing_results(self):
         metrics={};results=[]
