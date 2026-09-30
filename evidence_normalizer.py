@@ -129,6 +129,8 @@ def normalize(result, raw_result_reference=""):
             "description":str(row.get("description") or ""),"fix":str(row.get("fix") or ""),
             "scan_id":str(row.get("scan_id") or data.get("scan_id") or ""),
             "auth_state":str(row.get("auth_state") or coverage.get("auth_state") or ""),
+            "auth_generation":coverage.get("auth_generation",args.get("auth_generation")),
+            "auth_disposition":str(coverage.get("auth_disposition") or "trusted"),
             "request_sha256":request_hash,"response_sha256":response_hash,
             "raw_result_reference":raw_result_reference,"_candidate":candidates,
             "family_id":str(reference.get("family_id") or args.get("family_id") or coverage.get("family_id") or ""),

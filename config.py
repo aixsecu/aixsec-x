@@ -88,6 +88,27 @@ SCAN_PROFILES = {
     },
 }
 
+INTENSITY_PROFILES = {
+    'gentle': {'zap_workers':1,'zap_delay_ms':500,'zap_bootstrap_ceiling':1,'nuclei_rate':2,'ffuf_rate':2,'ffuf_threads':1,
+        'zap_auto_escalation_groups':2,'zap_auto_recovery_groups':4,
+        'zap_auto_promotion_cooldown_groups':6,'zap_auto_demotion_cooldown_groups':2},
+    'normal': {'zap_workers':2,'zap_delay_ms':200,'zap_bootstrap_ceiling':2,'nuclei_rate':5,'ffuf_rate':5,'ffuf_threads':2,
+        'zap_auto_escalation_groups':2,'zap_auto_recovery_groups':2,
+        'zap_auto_promotion_cooldown_groups':4,'zap_auto_demotion_cooldown_groups':3},
+    'fast': {'zap_workers':4,'zap_delay_ms':50,'zap_bootstrap_ceiling':2,'nuclei_rate':10,'ffuf_rate':10,'ffuf_threads':4,
+        'zap_auto_escalation_groups':3,'zap_auto_recovery_groups':2,
+        'zap_auto_promotion_cooldown_groups':3,'zap_auto_demotion_cooldown_groups':3},
+}
+
+def apply_scan_intensity(config, intensity):
+    name=str(intensity or 'normal').lower()
+    if name not in (*INTENSITY_PROFILES,'custom'):
+        raise ValueError('scan intensity must be gentle, normal, fast or custom')
+    resolved=dict(config)
+    if name!='custom': resolved.update(INTENSITY_PROFILES[name])
+    resolved['scan_intensity']=name
+    return resolved
+
 
 def apply_scan_profile(config: dict, profile: str) -> dict:
     """Return a copy with a named terminal profile applied.
@@ -119,9 +140,10 @@ def load_config() -> dict:
     planner_mode = os.environ.get("WEBX_PLANNER_MODE", "balanced").strip().lower()
     if planner_mode not in ("aggressive", "balanced", "thorough"):
         raise ValueError("WEBX_PLANNER_MODE must be aggressive, balanced or thorough")
-    return {
+    config = {
         # Existing behavior is unchanged unless --scan-profile is supplied.
         "scan_profile": "custom",
+        "scan_intensity": os.environ.get("WEBX_SCAN_INTENSITY", "normal").lower(),
         "budget_aware_active": True,
         "active_budget_reserve_seconds": 300,
         "active_expected_job_seconds": 90,
@@ -158,6 +180,11 @@ def load_config() -> dict:
         "zap_executable": os.environ.get("WEBX_ZAP_EXECUTABLE", "zap.sh"),
         "zap_startup_timeout": max(15, int(os.environ.get("WEBX_ZAP_STARTUP_TIMEOUT", "120"))),
         "zap_workers": max(1, min(8, int(os.environ.get("WEBX_ZAP_WORKERS", "2")))),
+        "zap_bootstrap_ceiling": max(1,min(2,int(os.environ.get("WEBX_ZAP_BOOTSTRAP_CEILING","2")))),
+        "zap_auto_escalation_groups": max(2,int(os.environ.get("WEBX_ZAP_AUTO_ESCALATION_GROUPS","2"))),
+        "zap_auto_recovery_groups": max(2,int(os.environ.get("WEBX_ZAP_AUTO_RECOVERY_GROUPS","2"))),
+        "zap_auto_promotion_cooldown_groups": max(2,int(os.environ.get("WEBX_ZAP_AUTO_PROMOTION_COOLDOWN_GROUPS","4"))),
+        "zap_auto_demotion_cooldown_groups": max(2,int(os.environ.get("WEBX_ZAP_AUTO_DEMOTION_COOLDOWN_GROUPS","3"))),
         "zap_worker_max_jobs": max(1, int(os.environ.get("WEBX_ZAP_WORKER_MAX_JOBS", "100"))),
         "zap_worker_memory_mb": max(0, int(os.environ.get("WEBX_ZAP_WORKER_MEMORY_MB", "0"))),
         "zap_batch_size": max(1, min(32, int(os.environ.get("WEBX_ZAP_BATCH_SIZE", "8")))),
@@ -300,3 +327,5 @@ def load_config() -> dict:
         #   compact → prompt ngắn, ít luật (model nhỏ tuân theo tốt hơn)
         #   full    → prompt chi tiết (model lớn)
     }
+    return (apply_scan_intensity(config, config['scan_intensity'])
+            if 'WEBX_SCAN_INTENSITY' in os.environ else config)

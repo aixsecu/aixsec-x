@@ -85,8 +85,11 @@ class ScanSchedule:
         with self.connection() as db:
             db.execute('BEGIN IMMEDIATE')
             db.execute('CREATE TABLE IF NOT EXISTS attempts (namespace TEXT, family TEXT, rule INTEGER, state TEXT, artifact_ref TEXT DEFAULT "", PRIMARY KEY(namespace,family,rule))')
+            db.execute('CREATE TABLE IF NOT EXISTS auth_retry_ledger (namespace TEXT, family TEXT, rule INTEGER, generation INTEGER, state TEXT, artifact_ref TEXT DEFAULT "", created_at REAL, PRIMARY KEY(namespace,family,rule,generation,state))')
             if 'artifact_ref' not in {r[1] for r in db.execute('PRAGMA table_info(attempts)')}:
                 db.execute('ALTER TABLE attempts ADD COLUMN artifact_ref TEXT DEFAULT ""')
+            if 'auth_generation' not in {r[1] for r in db.execute('PRAGMA table_info(attempts)')}:
+                db.execute('ALTER TABLE attempts ADD COLUMN auth_generation INTEGER DEFAULT 0')
         self.path.chmod(0o600)
         self.entries = {}
         self.rules = []
@@ -254,19 +257,28 @@ class ScanSchedule:
 
     def finish(self, fid, rules, result):
         outcome = result.get('outcome')
+        coverage=((result.get('data') or {}).get('coverage') or {})
+        disposition=coverage.get('auth_disposition','')
+        generation=int(coverage.get('auth_generation') or 0)
         observed = {int(rule) for row in ((result.get('data') or {}).get('discovery') or {}).get('endpoints', [])
                     for rule in row.get('tested_rule_ids', []) if str(rule).isdigit()}
         captured = set(((result.get('data') or {}).get('coverage') or {}).get('active_evidence', {}).get('rules_with_evidence', []))
         with self.connection() as db:
             for rule in rules:
-                if outcome in ('denied', 'blocked', 'scope_rejected'):
+                if disposition in ('auth_uncertain','deferred_auth_expired'):
+                    import time
+                    db.execute('INSERT OR REPLACE INTO auth_retry_ledger VALUES (?,?,?,?,?,?,?)',
+                        (self.namespace,fid,rule,generation,disposition,coverage.get('report_path',''),time.time()))
+                    db.execute('DELETE FROM attempts WHERE namespace=? AND family=? AND rule=?', (self.namespace,fid,rule))
+                    self.defer(fid,[rule],disposition)
+                elif outcome in ('denied', 'blocked', 'scope_rejected'):
                     db.execute('DELETE FROM attempts WHERE namespace=? AND family=? AND rule=?', (self.namespace, fid, rule))
                 else:
                     state = (outcome if outcome in ('error', 'timeout', 'partial') else
                              'responses_recorded' if rule in observed and rule in captured else
                              'requests_observed' if rule in observed else 'attempted_unverified')
                     artifact = ((result.get('data') or {}).get('coverage') or {}).get('report_path', '')
-                    db.execute('UPDATE attempts SET state=?,artifact_ref=? WHERE namespace=? AND family=? AND rule=?', (state, artifact, self.namespace, fid, rule))
+                    db.execute('UPDATE attempts SET state=?,artifact_ref=?,auth_generation=? WHERE namespace=? AND family=? AND rule=?', (state, artifact, generation, self.namespace, fid, rule))
 
     def defer(self, fid, rules, reason='session budget'):
         """Record unclaimed work as deferred without poisoning persistent history."""
@@ -278,14 +290,18 @@ class ScanSchedule:
         rows = []
         with self.connection() as db:
             for fid, entry in self.entries.items():
-                states = {r[0]: (r[1], r[2]) for r in db.execute('SELECT rule,state,artifact_ref FROM attempts WHERE namespace=? AND family=?', (self.namespace, fid))}
+                states = {r[0]: (r[1], r[2], r[3]) for r in db.execute('SELECT rule,state,artifact_ref,auth_generation FROM attempts WHERE namespace=? AND family=?', (self.namespace, fid))}
                 rows.append({k:v for k,v in entry.items() if not k.startswith('_')} | {
                     'rules': [{'id':r,
-                               'state':states.get(r,('deferred_by_budget',''))[0]
+                               'state':('deferred_auth_expired' if str(self.deferred.get(fid,{}).get(r,'')).startswith(('auth_','deferred_auth')) else 'deferred_by_budget')
                                    if r in self.deferred.get(fid,{}) else states.get(r,('not_run',''))[0],
                                'reason':self.deferred.get(fid,{}).get(r,''),
-                               'artifact_ref':states.get(r,('not_run',''))[1]} for r in rules]})
+                               'artifact_ref':states.get(r,('not_run','',0))[1],
+                               'auth_generation':states.get(r,('not_run','',0))[2]} for r in rules]})
+            retry_rows=[dict(zip(('family','rule','auth_generation','state','artifact_ref','created_at'),r))
+                for r in db.execute('SELECT family,rule,generation,state,artifact_ref,created_at FROM auth_retry_ledger WHERE namespace=? ORDER BY created_at',(self.namespace,))]
         return {'namespace': self.namespace, 'history_path': str(self.path), 'families': rows,
+                'auth_retry_ledger':retry_rows,
                 'rules': self.rules, 'skipped_static_requests': self.skipped_static,
                 'import_errors': list(self.import_errors),
                 'active_input_limit': self.limit_report,

@@ -8,7 +8,7 @@ import json
 import os
 from pathlib import Path
 
-from config import SCAN_PROFILES, apply_scan_profile
+from config import SCAN_PROFILES, apply_scan_profile, apply_scan_intensity
 
 
 DEFAULT_USER_CONFIG = Path('.aixsec-config.json')
@@ -16,11 +16,14 @@ DEFAULT_USER_CONFIG = Path('.aixsec-config.json')
 # Do not accept arbitrary internal keys from a user-owned file. In particular,
 # runtime objects and private credential values must never be deserialized here.
 USER_CONFIG_KEYS = {
-    'scan_profile', 'targets', 'src_dirs', 'scan_backend', 'planner_enabled',
+    'scan_profile', 'scan_intensity', 'targets', 'src_dirs', 'scan_backend', 'planner_enabled',
     'allow_active_scan', 'nuclei_enabled', 'zap_ajax',
     'allow_content_discovery', 'advanced_coverage', 'allow_sqlmap',
     'allow_extraction', 'allow_oast', 'oast_callback_url', 'zap_workers',
-    'zap_strength', 'zap_auth_file', 'zap_openapi_file', 'evidence_dir',
+    'zap_strength', 'zap_auth_file', 'zap_auth_context', 'zap_openapi_file', 'evidence_dir',
+    'zap_delay_ms', 'zap_bootstrap_ceiling', 'zap_auto_escalation_groups',
+    'zap_auto_recovery_groups', 'zap_auto_promotion_cooldown_groups',
+    'zap_auto_demotion_cooldown_groups', 'nuclei_rate', 'ffuf_rate', 'ffuf_threads',
 }
 
 
@@ -42,7 +45,9 @@ def apply_user_config(config, settings):
     profile = str(settings.get('scan_profile', '')).lower()
     if profile:
         resolved = apply_scan_profile(resolved, profile)
-    resolved.update({key: value for key, value in settings.items() if key != 'scan_profile'})
+    intensity=str(settings.get('scan_intensity','normal')).lower()
+    resolved=apply_scan_intensity(resolved,intensity)
+    resolved.update({key: value for key, value in settings.items() if key not in ('scan_profile','scan_intensity')})
     if not isinstance(resolved.get('targets', []), list) or not isinstance(resolved.get('src_dirs', []), list):
         raise ValueError('targets and src_dirs in user config must be JSON arrays')
     workers = int(resolved.get('zap_workers', 2))
@@ -97,6 +102,10 @@ def configure_interactive(existing=None):
     print('\nAIXSEC-X — CÀI ĐẶT NGƯỜI DÙNG')
     print('Không lưu mật khẩu/token. Credential phải nằm trong auth profile hoặc secret env riêng.')
     number = _choice('Profile: 1 Fast, 2 Balanced, 3 Full, 4 Exhaustive', tuple(profile_numbers), default_number)
+    intensity_numbers={'1':'gentle','2':'normal','3':'fast','4':'custom'}
+    default_intensity=old.get('scan_intensity','normal')
+    default_intensity_number=next((n for n,v in intensity_numbers.items() if v==default_intensity),'2')
+    intensity_number=_choice('Intensity: 1 Gentle, 2 Normal, 3 Fast, 4 Custom',tuple(intensity_numbers),default_intensity_number)
     targets_default = ','.join(old.get('targets', []))
     targets = input(f'Target được cấp quyền, cách nhau bằng dấu phẩy [{targets_default}]: ').strip()
     sources_default = ','.join(old.get('src_dirs', []))
@@ -105,6 +114,7 @@ def configure_interactive(existing=None):
     active = _yes_no('Cho phép active scan?', old.get('allow_active_scan', True))
     settings = {
         'scan_profile': profile_numbers[number],
+        'scan_intensity': intensity_numbers[intensity_number],
         'targets': [v.strip() for v in (targets or targets_default).split(',') if v.strip()],
         'src_dirs': [v.strip() for v in (sources or sources_default).split(',') if v.strip()],
         'scan_backend': backend,
@@ -118,12 +128,29 @@ def configure_interactive(existing=None):
         'allow_extraction': False,
         'allow_oast': _yes_no('Cho phép kiểm thử OAST?', old.get('allow_oast', False)),
     }
+    if settings['scan_intensity']=='custom':
+        settings['zap_workers']=int(_choice('Workers',tuple(str(v) for v in range(1,9)),str(old.get('zap_workers',2))))
+        settings['zap_delay_ms']=max(0,int(input(f"Delay ms/origin [{old.get('zap_delay_ms',200)}]: ").strip() or old.get('zap_delay_ms',200)))
+        settings['zap_bootstrap_ceiling']=int(_choice('Bootstrap ceiling',('1','2'),str(old.get('zap_bootstrap_ceiling',2))))
+        settings['nuclei_rate']=max(1,int(input(f"Request rate/origin [{old.get('nuclei_rate',5)}]: ").strip() or old.get('nuclei_rate',5)))
+        settings['zap_auto_escalation_groups']=max(2,int(input(f"Backoff threshold [{old.get('zap_auto_escalation_groups',2)}]: ").strip() or old.get('zap_auto_escalation_groups',2)))
+        settings['zap_auto_recovery_groups']=max(2,int(input(f"Recovery threshold [{old.get('zap_auto_recovery_groups',2)}]: ").strip() or old.get('zap_auto_recovery_groups',2)))
     if settings['allow_sqlmap']:
         settings['allow_extraction'] = _yes_no(
             'Cho phép extraction? (rủi ro cao)', old.get('allow_extraction', False))
     if settings['allow_oast']:
         callback = input(f"OAST callback URL [{old.get('oast_callback_url', '')}]: ").strip()
         settings['oast_callback_url'] = callback or old.get('oast_callback_url', '')
+    auth_file = old.get('zap_auth_file')
+    if auth_file:
+        from auth_wizard import load_profiles
+        profiles = load_profiles(auth_file)
+        choices = ('anonymous', *sorted(profiles))
+        default_auth = old.get('zap_auth_context', 'anonymous')
+        if default_auth not in choices:
+            default_auth = 'anonymous'
+        settings['zap_auth_file'] = auth_file
+        settings['zap_auth_context'] = _choice('Auth context', choices, default_auth)
     return settings
 
 
@@ -131,6 +158,7 @@ def public_summary(config):
     """Small non-secret summary suitable for startup display."""
     return {
         'profile': config.get('scan_profile', 'custom'),
+        'intensity': config.get('scan_intensity', 'normal'),
         'backend': config.get('scan_backend', 'auto'),
         'active': bool(config.get('allow_active_scan')),
         'ajax': bool(config.get('zap_ajax')),
@@ -138,4 +166,5 @@ def public_summary(config):
         'sqlmap': bool(config.get('allow_sqlmap')),
         'extraction': bool(config.get('allow_extraction')),
         'oast': bool(config.get('allow_oast')),
+        'auth': config.get('zap_auth_context', 'anonymous'),
     }

@@ -539,7 +539,9 @@ def run_scan(config, url, *, active=False, rule_ids=(), auth_context='anonymous'
                     'worker_jobs':pool_worker.jobs,'worker_reused':pool_worker.jobs>1,
                     'worker_startup_ms':pool_worker.startup_ms,
                     'context_reused':bool(result.get('context_reused')),
-                    'policy_reused':bool(result.get('policy_reused'))}
+                    'policy_reused':bool(result.get('policy_reused')),
+                    'session_slot':result.get('session_slot',''),
+                    'session_isolation':result.get('session_isolation','')}
                 jvm_launches=0
                 log_path.write_text(json.dumps(result.get('progress') or {},default=str))
             except BaseException as exc:
@@ -629,6 +631,12 @@ def run_scan(config, url, *, active=False, rule_ids=(), auth_context='anonymous'
             inventory_error = 'Cannot parse active request evidence: ' + str(exc)
     from zap_active_evidence import analyze
     diagnostics, candidates = analyze(directory, url, rule_ids, auth_context, scan_id) if active else ({}, [])
+    if active and auth_context != 'anonymous':
+        from captured_auth import artifact_expired
+        if artifact_expired(config,auth_context,directory/'active-evidence.jsonl'):
+            auth_state='unverified'
+            diagnostics.setdefault('gaps',[]).append('Logged-out marker observed in active response evidence')
+            if state=='complete': state='partial'
     for candidate in candidates:
         candidate['auth_state'] = auth_state
     rows.extend(candidates)

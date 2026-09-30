@@ -329,7 +329,7 @@ class SecurityAnalysisState:
             if not isinstance(step, dict) or not step.get("action") \
                     or not isinstance(step.get("request"), dict):
                 raise ValueError("each workflow step needs action and request")
-            response, record = context._request(step["request"], record=True)
+            response, record = context.request(step["request"], record=True)
             evidence = context.evidence(record)
             observations.append({
                 "index": index, "action": str(step["action"]),

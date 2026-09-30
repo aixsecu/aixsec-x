@@ -20,6 +20,7 @@ from ledger import Finding
 from evidence_normalizer import normalize, validate_schema, SUPPORTED_TOOLS
 
 RANK = {'info': 0, 'low': 1, 'medium': 2, 'high': 3, 'critical': 4}
+AUTH_QUARANTINE_DISPOSITIONS = frozenset({'auth_uncertain', 'deferred_auth_expired'})
 
 
 def stable_id(prefix, value):
@@ -34,6 +35,20 @@ def public(value):
     return value
 
 
+def auth_disposition(result):
+    """Return the authoritative auth disposition attached to a tool result."""
+    if not isinstance(result, dict):
+        return ''
+    data = result.get('data') if isinstance(result.get('data'), dict) else {}
+    coverage = data.get('coverage') if isinstance(data.get('coverage'), dict) else {}
+    return str(coverage.get('auth_disposition') or data.get('auth_disposition')
+               or result.get('auth_disposition') or '')
+
+
+def auth_quarantined(result):
+    return auth_disposition(result) in AUTH_QUARANTINE_DISPOSITIONS
+
+
 class EvidenceStore:
     def __init__(self, ledger, directory=None):
         self.ledger = ledger
@@ -42,6 +57,7 @@ class EvidenceStore:
         self.candidates = {}
         self.coverage = []
         self.observations = []
+        self.quarantined = []
         self.discovery = []
         self.active_rules = []
         self.directory = None
@@ -58,12 +74,37 @@ class EvidenceStore:
             data = {}
         raw_artifact = ''
         if self.directory:
-            artifact = self.directory / f'tool-{len(self.observations) + 1}.json'
+            artifact = self.directory / f'tool-{len(self.observations) + len(self.quarantined) + 1}.json'
             with artifact.open('w') as out:
                 os.chmod(artifact, 0o600)
                 json.dump(result, out, ensure_ascii=False, default=str)
             raw_artifact = str(artifact)
         coverage = data.get('coverage')
+        disposition = auth_disposition(result)
+        if disposition in AUTH_QUARANTINE_DISPOSITIONS:
+            quarantine = {
+                'quarantine_id': stable_id('authq', [name, args.get('url'),
+                    args.get('request_id'), args.get('auth_context'),
+                    coverage.get('auth_generation') if isinstance(coverage, dict) else None,
+                    disposition, raw_artifact]),
+                'tool': name,
+                'outcome': str(result.get('outcome') or ''),
+                'url': EvidenceRedactor().redact_url(str(args.get('url') or '')),
+                'request_id': str(args.get('request_id') or ''),
+                'auth_context': str((coverage.get('auth_context') if isinstance(coverage, dict) else '')
+                                    or args.get('auth_context') or 'anonymous'),
+                'auth_generation': (coverage.get('auth_generation')
+                                    if isinstance(coverage, dict) else None),
+                'auth_disposition': disposition,
+                'reason': str((coverage.get('auth_reason') if isinstance(coverage, dict) else '')
+                              or (coverage.get('reason') if isinstance(coverage, dict) else '')
+                              or 'Authentication state could not be trusted'),
+                'artifact_ref': raw_artifact,
+                'time': time.time(),
+            }
+            self.quarantined.append(quarantine)
+            self.persist()
+            return {'accepted': False, 'quarantined': True, **public(quarantine)}
         if isinstance(coverage, dict):
             self.coverage.append(public(coverage))
         if isinstance(data.get('discovery'), dict):
@@ -79,7 +120,7 @@ class EvidenceStore:
             self.normalized[normalized_row['evidence_id']]=normalized_row
         if result.get('outcome') not in ('ok', 'partial', 'timeout'):
             self.persist()
-            return
+            return {'accepted': True, 'quarantined': False}
         rows = normalized_rows
         normalized = bool(name in SUPPORTED_TOOLS)
         if name == 'wapiti_scan':
@@ -138,6 +179,7 @@ class EvidenceStore:
                     finding.sources.append(name)
             # Even ZAP confidence=confirmed is not authority to change our state.
         self.persist()
+        return {'accepted': True, 'quarantined': False}
 
     def validate(self, evidence_id):
         row = self.records.get(evidence_id)
@@ -222,7 +264,7 @@ class EvidenceStore:
             context = auth_context.manager().get(context_name)
             if context.state not in ('ready', 'authenticated'):
                 raise ValueError('Replay requires an authenticated AIXSEC context with the same name; ZAP cookies are not copied')
-            response, record = context._request(spec, record=True)
+            response, record = context.request(spec, record=True)
         else:
             session = he.HttpSession('evidence-replay', proxies=he.get_proxies())
             try:
@@ -247,6 +289,8 @@ class EvidenceStore:
                 'evidence': [public(v) for v in self.records.values()],
                 'normalized_evidence': [public(v) for v in self.normalized.values()],
                 'findings': [asdict(f) for f in self.candidates.values()],
+                'auth_quarantine': [public(v) for v in self.quarantined],
+                'auth_quarantine_count': len(self.quarantined),
                 'observations': self.observations}
 
     def planner_records(self):
@@ -263,6 +307,14 @@ class EvidenceStore:
                 os.chmod(temporary, 0o600)
                 json.dump(self.summary(), out, ensure_ascii=False, indent=2)
             temporary.replace(path)
+            quarantine_path = self.directory / 'auth-quarantine.json'
+            quarantine_temporary = self.directory / 'auth-quarantine.tmp'
+            with quarantine_temporary.open('w') as out:
+                os.chmod(quarantine_temporary, 0o600)
+                json.dump({'version': 1, 'count': len(self.quarantined),
+                           'records': [public(v) for v in self.quarantined]},
+                          out, ensure_ascii=False, indent=2)
+            quarantine_temporary.replace(quarantine_path)
 
     def finish(self, llm_down=False):
         findings = [asdict(f) for f in self.candidates.values()]
@@ -276,8 +328,11 @@ class EvidenceStore:
         result = {'risk_level': risk, 'candidate_risk_level': candidate_risk,
                   'overall_summary': summary, 'findings': findings, 'coverage': self.coverage,
                   'discovery': self.discovery,
+                  'auth_quarantine': [public(v) for v in self.quarantined],
+                  'auth_quarantine_count': len(self.quarantined),
                   'llm_down': llm_down}
         if self.directory:
             result['evidence_path'] = str(self.directory / 'evidence.json')
+            result['auth_quarantine_path'] = str(self.directory / 'auth-quarantine.json')
         self.persist()
         return result

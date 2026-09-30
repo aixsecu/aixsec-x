@@ -71,6 +71,8 @@ class Journal:
             return None
         if self.retry and task['status'] not in ('complete', 'duplicate'):
             return None
+        if task.get('auth_disposition') in ('auth_uncertain','deferred_auth_expired'):
+            return None
         path = self.directory / ('checkpoint-' + key + '.json')
         return json.loads(path.read_text()) if path.exists() else None
 
@@ -87,6 +89,8 @@ class Journal:
         status=(coverage.get('status') if isinstance(coverage,dict) else None) or result.get('outcome','error')
         task['status'] = 'complete' if status in ('ok', 'complete') else status
         task['outcome'] = result.get('outcome', 'error')
+        task['auth_disposition'] = coverage.get('auth_disposition','') if isinstance(coverage,dict) else ''
+        task['auth_generation'] = coverage.get('auth_generation') if isinstance(coverage,dict) else None
         task['finished_at'] = time.time()
         task['exec_time'] = result.get('exec_time')
         self.save()

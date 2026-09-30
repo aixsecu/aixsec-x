@@ -7,7 +7,7 @@ import time
 from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
-from zap_auto import AutoConcurrency, bootstrap_eligible, controls, classify_cookies, classify_redirect
+from zap_auto import AutoConcurrency, bootstrap_eligible, controls, classify_cookies, classify_redirect, cookie_lane
 from zap_concurrency import ConcurrencyPolicy
 from zap_workers import drive, scheduling_reasons
 from tests.test_zap_workers import entry
@@ -54,14 +54,36 @@ class AutoTests(unittest.TestCase):
         self.assertTrue(bootstrap_eligible(bootstrap_job('products')))
         self.assertTrue(bootstrap_eligible(bootstrap_job('products',method='HEAD')))
         cases=[bootstrap_job('products',method='POST'),
-               bootstrap_job('products',headers=[{'name':'Cookie','value':'sid=x'}]),
                bootstrap_job('products',headers=[{'name':'Authorization','value':'Bearer x'}]),
                bootstrap_job('products',headers=[{'name':'X-CSRF-Token','value':'x'}]),
                bootstrap_job('products?session=x'),bootstrap_job('checkout')]
         body=bootstrap_job('products');body['_entry']['request']['postData']={'text':'x'};cases.append(body)
-        authenticated=bootstrap_job('products');authenticated['auth_context']='member';cases.append(authenticated)
         for item in cases:
             self.assertFalse(bootstrap_eligible(item),item['request_id'])
+
+    def test_guest_cookie_lanes_distinguish_benign_and_session_state(self):
+        analytics=bootstrap_job('products',headers=[{'name':'Cookie','value':'_ga=x'}])
+        affinity=bootstrap_job('products',headers=[{'name':'Cookie','value':'AWSALB=x'}])
+        session=bootstrap_job('products',headers=[{'name':'Cookie','value':'PHPSESSID=x'}])
+        authenticated=bootstrap_job('products');authenticated['auth_context']='member'
+        self.assertEqual(cookie_lane(analytics),'analytics')
+        self.assertEqual(cookie_lane(affinity),'affinity')
+        self.assertEqual(cookie_lane(session),'guest_session')
+        self.assertEqual(cookie_lane(authenticated),'authenticated_session')
+        self.assertTrue(bootstrap_eligible(analytics)); self.assertTrue(bootstrap_eligible(affinity))
+        auto=self.controller([analytics,affinity,session,authenticated])
+        self.assertEqual(auto.limit('https://example.test',session),1)
+        self.assertEqual(auto.limit('https://example.test',authenticated),1)
+
+    def test_authenticated_roles_have_independent_concurrency_state(self):
+        user_a=bootstrap_job('a'); user_a['auth_context']='user_A'
+        user_b=bootstrap_job('b'); user_b['auth_context']='user_B'
+        auto=self.controller([user_a,user_b])
+        auto._state(user_a).update(mode='steady',level=2)
+        auto._state(user_b).update(mode='steady',level=1)
+        self.assertEqual(auto.limit('https://example.test',user_a),2)
+        self.assertEqual(auto.limit('https://example.test',user_b),1)
+        self.assertIn('https://example.test|auth=user_A',auto.data['origins'])
 
     def test_two_clean_bootstrap_groups_run_together_and_promote(self):
         items=[bootstrap_job('public-a'),bootstrap_job('public-b')]
@@ -186,7 +208,7 @@ class AutoTests(unittest.TestCase):
         self.assertEqual(auto.limit('https://example.test'),4)
         self.assertTrue(auto.data['groups']['products']['quarantined'])
         auto.observe(items[1],self.result(302,redirect=True,location='/login'))
-        self.assertEqual(auto.limit('https://example.test'),2)
+        self.assertEqual(auto.limit('https://example.test'),1)
     def test_two_worker_trial_after_first_success(self):
         items=[job(v) for v in ('a','b','c','d','e','f')];auto=self.controller(items)
         auto.data['origins']['https://example.test']['mode']='steady'
