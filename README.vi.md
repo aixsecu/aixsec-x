@@ -388,6 +388,12 @@ Các công tắc boolean dùng `1` (bật) và `0` (tắt). Mặc định dướ
 | `WEBX_ALLOW_OAST` | `0` | Khai báo OAST đã được cấp quyền; không tự tạo hay suy đoán callback service. |
 | `WEBX_OAST_CALLBACK_URL` | *(trống)* | Endpoint callback HTTP(S) do operator kiểm soát, chỉ dùng để đánh dấu prerequisite OAST sẵn sàng; secret/path callback không đưa vào coverage công khai. |
 | `WEBX_ZAP_DELAY_MS` | `200` | Độ trễ giữa các request active scan, tính bằng mili giây. |
+| `WEBX_SCAN_INTENSITY` | `normal` | Preset throughput: `gentle`, `normal`, `fast` hoặc `custom`; người dùng terminal thường chọn trong menu. |
+| `WEBX_ZAP_BOOTSTRAP_CEILING` | `2` | Số worker tối đa trong bootstrap adaptive concurrency chưa được chứng minh (1–2). |
+| `WEBX_ZAP_AUTO_ESCALATION_GROUPS` | `2` | Số group bất ổn khác nhau cần có trước khi giảm concurrency. |
+| `WEBX_ZAP_AUTO_RECOVERY_GROUPS` | `2` | Số group ổn định cần cho phục hồi/tăng concurrency. |
+| `WEBX_ZAP_AUTO_PROMOTION_COOLDOWN_GROUPS` | `4` | Số group tối thiểu giữa hai lần tăng concurrency. |
+| `WEBX_ZAP_AUTO_DEMOTION_COOLDOWN_GROUPS` | `3` | Số group tối thiểu giữa hai lần giảm concurrency. |
 | `WEBX_ZAP_AJAX` | `1` | Bật AJAX Spider để khám phá qua trình duyệt. |
 | `WEBX_ZAP_BROWSER` | `firefox-headless` | ID trình duyệt Selenium cho AJAX Spider; cần trình duyệt/driver tương ứng. |
 | `WEBX_ZAP_SPIDER_DEPTH` | `10` | Độ sâu crawl tối đa cho Spider/AJAX (tối thiểu 1). |
@@ -549,10 +555,43 @@ root@aixsec-x:~# Quét nuclei severity high                  → tấn công m�
 root@aixsec-x:~# /findings                                  → xem ledger (candidate/confirmed/ruled_out)
 root@aixsec-x:~# /report                                    → xuất report markdown
 root@aixsec-x:~# /config                                    → mở lại wizard và áp dụng cấu hình ngay trong phiên
+root@aixsec-x:~# /auth                                      → quản lý/chọn guest hoặc profile đăng nhập ZAP, không lưu secret thô
 root@aixsec-x:~# /capabilities                              → liệt kê tool/binary/version khả dụng (v1.6.0)
 root@aixsec-x:~# !! nmap -p- 10.0.0.5                       → chạy shell trực tiếp (tự chịu trách nhiệm)
 root@aixsec-x:~# q                                          → thoát
 ```
+
+File auth được chọn đồng thời là manifest runtime dùng chung. Profile form/JSON,
+HTTP Basic và browser dùng được với ZAP; Bearer, API key và cookie tĩnh chỉ dùng
+cho HTTP runtime context. Trạng thái xác thực có generation counter. Khi phiên
+hết hạn, AIXSEC-X chỉ refresh một lần có khóa và kiểm chứng; chỉ GET/HEAD được
+tự động chạy lại, request làm thay đổi trạng thái không bao giờ tự replay.
+
+Job có xác thực được ràng buộc theo generation. Coverage và evidence đều mang
+`auth_context` cùng `auth_generation`; response trang login/hết phiên được ghi
+thành `auth_uncertain`, `retry_after_refresh` hoặc `deferred_auth_expired`.
+Attempt không chắc chắn không tạo finding, không làm bẩn persistent history và
+refresh ledger không chứa secret được giữ lại khi resume.
+
+Adaptive concurrency phân loại stateless, analytics, preference, affinity,
+CSRF, guest session, authenticated session và unknown. GET stateless hoặc chỉ
+có cookie vô hại có thể tăng từ hai worker tới mức tối đa. Guest/authenticated
+session bị giới hạn một đến hai worker theo origin/context; POST và workflow
+luôn serial. Chỉ tăng worker sau control ổn định và tự giảm khi cookie đổi,
+redirect login/logout, CAPTCHA/WAF, rate limit, lỗi server hoặc latency cao.
+
+Scan profile và scan intensity là hai lựa chọn terminal độc lập. Độ phủ vẫn là
+Fast/Balanced/Full/Exhaustive, còn cường độ là Gentle/Normal/Fast/Custom.
+Intensity cấu hình worker, delay/rate theo origin, bootstrap ceiling, ngưỡng
+tăng/giảm và cooldown. Giá trị Custom được lưu qua `/config`, không buộc người
+dùng sửa biến môi trường.
+
+Mỗi ZAP worker dùng home và session slot riêng. Trước khi tái sử dụng, worker
+xóa HTTP session, alert và site tree; nếu không xóa sạch auth state thì worker
+được recycle. Chỉ nhóm read-only tương thích mới được batch; CSRF và workflow
+vẫn serial. `/auth` còn hỗ trợ import cookie JSON/Netscape theo scope (giá trị
+chỉ ở trong process), browser/SSO, OAuth/OIDC refresh token, MFA pause/resume và
+nhiều role đặt tên để phân tích differential authorization.
 
 Khi tin nhắn chứa URL/domain/IP cụ thể và yêu cầu scan rõ ràng, intent router
 có thể chuyển target mà không cần `/config`. Parser xác định chỉ trích xuất và

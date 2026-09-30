@@ -173,11 +173,15 @@ class AuthContext:
     transport: dict = field(default_factory=dict)
     login_steps: list[dict] = field(default_factory=list)
     logout_step: dict | None = None
+    verification: dict = field(default_factory=dict)
     state: str = "configured"
     variables: dict[str, str] = field(default_factory=dict, repr=False)
     last_login_at: float | None = None
     last_error: str = ""
+    generation: int = 0
+    refreshes: int = 0
     session: he.HttpSession | None = field(default=None, repr=False)
+    _refresh_lock: threading.RLock = field(default_factory=threading.RLock, repr=False)
 
     def ensure_session(self) -> he.HttpSession:
         if self.session is None:
@@ -196,8 +200,11 @@ class AuthContext:
             },
             "login_steps": len(self.login_steps),
             "has_logout": self.logout_step is not None,
+            "has_verification": bool(self.verification),
             "last_login_at": round(self.last_login_at, 2) if self.last_login_at else None,
             "last_error": self.last_error,
+            "generation": self.generation,
+            "refreshes": self.refreshes,
         }
 
     def sensitive_query_names(self) -> tuple[str, ...]:
@@ -279,6 +286,30 @@ class AuthContext:
         except requests.RequestException as exc:
             raise ValueError(f"HTTP request failed: {type(exc).__name__}") from None
 
+    def _expired_response(self, response) -> bool:
+        if response.status_code in (401, 403):
+            return True
+        text=response.text[:MAX_RESPONSE_BYTES]
+        logged_out=str(self.verification.get('loggedOutRegex') or '')
+        logged_in=str(self.verification.get('loggedInRegex') or '')
+        return bool(logged_out and re.search(logged_out,text)) or bool(logged_in and not re.search(logged_in,text))
+
+    def request(self, spec: dict, *, record: bool = False):
+        """Refresh once on expiry; replay only protocol-safe read requests."""
+        if self.login_steps and self.state != 'authenticated':
+            with self._refresh_lock:
+                if self.state != 'authenticated': self.login()
+        response, request_record=self._request(spec,record=record)
+        if not self.login_steps or not self._expired_response(response):
+            return response,request_record
+        self.state='expired'
+        with self._refresh_lock:
+            self.state='refreshing'; self.login(); self.refreshes += 1
+        if str(spec.get('method') or 'GET').upper() not in ('GET','HEAD'):
+            self.state='refreshed_requires_replay'
+            return response,request_record
+        return self._request(spec,record=record)
+
     def login(self) -> dict:
         if not self.login_steps:
             self.state = "anonymous" if self.name == "anonymous" else "ready"
@@ -295,6 +326,12 @@ class AuthContext:
                     raise ValueError("expected_status must be an integer or list of integers")
                 if response.status_code not in expected:
                     raise ValueError(f"login step {index + 1} returned {response.status_code}")
+                logged_in = str(step.get("logged_in_regex") or "")
+                logged_out = str(step.get("logged_out_regex") or "")
+                if logged_in and not re.search(logged_in, response.text[:MAX_RESPONSE_BYTES]):
+                    raise ValueError(f"login step {index + 1} did not match logged-in marker")
+                if logged_out and re.search(logged_out, response.text[:MAX_RESPONSE_BYTES]):
+                    raise ValueError(f"login step {index + 1} matched logged-out marker")
                 extracted = []
                 for name, rule in (step.get("extract") or {}).items():
                     if not _NAME.fullmatch(str(name)) or not isinstance(rule, dict):
@@ -324,6 +361,7 @@ class AuthContext:
                                      "extracted_names": extracted,
                                      "evidence": self.evidence(record)})
             self.state, self.last_error, self.last_login_at = "authenticated", "", time.time()
+            self.generation += 1
             return {"context": self.name, "state": self.state, "steps": observations}
         except Exception as exc:
             message = str(exc) if isinstance(exc, (ValueError, TypeError)) else type(exc).__name__
@@ -357,7 +395,7 @@ class AuthContextManager:
         self._lock = threading.RLock()
 
     def configure(self, name: str, origin: str, *, transport=None,
-                  login_steps=None, logout_step=None, replace=False) -> dict:
+                  login_steps=None, logout_step=None, verification=None, replace=False) -> dict:
         if not _NAME.fullmatch(str(name or "")):
             raise ValueError("invalid auth context name")
         normalized = _origin(origin)
@@ -376,7 +414,7 @@ class AuthContextManager:
             if name not in self._contexts and len(self._contexts) >= MAX_CONTEXTS:
                 raise ValueError("too many auth contexts")
             context = AuthContext(str(name), normalized, copy.deepcopy(transport or {}),
-                                  steps, copy.deepcopy(logout_step))
+                                  steps, copy.deepcopy(logout_step), copy.deepcopy(verification or {}))
             self._contexts[name] = context
         return context.public()
 
@@ -417,7 +455,7 @@ class AuthContextManager:
         observations = []
         raw_text: dict[str, str] = {}
         for context in contexts:
-            response, record = context._request(request, record=True)
+            response, record = context.request(request, record=True)
             facts = _response_facts(response, record, context.sensitive_query_names())
             observations.append({"context": context.name, "state": context.state,
                                  "response": facts, "evidence": context.evidence(record)})

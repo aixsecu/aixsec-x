@@ -113,6 +113,16 @@ class ScheduleTests(unittest.TestCase):
             with schedule.connection() as db:
                 self.assertEqual(db.execute('SELECT state FROM attempts').fetchone()[0], 'responses_recorded')
 
+    def test_auth_expired_attempt_is_retryable_and_keeps_generation_ledger(self):
+        with tempfile.TemporaryDirectory() as root:
+            schedule=ScanSchedule(root); schedule.claim('family',[40018])
+            schedule.finish('family',[40018],{'outcome':'ok','data':{'coverage':{
+                'status':'partial','auth_generation':3,'auth_disposition':'deferred_auth_expired'}}})
+            self.assertEqual(schedule.remaining('family',[40018]),[40018])
+            summary=schedule.summary([40018])
+            self.assertEqual(summary['auth_retry_ledger'][0]['auth_generation'],3)
+            self.assertEqual(summary['families'],[])  # ledger survives even before a new HAR entry is collected
+
 
     def test_persistent_per_rule_reservation_and_denial_release(self):
         with tempfile.TemporaryDirectory() as root:

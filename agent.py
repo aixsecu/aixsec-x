@@ -26,7 +26,7 @@ from urllib.parse import urljoin
 
 # ── local imports ──
 from terminal_output import TerminalOutput, prompt as terminal_prompt
-from config import SCAN_PROFILES, apply_scan_profile, load_config
+from config import SCAN_PROFILES, apply_scan_profile, apply_scan_intensity, load_config
 from user_config import (DEFAULT_USER_CONFIG, apply_user_config,
                          configure_interactive, load_user_config,
                          public_summary, save_user_config, USER_CONFIG_KEYS)
@@ -1662,8 +1662,14 @@ def _banner(cfg: dict, scope: str = "", missing=None, mode: str = "interactive",
     lines.append("")
     lines.append(f"{C}{B}[>]{RS} {D}{'model':<9}{RS} {B}{info['python']} | {cfg.get('model', '?')}{RS}")
     lines.append(f"{C}{B}[>]{RS} {D}{'scan-mode':<9}{RS} {A}{B}{str(cfg.get('scan_profile', 'custom')).upper()}{RS}")
+    lines.append(f"{C}{B}[>]{RS} {D}{'intensity':<9}{RS} {A}{B}{str(cfg.get('scan_intensity', 'normal')).upper()}{RS}"
+                 f"{D}  workers={cfg.get('zap_workers',2)} delay={cfg.get('zap_delay_ms',200)}ms{RS}")
     lines.append(f"{C}{B}[>]{RS} {D}{'scanner':<9}{RS} {B}{cfg.get('scan_backend', 'auto')}{RS}"
                  f"{D}  active={onoff('allow_active_scan')} ajax={onoff('zap_ajax')} nuclei={onoff('nuclei_enabled')}{RS}")
+    auth_name = str(cfg.get('zap_auth_context') or 'anonymous')
+    auth_state = ('anonymous_stateless (pending discovery)' if auth_name == 'anonymous'
+                  else 'auth_configured (unverified)')
+    lines.append(f"{C}{B}[>]{RS} {D}{'auth':<9}{RS} {B}{auth_name}{RS}{D}  {auth_state}{RS}")
     lines.append(f"{C}{B}[>]{RS} {D}{'opt-ins':<9}{RS} {Y}sqlmap={onoff('allow_sqlmap')}"
                  f" oast={onoff('allow_oast')} extraction={onoff('allow_extraction')}{RS}")
     lines.append(f"{C}{B}[>]{RS} {D}{'scope':<9}{RS} {G}{scope}{RS}")
@@ -1749,6 +1755,29 @@ def select_scan_profile_interactive(cfg: dict) -> dict:
         print("[!] Lựa chọn không hợp lệ. Vui lòng nhập 1, 2 hoặc 3.")
 
 
+def select_scan_intensity_interactive(cfg: dict) -> dict:
+    choices={'1':'gentle','2':'normal','3':'fast','4':'custom'}
+    default=str(cfg.get('scan_intensity','normal'))
+    default_number=next((n for n,v in choices.items() if v==default),'2')
+    print("Scan intensity: 1 Gentle | 2 Normal | 3 Fast | 4 Custom")
+    try:
+        selected=input(f"Chọn cường độ [1/2/3/4] (mặc định {default_number}): ").strip() or default_number
+    except EOFError:
+        selected=default_number
+    intensity=choices.get(selected)
+    if not intensity: raise ValueError('Cường độ scan không hợp lệ')
+    resolved=apply_scan_intensity(cfg,intensity)
+    if intensity=='custom':
+        workers=input(f"Workers 1-8 [{resolved.get('zap_workers',2)}]: ").strip()
+        delay=input(f"Delay ms/origin [{resolved.get('zap_delay_ms',200)}]: ").strip()
+        ceiling=input(f"Bootstrap ceiling 1-2 [{resolved.get('zap_bootstrap_ceiling',2)}]: ").strip()
+        if workers: resolved['zap_workers']=max(1,min(8,int(workers)))
+        if delay: resolved['zap_delay_ms']=max(0,int(delay))
+        if ceiling: resolved['zap_bootstrap_ceiling']=max(1,min(2,int(ceiling)))
+    print(f"[>] INTENSITY: {intensity.upper()}\n")
+    return resolved
+
+
 def _load_cli_config():
     cfg = load_config()
     selected_path = _cli_option_value('--config')
@@ -1778,6 +1807,18 @@ def reconfigure_interactive(current_config, path=DEFAULT_USER_CONFIG):
         raise ValueError('Cần ít nhất một target hoặc thư mục source; cấu hình cũ được giữ nguyên')
     saved = save_user_config(settings, path)
     return refreshed, saved
+
+
+def configure_auth_interactive(current_config, path=DEFAULT_USER_CONFIG):
+    """Run /auth and persist profile references only, never credential values."""
+    from auth_wizard import interactive
+    updated = interactive(dict(current_config))
+    settings = load_user_config(path) if Path(path).exists() else {}
+    for key in ('zap_auth_file', 'zap_auth_context'):
+        if updated.get(key):
+            settings[key] = updated[key]
+    save_user_config(settings, path)
+    return apply_user_config(load_config(), settings)
 
 
 def switch_scan_target(agent, targets):
@@ -1814,6 +1855,7 @@ def _main():
         scan_profile = _cli_option_value("--scan-profile")
         if scan_profile:
             cfg = apply_scan_profile(cfg, scan_profile)
+            cfg = apply_scan_intensity(cfg, cfg.get('scan_intensity','normal'))
     except ValueError as exc:
         print(f"[!] {exc}", file=sys.stderr)
         print("    Use --list-scan-profiles to see available modes.", file=sys.stderr)
@@ -1834,6 +1876,7 @@ def _main():
     if not non_interactive and not one_shot and "--capabilities" not in sys.argv:
         if not scan_profile:
             cfg = select_scan_profile_interactive(cfg)
+            cfg = select_scan_intensity_interactive(cfg)
         cfg = resolve_scope_interactive(cfg)
 
     if not cfg["targets"] and not cfg.get("src_dirs"):
@@ -1898,7 +1941,7 @@ def _main():
     # ── interactive ──
     print(f"{DIM}[>]{RESET} {DIM}Type{RESET} {GREEN}'q'{RESET} {DIM}quit |{RESET} {GREEN}'!! <cmd>'{RESET} {DIM}shell |{RESET} "
           f"{GREEN}'/findings'{RESET} {DIM}ledger |{RESET} {GREEN}'/report'{RESET} {DIM}export |{RESET} "
-          f"{GREEN}'/config'{RESET} {DIM}settings |{RESET} "
+          f"{GREEN}'/config'{RESET} {DIM}settings |{RESET} {GREEN}'/auth'{RESET} {DIM}identity |{RESET} "
           f"{GREEN}'/autonomy [goal]'{RESET} {DIM}|{RESET} "
           f"{GREEN}'/context-metrics'{RESET}{DIM}.{RESET}", flush=True)
     while True:
@@ -1929,6 +1972,17 @@ def _main():
                               missing=agent.missing_tools, mode='interactive')
             except (ValueError, OSError, json.JSONDecodeError) as exc:
                 print(f"[!] Không thể cập nhật cấu hình: {exc}")
+            continue
+        if line == "/auth":
+            try:
+                cfg = configure_auth_interactive(agent.config, user_config_path)
+                agent = WebXAgent(config=cfg)
+                event("bind", agent)
+                print(f"[✓] Auth context hiện tại: {cfg.get('zap_auth_context', 'anonymous')}")
+                _print_banner(cfg, scope=agent.policy.describe(), missing=agent.missing_tools,
+                              mode='interactive')
+            except (ValueError, OSError, json.JSONDecodeError) as exc:
+                print(f"[!] Không thể cập nhật auth: {exc}")
             continue
         if line == "/capabilities":
             for r in agent.capability_rows():

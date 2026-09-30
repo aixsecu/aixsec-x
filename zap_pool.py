@@ -129,6 +129,8 @@ class ZapWorker:
                 self.reset()
                 plan=json.loads(Path(plan_path).read_text())
                 contexts=((plan.get('env') or {}).get('contexts') or [])
+                context_names=[str(context.get('name') or 'anonymous') for context in contexts]
+                session_slot=f'worker-{self.worker_id}:' + ','.join(context_names or ['anonymous'])
                 context_signature=hashlib.sha256(json.dumps(contexts,sort_keys=True).encode()).hexdigest()
                 context_reused=bool(contexts and context_signature==self.context_signature)
                 policies=[job for job in plan.get('jobs',[]) if job.get('type')=='activeScan-policy']
@@ -152,7 +154,8 @@ class ZapWorker:
                         if contexts:self.context_signature=context_signature
                         self.jobs+=1;return {'returncode':0,'job_ms':_milliseconds()-began,
                             'plan_id':str(plan_id),'progress':value,'policy_reused':policy_reused,
-                            'context_reused':context_reused}
+                            'context_reused':context_reused,'session_slot':session_slot,
+                            'session_isolation':'dedicated_worker_home_reset_before_job'}
                     time.sleep(.1)
                 raise TimeoutError('ZAP automation plan timed out')
             except BaseException as exc:

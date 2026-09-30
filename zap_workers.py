@@ -112,11 +112,14 @@ def scheduling_summary(jobs, workers=2, cookie_mode='strict', policy=None):
             policy_counts[rule['id']] += 1
         rows.append({'request_id':entry.get('request_id'),
                      'mode':'serial' if reasons else 'parallel_eligible', 'reasons':reasons,
+                     'session_lane':entry.get('_session_lane','unclassified'),
                      'policy_rule':rule['id'] if rule else None})
     eligible = sum(row['mode'] == 'parallel_eligible' for row in rows)
+    lane_counts=Counter(row['session_lane'] for row in rows)
     return {'workers':workers, 'cookie_mode':cookie_mode, 'total_groups':len(jobs),
             'parallel_eligible':eligible, 'serial_groups':len(jobs)-eligible,
-            'serial_reasons':dict(counts), 'policy_matches':dict(policy_counts), 'groups':rows}
+            'serial_reasons':dict(counts), 'session_lanes':dict(lane_counts),
+            'policy_matches':dict(policy_counts), 'groups':rows}
 
 
 def drive(jobs, start, workers=2, cookie_mode='strict', policy=None, auto=None, metrics=None,
@@ -132,7 +135,11 @@ def drive(jobs, start, workers=2, cookie_mode='strict', policy=None, auto=None, 
         capacity = max(0, int(available / max(1.0, float(expected_job_seconds))) * max(1, workers))
         if capacity < len(ordered):
             deferred.extend(ordered[capacity:]); ordered = ordered[:capacity]
-    queue = [(entry, origin(entry['_entry']['request']['url']),
+    def execution_lane(entry):
+        target=origin(entry['_entry']['request']['url'])
+        context=entry.get('auth_context','anonymous')
+        return target if context=='anonymous' else target+'|auth='+context
+    queue = [(entry, execution_lane(entry),
               scheduling_reasons(entry, cookie_mode, policy)) for entry in ordered]
     cancelled = threading.Event()
     pool = ThreadPoolExecutor(max_workers=workers, thread_name_prefix='zap')
@@ -151,6 +158,7 @@ def drive(jobs, start, workers=2, cookie_mode='strict', policy=None, auto=None, 
     stop = False
     stop_reason = ('Active jobs deferred because the estimated workload exceeds the remaining session budget'
                    if deferred else '')
+    limit_note = 'configured maximum'
 
     def eta_text(seconds):
         seconds=max(0,int(seconds))
@@ -168,7 +176,7 @@ def drive(jobs, start, workers=2, cookie_mode='strict', policy=None, auto=None, 
         event('stage','zap_active',f'{completed}/{scheduled_total} jobs finished',
               f'W {len(pending)}/{workers}' + (f' + prep {preparing}' if preparing else '') +
               f' | ETA {eta_text(eta)} {confidence} | '
-              f'req {requests_executed} | def {len(deferred)}/{len(jobs)}')
+              f'req {requests_executed} | def {len(deferred)}/{len(jobs)} | limit {limit_note}')
 
     def mark_wait(entry, kind):
         now = time.perf_counter_ns();state = waiting.get(id(entry))
@@ -245,17 +253,22 @@ def drive(jobs, start, workers=2, cookie_mode='strict', policy=None, auto=None, 
                     mark_wait(entry, waiting_origins[target_origin])
                     continue
                 reasons = scheduling_reasons(entry, cookie_mode, policy)
-                width = auto.limit(target_origin, entry) if auto and not (policy and policy.match(entry)) else workers
+                raw_origin=origin(entry['_entry']['request']['url'])
+                width = auto.limit(raw_origin, entry) if auto and not (policy and policy.match(entry)) else workers
                 serial = bool(reasons) or bool(auto and not (policy and policy.match(entry))
                                                and auto.bootstrap_serial(entry))
                 saturated = sum(active_origin == target_origin for _, active_origin, _ in pending.values()) >= width
-                conflicts = saturated or any(active_origin == target_origin and (serial or active_serial)
-                                for _, active_origin, active_serial in pending.values())
+                raw_lane=target_origin.split('|auth=',1)[0]
+                conflicts = saturated or any(
+                    (active_origin == target_origin or
+                     ((serial or active_serial) and active_origin.split('|auth=',1)[0] == raw_lane))
+                    and (serial or active_serial)
+                    for _, active_origin, active_serial in pending.values())
                 if conflicts:
-                    if any(active_origin == target_origin and active_serial
+                    if any(active_origin.split('|auth=',1)[0] == raw_lane and active_serial
                            for _, active_origin, active_serial in pending.values()) or serial:
                         kind='serial_barrier_wait_ms'
-                    elif auto and auto.data.get('origins',{}).get(target_origin,{}).get('mode')=='bootstrap':
+                    elif auto and auto.data.get('origins',{}).get(auto.lane_key(raw_origin,entry),{}).get('mode')=='bootstrap':
                         kind='bootstrap_wait_ms'
                     elif auto:
                         kind='auto_concurrency_wait_ms'
@@ -269,6 +282,10 @@ def drive(jobs, start, workers=2, cookie_mode='strict', policy=None, auto=None, 
                 collect()
                 continue
             entry, target_origin, _ = queue.pop(index)
+            if auto and not (policy and policy.match(entry)):
+                limit_note = auto.limit_status(origin(entry['_entry']['request']['url']), entry)['reason']
+            else:
+                limit_note = 'operator policy' if policy and policy.match(entry) else 'configured maximum'
             preparing=1;emit_progress()
             finish_wait(entry)
             perf=entry.setdefault('_scheduler_performance', {})

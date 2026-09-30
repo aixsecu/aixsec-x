@@ -31,6 +31,30 @@ def _cookie_class(name):
     return 'unknown'
 
 
+def cookie_lane(entry):
+    """Classify cookie identity by names only; values never enter diagnostics."""
+    request=(entry.get('_entry') or {}).get('request') or {}
+    response=(entry.get('_entry') or {}).get('response') or {}
+    names={str(c.get('name','')) for c in request.get('cookies',[]) if c.get('name')}
+    for header in request.get('headers',[]):
+        if str(header.get('name','')).lower()=='cookie':
+            names.update(part.split('=',1)[0].strip() for part in str(header.get('value','')).split(';') if '=' in part)
+    for header in response.get('headers',[]):
+        if str(header.get('name','')).lower()=='set-cookie':
+            first=str(header.get('value','')).split(';',1)[0]
+            if '=' in first: names.add(first.split('=',1)[0].strip())
+    classes={_cookie_class(name) for name in names if name}
+    if entry.get('auth_context','anonymous')!='anonymous': return 'authenticated_session'
+    if not classes: return 'stateless'
+    if classes <= {'analytics'}: return 'analytics'
+    if classes <= {'preference'}: return 'preference'
+    if classes <= {'affinity'}: return 'affinity'
+    if classes <= {'analytics','preference','affinity'}: return 'benign_cookie'
+    if 'csrf' in classes: return 'csrf'
+    if 'session' in classes: return 'guest_session'
+    return 'unknown'
+
+
 def classify_cookies(row):
     """Classify names only. Cookie values must never enter scheduler state/logs."""
     response = {str(v) for v in row.get('set_cookie_names', []) if v}
@@ -110,7 +134,7 @@ def candidate_reasons(entry, config):
             reasons.append('auto_missing_auth_oracle')
     elif any(re.search(r'authorization|api.?key|token|secret|auth', name) for name in names):
         reasons.append('auto_unlabelled_credentials')
-    if req.get('cookies') and 'cookie' not in names:
+    if req.get('cookies') and 'cookie' not in names and cookie_lane(entry) in ('guest_session','csrf','unknown','authenticated_session'):
         reasons.append('auto_cookie_header_missing')
     return reasons
 
@@ -123,7 +147,7 @@ def bootstrap_eligible(entry):
     req = entry['_entry']['request']
     if req.get('method', 'GET').upper() not in ('GET', 'HEAD'):
         return False
-    if has_request_body(req) or entry.get('auth_context', 'anonymous') != 'anonymous':
+    if has_request_body(req):
         return False
     parsed = urlsplit(req.get('url', ''))
     if WORKFLOW.search(unquote(parsed.path)):
@@ -134,7 +158,8 @@ def bootstrap_eligible(entry):
         if key.lower() in ('action', 'act', 'task', 'operation', 'op') and WORKFLOW.search('/' + value):
             return False
     names = {str(h.get('name', '')).lower() for h in req.get('headers', [])}
-    if req.get('cookies') or 'cookie' in names:
+    lane=cookie_lane(entry)
+    if lane in ('csrf','unknown'):
         return False
     if any(re.search(r'authorization|api.?key|token|secret|auth|csrf|xsrf', name, re.I)
            for name in names):
@@ -196,6 +221,8 @@ def controls(config, entry, root):
                     return {'stable':False,'reason':'control_session_mutation','cookie_class':cookie_class}
             if re.search(r'type\s*=\s*["\x27]?password|(?:csrf|xsrf)',text,re.I):
                 return {'stable':False,'reason':'control_login_or_csrf'}
+            if re.search(r'captcha|cf-chl-|challenge-platform|access denied|web application firewall|rate limit',text,re.I):
+                return {'stable':False,'reason':'control_captcha_or_waf'}
             # A truncated response cannot establish equality of full responses.
             if len(response.content)>=1048576:
                 return {'stable':False,'reason':'control_body_limit'}
@@ -215,9 +242,15 @@ def controls(config, entry, root):
 
 
 class AutoConcurrency:
+    @staticmethod
+    def lane_key(target_origin, entry=None):
+        context=(entry or {}).get('auth_context','anonymous')
+        return target_origin if context=='anonymous' else target_origin+'|auth='+context
+
     def __init__(self,config,directory,entries,policy):
         self.config=config;self.path=Path(directory)/'auto-concurrency.json';self.policy=policy
         self.max_workers=max(1,min(8,int(config.get('zap_workers',2))))
+        self.bootstrap_ceiling=max(1,min(2,int(config.get('zap_bootstrap_ceiling',2))))
         self.recovery_groups=max(2,int(config.get('zap_auto_recovery_groups',2)))
         self.escalation_groups=max(2,int(config.get('zap_auto_escalation_groups',2)))
         self.minimum_dwell=max(1,int(config.get('zap_auto_minimum_dwell_groups',3)))
@@ -233,27 +266,53 @@ class AutoConcurrency:
             state.setdefault('groups_since_change',0)
             # State written before bootstrap existed is already steady-state.
             state.setdefault('mode','steady')
+        self.session_lanes={}
         for entry in entries:
             entry['_auto_reasons']=candidate_reasons(entry,config)
-            target_origin=origin(entry['_entry']['request']['url'])
+            entry['_session_lane']=cookie_lane(entry)
+            self.session_lanes[entry['request_id']]=entry['_session_lane']
+            target_origin=self.lane_key(origin(entry['_entry']['request']['url']),entry)
             self.data['origins'].setdefault(target_origin,
                 {'mode':'bootstrap','level':1,'score':0,'stable_groups':0,
                  'unstable_groups':{},'groups_since_change':0,'bootstrap_groups':{}})
         self.save()
     def save(self): atomic(self.path,self.data)
     def summary(self):
+        from collections import Counter
         return {'path':str(self.path), 'assessed_groups':len(self.data['decisions']),
                 'stable_controls':sum(bool(d.get('stable')) for d in self.data['decisions'].values()),
-                'origins':self.data['origins']}
+                'origins':self.data['origins'],
+                'session_lanes':dict(Counter(self.session_lanes.values()))}
     def limit(self,target_origin,entry=None):
-        state=self.data['origins'].get(target_origin,{})
+        state=self.data['origins'].get(self.lane_key(target_origin,entry),{})
+        lane=cookie_lane(entry) if entry else None
+        if lane in ('csrf','unknown'): return 1
+        if lane in ('guest_session','authenticated_session'):
+            return min(2,self.max_workers,max(1,int(state.get('level',1))))
         if state.get('mode')=='bootstrap':
             if entry is not None and not bootstrap_eligible(entry):
                 return 1
-            return min(self.max_workers,2)
+            return min(self.max_workers,self.bootstrap_ceiling)
         return min(self.max_workers,max(1,int(state.get('level',1))))
+    def limit_status(self, target_origin, entry=None):
+        state=self.data['origins'].get(self.lane_key(target_origin,entry),{})
+        limit=self.limit(target_origin,entry)
+        lane=cookie_lane(entry) if entry else 'unknown'
+        if state.get('mode')=='bootstrap':
+            if entry is not None and not bootstrap_eligible(entry):
+                reasons=entry.get('_auto_reasons') or ['guest/session or stateful request']
+                reason='bootstrap serial: '+','.join(reasons[:2])
+            else: reason='safe anonymous bootstrap'
+        elif state.get('reason'):
+            reason=str(state['reason'])
+        elif limit < self.max_workers:
+            reason='adaptive stability limit'
+        else: reason='configured maximum'
+        return {'limit':limit,'mode':state.get('mode','unknown'),'lane':lane,
+                'reason':lane+': '+reason}
     def _state(self,entry):
-        return self.data['origins'].setdefault(origin(entry['_entry']['request']['url']),
+        target_origin=origin(entry['_entry']['request']['url'])
+        return self.data['origins'].setdefault(self.lane_key(target_origin,entry),
             {'mode':'bootstrap','level':1,'score':0,'stable_groups':0,
              'unstable_groups':{},'groups_since_change':0,'bootstrap_groups':{}})
     def _bootstrap_active(self,entry):
@@ -299,7 +358,8 @@ class AutoConcurrency:
         fid=entry['request_id'];state=self._state(entry)
         group=self.data['groups'].setdefault(fid,{'quarantined':False,'events':0})
         group.update(quarantined=True,reason=reason,evidence=evidence,
-                     cookie_class=cookie_class,redirect_class=redirect_class)
+                     cookie_class=cookie_class,redirect_class=redirect_class,
+                     session_lane=entry.get('_session_lane',cookie_lane(entry)))
         group['events']+=1;state['stable_groups']=0
         state['groups_since_change']=int(state.get('groups_since_change',0))+1
         state['score']=max(-20,int(state.get('score',0))+delta)
@@ -307,7 +367,7 @@ class AutoConcurrency:
         if (len(state['unstable_groups']) < self.escalation_groups or
                 state['groups_since_change'] < self.demotion_cooldown):
             self.save();return
-        previous=self.limit(origin(entry['_entry']['request']['url']))
+        previous=self.limit(origin(entry['_entry']['request']['url']),entry)
         current=self._next_level(previous,False)
         state.update(level=current,reason=reason,groups_since_change=0)
         self.save()
@@ -324,7 +384,7 @@ class AutoConcurrency:
                 state['score'] < self.recovery_groups*3 or
                 state['groups_since_change'] < self.promotion_cooldown):
             self.save();return
-        previous=self.limit(origin(entry['_entry']['request']['url']))
+        previous=self.limit(origin(entry['_entry']['request']['url']),entry)
         current=self._next_level(previous,True)
         state.update(level=current,stable_groups=0,reason='stable_groups',groups_since_change=0)
         state['unstable_groups']={}

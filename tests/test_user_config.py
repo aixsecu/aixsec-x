@@ -5,7 +5,7 @@ from types import SimpleNamespace
 import pytest
 
 import agent as cli
-from config import load_config
+from config import load_config, apply_scan_intensity
 from user_config import (apply_user_config, load_user_config, public_summary,
                          save_user_config)
 
@@ -35,6 +35,16 @@ def test_user_config_applies_profile_then_explicit_operator_choices():
     assert resolved['family_scan'] is True
     assert resolved['technology_filter_mode'] == 'priority'
     assert resolved['allow_active_scan'] is False
+
+
+def test_intensity_is_independent_from_coverage_profile():
+    full=apply_user_config(load_config(),{'scan_profile':'full','scan_intensity':'gentle',
+        'targets':['https://example.test']})
+    assert full['scan_profile']=='full'
+    assert full['scan_intensity']=='gentle'
+    assert (full['zap_workers'],full['zap_delay_ms'],full['zap_bootstrap_ceiling'])==(1,500,1)
+    fast=apply_scan_intensity(full,'fast')
+    assert (fast['zap_workers'],fast['nuclei_rate'])==(4,10)
 
 
 def test_user_config_rejects_unknown_internal_keys(tmp_path):

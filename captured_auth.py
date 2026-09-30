@@ -40,6 +40,25 @@ def accepted(check, status, text):
         (bool(check[0].search(text)) and not check[1].search(text)))
 
 
+def artifact_expired(config, context, path):
+    """Detect an explicit logged-out marker in bounded active evidence."""
+    if context=='anonymous' or not path or not Path(path).is_file(): return False
+    profile=json.loads(Path(config['zap_auth_file']).read_text()).get(context) or {}
+    verification=(profile.get('authentication') or {}).get('verification') or {}
+    marker=verification.get('loggedOutRegex')
+    if not marker: return True
+    pattern=re.compile(marker)
+    try:
+        with Path(path).open(errors='replace') as stream:
+            for index,line in enumerate(stream):
+                if index>=10000: break
+                try: body=str(json.loads(line).get('response_body') or '')
+                except (ValueError,TypeError): continue
+                if pattern.search(body): return True
+    except OSError: return True
+    return False
+
+
 def preflight(config, entry, context, timeout=15):
     import http_engine as he
     req=entry['request']; check=oracle(config,context,req['url'])

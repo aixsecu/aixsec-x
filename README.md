@@ -391,6 +391,12 @@ Boolean switches use `1` (enabled) and `0` (disabled). Defaults below come from 
 | `WEBX_ALLOW_OAST` | `0` | Declare that out-of-band testing is authorized. This does not invent or provision a callback service. |
 | `WEBX_OAST_CALLBACK_URL` | *(empty)* | Operator-controlled HTTP(S) callback endpoint used only to mark OAST prerequisites ready; secrets and callback paths are not copied into public coverage. |
 | `WEBX_ZAP_DELAY_MS` | `200` | Delay between active scan requests, in milliseconds. |
+| `WEBX_SCAN_INTENSITY` | `normal` | Throughput preset: `gentle`, `normal`, `fast`, or `custom`; terminal users normally select this from the menu. |
+| `WEBX_ZAP_BOOTSTRAP_CEILING` | `2` | Maximum workers during an unproven adaptive-concurrency bootstrap (1–2). |
+| `WEBX_ZAP_AUTO_ESCALATION_GROUPS` | `2` | Distinct unstable groups required before concurrency backoff. |
+| `WEBX_ZAP_AUTO_RECOVERY_GROUPS` | `2` | Stable groups required as part of concurrency recovery/promotion. |
+| `WEBX_ZAP_AUTO_PROMOTION_COOLDOWN_GROUPS` | `4` | Minimum groups between concurrency promotions. |
+| `WEBX_ZAP_AUTO_DEMOTION_COOLDOWN_GROUPS` | `3` | Minimum groups between concurrency demotions. |
 | `WEBX_ZAP_AJAX` | `1` | Enable AJAX Spider for browser-driven discovery. |
 | `WEBX_ZAP_BROWSER` | `firefox-headless` | Selenium browser ID for AJAX Spider; requires the corresponding browser/driver. |
 | `WEBX_ZAP_SPIDER_DEPTH` | `10` | Maximum traditional/AJAX crawl depth (minimum 1). |
@@ -557,10 +563,46 @@ root@aixsec-x:~# Run nuclei severity high                      → attack the ta
 root@aixsec-x:~# /findings                                     → view ledger (candidate/confirmed/ruled_out)
 root@aixsec-x:~# /report                                       → export markdown report
 root@aixsec-x:~# /config                                       → reopen settings wizard and apply changes in this session
+root@aixsec-x:~# /auth                                         → manage/select guest or ZAP login profiles without storing raw secrets
 root@aixsec-x:~# /capabilities                                 → list tool/binary/version availability (v1.6.0)
 root@aixsec-x:~# !! nmap -p- 10.0.0.5                          → run a shell command directly (at your own risk)
 root@aixsec-x:~# q                                             → quit
 ```
+
+The selected auth file is also loaded as a shared runtime manifest. Form/JSON,
+HTTP Basic and browser profiles are available to ZAP; Bearer, API-key and static
+cookie profiles are runtime-only HTTP contexts. Authentication state includes a
+generation counter. On expiry AIXSEC-X performs one serialized, verified refresh
+and automatically retries only GET/HEAD work; state-changing requests are never
+replayed automatically.
+
+Authenticated work is generation-fenced. Coverage and evidence carry both
+`auth_context` and `auth_generation`; login-page/expired results are recorded as
+`auth_uncertain`, `retry_after_refresh`, or `deferred_auth_expired`. Uncertain
+attempts never create findings or poison persistent scan history, and the
+non-secret refresh ledger is retained across resume.
+
+Automatic concurrency classifies request state as stateless, analytics,
+preference, affinity, CSRF, guest session, authenticated session, or unknown.
+Stateless and benign-cookie GET groups can promote from two workers toward the
+configured maximum. Guest/authenticated sessions remain capped at one or two
+workers per origin/context; POST and workflow routes remain serial. Promotion
+requires stable controls and backs off on cookie mutation, login/logout
+redirects, CAPTCHA/WAF indicators, rate limits, server errors, or high latency.
+
+Scan profile and scan intensity are separate terminal choices. Coverage remains
+Fast/Balanced/Full/Exhaustive, while intensity is Gentle/Normal/Fast/Custom.
+Intensity configures workers, per-origin delay/rate, bootstrap ceiling,
+promotion/backoff thresholds and cooldowns. Custom values are saved through
+`/config`; users do not need to edit environment variables.
+
+Each persistent ZAP worker has a private home and session slot. Before reuse it
+clears the active HTTP session, alerts and site tree; failure to clear any auth
+state recycles the worker. Only compatible read-only groups may batch, while
+CSRF and workflow requests remain serial. `/auth` additionally supports scoped
+JSON/Netscape cookie import (values remain process-only), browser/SSO profiles,
+OAuth/OIDC refresh-token runtime profiles, MFA pause/resume, and multiple named
+roles for differential authorization analysis.
 
 When a message contains a literal URL/domain/IP and an explicit scan request,
 the intent router can switch targets without `/config`. A deterministic parser

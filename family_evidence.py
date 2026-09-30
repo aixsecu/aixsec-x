@@ -12,6 +12,7 @@ class FamilyEvidenceStore:
         findings={}
         for row in records:
             if (not isinstance(row,dict) or row.get('tool')!='zap_active_scan'
+                    or row.get('auth_disposition') in ('auth_uncertain','deferred_auth_expired')
                     or not row.get('family_id') or not row.get('_candidate')):
                 continue
             key=(str(row.get('family_id')),str(row.get('representative_id')),
